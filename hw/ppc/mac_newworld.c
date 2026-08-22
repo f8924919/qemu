@@ -329,11 +329,11 @@ static void ppc_core99_init(MachineState *machine)
             /* Self registers: 0xf8000000 + U3_HT_CONFIG_BASE */
             sysbus_mmio_map(s, 0, 0xf8070000);
             /*
-             * External config window. The real machine has it at
-             * 0xf2000000, which currently holds the AGP ISA IO space;
-             * keep it out of the way until the device tree exposes it.
+             * External config window, at the address used by the real
+             * machine (and hardcoded by the Linux HT PIC scan). The
+             * AGP ISA IO space moves to 0xf6000000 to make room.
              */
-            sysbus_mmio_map(s, 1, 0xf6000000);
+            sysbus_mmio_map(s, 1, 0xf2000000);
             /* HT I/O space, fixed address expected by kernels */
             sysbus_mmio_map(s, 2, 0xf4000000);
         }
@@ -346,8 +346,15 @@ static void ppc_core99_init(MachineState *machine)
         /* PCI hole */
         memory_region_add_subregion(get_system_memory(), 0x80000000,
                                     sysbus_mmio_get_region(s, 2));
-        /* Register 8 MB of ISA IO space */
-        memory_region_add_subregion(get_system_memory(), 0xf2000000,
+        /*
+         * Register 8 MB of ISA IO space. On powermac7_3 the U3 HT
+         * config window claims the historical 0xf2000000 address, so
+         * the IO space moves to the slot the config window vacated;
+         * mac99 with a 970 keeps the old layout.
+         */
+        memory_region_add_subregion(get_system_memory(),
+                                    core99_machine->has_u3_ht ? 0xf6000000
+                                                              : 0xf2000000,
                                     sysbus_mmio_get_region(s, 3));
     } else {
         machine_arch = ARCH_MAC99;

@@ -6,8 +6,8 @@
  *  - self-register window at 0xf8070000: word-indexed (offset << 2),
  *    big-endian access to the host bridge's own config space; the region
  *    decode register is config offset 0x80 (byte offset 0x200).
- *  - external config window (mapped at 0xf6000000 for now): flat
- *    memory-mapped U3_HT_CFA0/CFA1 encoding, little-endian.
+ *  - external config window at 0xf2000000 (the address used by the real
+ *    machine): flat memory-mapped U3_HT_CFA0/CFA1 encoding, little-endian.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -17,7 +17,10 @@
 #include "libqtest.h"
 
 #define U3_HT_SELF_BASE   0xf8070000ULL
-#define U3_HT_CFG_BASE    0xf6000000ULL
+#define U3_HT_CFG_BASE    0xf2000000ULL
+
+/* AGP (ISA) PCI I/O window, moved out of the way of the config window */
+#define U3_AGP_IO_BASE    0xf6000000ULL
 
 /* IDs of the u3-ht host bridge itself (Apple CPC945 HT bridge) */
 #define U3_HT_IDS         ((0x004a << 16) | 0x106b)
@@ -99,16 +102,35 @@ static void test_cfa1_master_abort(void)
     qtest_quit(qts);
 }
 
+static void test_agp_io_mapped(void)
+{
+    QTestState *qts = qtest_init("-machine powermac7_3");
+
+    /*
+     * The AGP ISA I/O window must follow the machine to 0xf6000000.
+     * A mapped PCI I/O region with no BAR behind it reads as all-ones
+     * (unassigned_io_ops), while unmapped system memory reads as 0,
+     * so this distinguishes "window mapped" from "nothing there".
+     */
+    g_assert_cmphex(qtest_readl(qts, U3_AGP_IO_BASE), ==, 0xffffffff);
+
+    qtest_quit(qts);
+}
+
 static void test_mac99_unmapped(void)
 {
     QTestState *qts = qtest_init("-machine mac99 -cpu 970fx");
 
     /*
-     * mac99 must not grow the HT bridge: both windows stay unmapped
-     * (reads of unassigned memory return 0)
+     * mac99 must not grow the HT bridge.  Only the self-register window
+     * can be checked as unmapped (reads of unassigned memory return 0):
+     * the config window address 0xf2000000 hosts the AGP ISA I/O window
+     * on mac99 + 970fx, where a read returns all-ones, not 0.
      */
     g_assert_cmphex(qtest_readl(qts, U3_HT_SELF_BASE), ==, 0);
-    g_assert_cmphex(qtest_readl(qts, U3_HT_CFG_BASE), ==, 0);
+
+    /* AGP ISA I/O stays at 0xf2000000 on mac99 + 970fx (mapped: all-1s) */
+    g_assert_cmphex(qtest_readl(qts, U3_HT_CFG_BASE), ==, 0xffffffff);
 
     qtest_quit(qts);
 }
@@ -125,6 +147,7 @@ int main(int argc, char **argv)
     qtest_add_func("/u3-ht/self-window", test_self_window);
     qtest_add_func("/u3-ht/cfa0", test_cfa0);
     qtest_add_func("/u3-ht/cfa1-master-abort", test_cfa1_master_abort);
+    qtest_add_func("/u3-ht/agp-io-mapped", test_agp_io_mapped);
     qtest_add_func("/u3-ht/mac99-unmapped", test_mac99_unmapped);
 
     return g_test_run();
