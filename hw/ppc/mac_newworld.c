@@ -107,6 +107,8 @@ struct Core99MachineState {
     MachineState parent;
 
     Core99ViaConfig via_config;
+    /* PowerMac7,3 also gets the U3 HyperTransport PCI domain */
+    bool has_u3_ht;
 };
 
 static void fw_cfg_boot_set(void *opaque, const char *boot_device,
@@ -309,6 +311,26 @@ static void ppc_core99_init(MachineState *machine)
     if (PPC_INPUT(env) == PPC_FLAGS_INPUT_970) {
         machine_arch = ARCH_MAC99_U3;
         /* 970 gets a U3 bus */
+        if (core99_machine->has_u3_ht) {
+            /*
+             * U3 HyperTransport bus (PowerMac7,3). This must be created
+             * before the AGP bridge so that the AGP bus stays the
+             * default for -device (the bus of the last created host
+             * bridge is found first).
+             */
+            s = SYS_BUS_DEVICE(qdev_new(TYPE_U3_HT_HOST_BRIDGE));
+            sysbus_realize_and_unref(s, &error_fatal);
+            /* Self registers: 0xf8000000 + U3_HT_CONFIG_BASE */
+            sysbus_mmio_map(s, 0, 0xf8070000);
+            /*
+             * External config window. The real machine has it at
+             * 0xf2000000, which currently holds the AGP ISA IO space;
+             * keep it out of the way until the device tree exposes it.
+             */
+            sysbus_mmio_map(s, 1, 0xf6000000);
+            /* HT I/O space, fixed address expected by kernels */
+            sysbus_mmio_map(s, 2, 0xf4000000);
+        }
         /* Uninorth AGP bus */
         uninorth_pci_dev = qdev_new(TYPE_U3_AGP_HOST_BRIDGE);
         s = SYS_BUS_DEVICE(uninorth_pci_dev);
@@ -726,6 +748,7 @@ static void powermac7_3_instance_init(Object *obj)
     /* Fixed configuration, remove the "via" property inherited from mac99 */
     object_property_del(obj, "via");
     cms->via_config = CORE99_VIA_CONFIG_PMU;
+    cms->has_u3_ht = true;
 }
 
 static const TypeInfo powermac7_3_machine_info = {

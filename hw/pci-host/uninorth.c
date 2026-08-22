@@ -208,6 +208,147 @@ static void pci_u3_agp_init(Object *obj)
     qdev_init_gpio_out(DEVICE(obj), s->irqs, ARRAY_SIZE(s->irqs));
 }
 
+/*
+ * U3 HyperTransport host bridge (PowerMac7,3).
+ *
+ * Unlike the other UniNorth bridges this one uses memory-mapped config
+ * space access, in the layout expected by the Linux u3-ht support code
+ * (arch/powerpc/platforms/powermac/pci.c) and FreeBSD's cpcht(4):
+ *
+ * - external config window (32 MB), little-endian:
+ *     U3_HT_CFA0(devfn, off) = (devfn << 8) | off          (type 0, bus 0)
+ *     U3_HT_CFA1(bus, devfn, off) = CFA0 + (bus << 16) + 0x01000000
+ * - self-register window (4 KB), big-endian: byte address (off << 2)
+ *   accesses config offset 'off' of the host bridge itself (bus 0
+ *   devfn 0).  The region decode register read by the kernels at
+ *   cfg_addr + 0x80 (in u32 units, i.e. byte offset 0x200) is thus
+ *   simply config offset 0x80 of the bridge.
+ */
+
+static void pci_u3_ht_set_irq(void *opaque, int irq_num, int level)
+{
+    /*
+     * The real bridge delivers interrupts via HT-APIC capability
+     * blocks, not INTx pins; nothing is wired up yet.
+     */
+}
+
+static uint32_t u3_ht_get_config_reg(hwaddr addr)
+{
+    uint32_t bus = 0;
+
+    if (addr & 0x01000000) {
+        /* CFA1 */
+        bus = (addr >> 16) & 0xff;
+    }
+    return (bus << 16) | (addr & 0xffff);
+}
+
+static void u3_ht_cfg_write(void *opaque, hwaddr addr,
+                            uint64_t val, unsigned len)
+{
+    U3HTHostState *s = opaque;
+    PCIHostState *phb = PCI_HOST_BRIDGE(s);
+
+    trace_u3_ht_cfg_write(addr, len, val);
+    pci_data_write(phb->bus, u3_ht_get_config_reg(addr), val, len);
+}
+
+static uint64_t u3_ht_cfg_read(void *opaque, hwaddr addr, unsigned len)
+{
+    U3HTHostState *s = opaque;
+    PCIHostState *phb = PCI_HOST_BRIDGE(s);
+    uint32_t val;
+
+    val = pci_data_read(phb->bus, u3_ht_get_config_reg(addr), len);
+    trace_u3_ht_cfg_read(addr, len, val);
+    return val;
+}
+
+static const MemoryRegionOps u3_ht_cfg_ops = {
+    .read = u3_ht_cfg_read,
+    .write = u3_ht_cfg_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+};
+
+static void u3_ht_self_write(void *opaque, hwaddr addr,
+                             uint64_t val, unsigned len)
+{
+    U3HTHostState *s = opaque;
+    PCIHostState *phb = PCI_HOST_BRIDGE(s);
+
+    trace_u3_ht_self_write(addr, len, val);
+    pci_data_write(phb->bus, (addr >> 2) & 0xff, val, len);
+}
+
+static uint64_t u3_ht_self_read(void *opaque, hwaddr addr, unsigned len)
+{
+    U3HTHostState *s = opaque;
+    PCIHostState *phb = PCI_HOST_BRIDGE(s);
+    uint32_t val;
+
+    val = pci_data_read(phb->bus, (addr >> 2) & 0xff, len);
+    trace_u3_ht_self_read(addr, len, val);
+    return val;
+}
+
+static const MemoryRegionOps u3_ht_self_ops = {
+    .read = u3_ht_self_read,
+    .write = u3_ht_self_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+};
+
+static void pci_u3_ht_realize(DeviceState *dev, Error **errp)
+{
+    U3HTHostState *s = U3_HT_HOST_BRIDGE(dev);
+    PCIHostState *h = PCI_HOST_BRIDGE(dev);
+
+    h->bus = pci_register_root_bus(dev, NULL,
+                                   pci_u3_ht_set_irq, pci_unin_map_irq,
+                                   s,
+                                   &s->pci_mmio,
+                                   &s->pci_io,
+                                   PCI_DEVFN(0, 0), 4, TYPE_PCI_BUS);
+
+    pci_create_simple(h->bus, PCI_DEVFN(0, 0), "u3-ht");
+}
+
+static void pci_u3_ht_init(Object *obj)
+{
+    U3HTHostState *s = U3_HT_HOST_BRIDGE(obj);
+    SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
+
+    memory_region_init_io(&s->self_mem, obj, &u3_ht_self_ops, obj,
+                          "u3-ht-self-cfg", 0x1000);
+    memory_region_init_io(&s->cfg_mem, obj, &u3_ht_cfg_ops, obj,
+                          "u3-ht-cfg", 0x02000000);
+
+    memory_region_init(&s->pci_mmio, OBJECT(s), "u3-ht-pci-mmio",
+                       0x100000000ULL);
+    memory_region_init_io(&s->pci_io, OBJECT(s), &unassigned_io_ops, obj,
+                          "u3-ht-pci-io", 0x00400000);
+
+    sysbus_init_mmio(sbd, &s->self_mem);
+    sysbus_init_mmio(sbd, &s->cfg_mem);
+    sysbus_init_mmio(sbd, &s->pci_io);
+}
+
 static void pci_unin_agp_realize(DeviceState *dev, Error **errp)
 {
     UNINHostState *s = UNI_NORTH_AGP_HOST_BRIDGE(dev);
@@ -304,6 +445,27 @@ static void u3_agp_pci_host_realize(PCIDevice *d, Error **errp)
     d->config[PCI_LATENCY_TIMER] = 0x10;
 }
 
+static void u3_ht_pci_host_realize(PCIDevice *d, Error **errp)
+{
+    d->config[PCI_CACHE_LINE_SIZE] = 0x08;
+    d->config[PCI_LATENCY_TIMER] = 0x10;
+
+    /*
+     * Region decode register, read by Linux's parse_region_decode() at
+     * config offset 0x80.  Set the three regions the Linux kernel
+     * comment names as enabled on a real machine, bits i = 4, 8, 9
+     * (bit i meaning a 16 MB window at 0xf0000000 + (i << 24), i.e.
+     * 0xf4000000 (HT I/O), 0xf8000000 and 0xf9000000).  Real machines
+     * presumably also enable windows at 0xfa000000 and up for device
+     * BARs; those can be added once the HT bus has devices needing
+     * them.  Linux masks the value with 0x003fffff, dropping i <= 9,
+     * so no PCI memory resources result from it as long as the HT bus
+     * is otherwise empty.  Read-only.
+     */
+    pci_set_long(d->config + 0x80, 0x08c00000);
+    pci_set_long(d->wmask + 0x80, 0);
+}
+
 static void unin_internal_pci_host_realize(PCIDevice *d, Error **errp)
 {
     d->config[PCI_CACHE_LINE_SIZE] = 0x08;
@@ -361,6 +523,34 @@ static const TypeInfo u3_agp_pci_host_info = {
     .parent = TYPE_PCI_DEVICE,
     .instance_size = sizeof(PCIDevice),
     .class_init = u3_agp_pci_host_class_init,
+    .interfaces = (const InterfaceInfo[]) {
+        { INTERFACE_CONVENTIONAL_PCI_DEVICE },
+        { },
+    },
+};
+
+static void u3_ht_pci_host_class_init(ObjectClass *klass, const void *data)
+{
+    PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
+    DeviceClass *dc = DEVICE_CLASS(klass);
+
+    k->realize   = u3_ht_pci_host_realize;
+    k->vendor_id = PCI_VENDOR_ID_APPLE;
+    k->device_id = PCI_DEVICE_ID_APPLE_U3_HT;
+    k->revision  = 0x00;
+    k->class_id  = PCI_CLASS_BRIDGE_HOST;
+    /*
+     * PCI-facing part of the host bridge, not usable without the
+     * host-facing part, which can't be device_add'ed, yet.
+     */
+    dc->user_creatable = false;
+}
+
+static const TypeInfo u3_ht_pci_host_info = {
+    .name = "u3-ht",
+    .parent = TYPE_PCI_DEVICE,
+    .instance_size = sizeof(PCIDevice),
+    .class_init = u3_ht_pci_host_class_init,
     .interfaces = (const InterfaceInfo[]) {
         { INTERFACE_CONVENTIONAL_PCI_DEVICE },
         { },
@@ -462,6 +652,21 @@ static const TypeInfo pci_u3_agp_info = {
     .class_init    = pci_u3_agp_class_init,
 };
 
+static void pci_u3_ht_class_init(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+
+    dc->realize = pci_u3_ht_realize;
+}
+
+static const TypeInfo pci_u3_ht_info = {
+    .name          = TYPE_U3_HT_HOST_BRIDGE,
+    .parent        = TYPE_PCI_HOST_BRIDGE,
+    .instance_size = sizeof(U3HTHostState),
+    .instance_init = pci_u3_ht_init,
+    .class_init    = pci_u3_ht_class_init,
+};
+
 static void pci_unin_agp_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -551,11 +756,13 @@ static void unin_register_types(void)
 {
     type_register_static(&unin_main_pci_host_info);
     type_register_static(&u3_agp_pci_host_info);
+    type_register_static(&u3_ht_pci_host_info);
     type_register_static(&unin_agp_pci_host_info);
     type_register_static(&unin_internal_pci_host_info);
 
     type_register_static(&pci_unin_main_info);
     type_register_static(&pci_u3_agp_info);
+    type_register_static(&pci_u3_ht_info);
     type_register_static(&pci_unin_agp_info);
     type_register_static(&pci_unin_internal_info);
 

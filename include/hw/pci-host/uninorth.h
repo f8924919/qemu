@@ -35,6 +35,7 @@
 #define TYPE_UNI_NORTH_AGP_HOST_BRIDGE "uni-north-agp-pcihost"
 #define TYPE_UNI_NORTH_INTERNAL_PCI_HOST_BRIDGE "uni-north-internal-pci-pcihost"
 #define TYPE_U3_AGP_HOST_BRIDGE "u3-agp-pcihost"
+#define TYPE_U3_HT_HOST_BRIDGE "u3-ht-pcihost"
 
 typedef struct UNINHostState UNINHostState;
 DECLARE_INSTANCE_CHECKER(UNINHostState, UNI_NORTH_PCI_HOST_BRIDGE,
@@ -55,6 +56,24 @@ struct UNINHostState {
     MemoryRegion pci_hole;
     MemoryRegion pci_io;
 };
+
+/*
+ * The U3 HyperTransport host bridge uses memory-mapped config space
+ * access (nothing like the indirect cfg_addr/cfg_data scheme of the
+ * other UniNorth bridges), so it gets its own state structure.
+ */
+struct U3HTHostState {
+    PCIHostState parent_obj;
+
+    MemoryRegion self_mem;
+    MemoryRegion cfg_mem;
+    MemoryRegion pci_mmio;
+    MemoryRegion pci_io;
+};
+
+typedef struct U3HTHostState U3HTHostState;
+DECLARE_INSTANCE_CHECKER(U3HTHostState, U3_HT_HOST_BRIDGE,
+                         TYPE_U3_HT_HOST_BRIDGE)
 
 struct UNINState {
     SysBusDevice parent_obj;
