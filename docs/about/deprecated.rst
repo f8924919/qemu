@@ -241,6 +241,19 @@ The RISC-V ``shakti_c`` machine hasn't had meaningful contributions since 2021
 and is currently unmaintained. The machine is scheduled to be removed as it
 appears to have no users.
 
+PowerPC ``mac99`` machine with a G5 CPU or with the ``via`` option (since 11.2)
+'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+
+The ``mac99`` machine emulates different machines depending on the ``via``
+machine option and on whether a G4 or G5 (970 series) CPU is used (the
+latter being the default of ``qemu-system-ppc64``), which is confusing.
+Explicit machine types are now available for these configurations and
+should be used instead: use ``powermac7_3`` instead of
+``qemu-system-ppc64 -M mac99`` with a 970 series CPU, ``powermac3_1``
+instead of ``-M mac99,via=pmu`` and ``powerbook3_2`` instead of
+``-M mac99,via=pmu-adb``. The default ``mac99`` configuration (G4 CPU
+with ``via=cuda``) is not deprecated.
+
 ``memory-encryption`` machine property (since 11.1)
 '''''''''''''''''''''''''''''''''''''''''''''''''''
 

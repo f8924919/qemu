@@ -1,4 +1,4 @@
-PowerMac family boards (``g3beige``, ``mac99``)
+PowerMac family boards (``g3beige``, ``mac99``, ...)
 ==================================================================
 
 Use the executable ``qemu-system-ppc`` to simulate a complete PowerMac
@@ -6,6 +6,12 @@ PowerPC system.
 
 - ``g3beige``              Heathrow based PowerMac
 - ``mac99``                Mac99 based PowerMac
+- ``powermac3_1``          Apple Power Mac G4 AGP (Sawtooth), fixed
+  configuration equivalent to ``mac99,via=pmu``
+- ``powerbook3_2``         Apple PowerBook G4 Titanium (Mercury), fixed
+  configuration equivalent to ``mac99,via=pmu-adb``
+- ``powermac7_3``          Apple Power Mac G5 (Niagara), 970FX based,
+  only available in ``qemu-system-ppc64``
 
 Supported devices
 -----------------
