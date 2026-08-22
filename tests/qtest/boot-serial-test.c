@@ -171,6 +171,7 @@ static const testdef_t tests[] = {
     { "ppc64", "ppce500", "", "U-Boot" },
     { "ppc64", "40p", "-m 192", "Memory: 192M" },
     { "ppc64", "mac99", "", "PowerPC,970FX" },
+    { "ppc64", "powermac7_3", "", "PowerPC,970FX" },
     { "ppc64", "pseries",
       "-machine " PSERIES_DEFAULT_CAPABILITIES,
       "Open Firmware" },
