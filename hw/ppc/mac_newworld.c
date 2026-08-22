@@ -309,7 +309,13 @@ static void ppc_core99_init(MachineState *machine)
                                 sysbus_mmio_get_region(s, 0));
 
     if (PPC_INPUT(env) == PPC_FLAGS_INPUT_970) {
-        machine_arch = ARCH_MAC99_U3;
+        /*
+         * powermac7_3 has its own machine id so that the firmware can
+         * build a PowerMac7,3/MacRISC4 device tree; mac99 with a 970
+         * keeps the old id.
+         */
+        machine_arch = core99_machine->has_u3_ht ? ARCH_POWERMAC7_3
+                                                 : ARCH_MAC99_U3;
         /* 970 gets a U3 bus */
         if (core99_machine->has_u3_ht) {
             /*
