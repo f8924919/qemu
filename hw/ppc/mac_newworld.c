@@ -647,9 +647,88 @@ static const TypeInfo core99_machine_info = {
     },
 };
 
+static void powermac3_1_machine_class_init(ObjectClass *oc, const void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+
+    mc->desc = "Apple Power Mac G4 AGP (Sawtooth)";
+    mc->default_cpu_type = POWERPC_CPU_TYPE_NAME("7400_v2.9");
+}
+
+static void powermac3_1_instance_init(Object *obj)
+{
+    Core99MachineState *cms = CORE99_MACHINE(obj);
+
+    /* Fixed configuration, remove the "via" property inherited from mac99 */
+    object_property_del(obj, "via");
+    cms->via_config = CORE99_VIA_CONFIG_PMU;
+}
+
+static const TypeInfo powermac3_1_machine_info = {
+    .name          = MACHINE_TYPE_NAME("powermac3_1"),
+    .parent        = TYPE_CORE99_MACHINE,
+    .class_init    = powermac3_1_machine_class_init,
+    .instance_init = powermac3_1_instance_init,
+};
+
+static void powerbook3_2_machine_class_init(ObjectClass *oc, const void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+
+    mc->desc = "Apple PowerBook G4 Titanium (Mercury)";
+    mc->default_cpu_type = POWERPC_CPU_TYPE_NAME("7400_v2.9");
+}
+
+static void powerbook3_2_instance_init(Object *obj)
+{
+    Core99MachineState *cms = CORE99_MACHINE(obj);
+
+    /* Fixed configuration, remove the "via" property inherited from mac99 */
+    object_property_del(obj, "via");
+    cms->via_config = CORE99_VIA_CONFIG_PMU_ADB;
+}
+
+static const TypeInfo powerbook3_2_machine_info = {
+    .name          = MACHINE_TYPE_NAME("powerbook3_2"),
+    .parent        = TYPE_CORE99_MACHINE,
+    .class_init    = powerbook3_2_machine_class_init,
+    .instance_init = powerbook3_2_instance_init,
+};
+
+#ifdef TARGET_PPC64
+static void powermac7_3_machine_class_init(ObjectClass *oc, const void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+
+    mc->desc = "Apple Power Mac G5 (Niagara)";
+    mc->default_cpu_type = POWERPC_CPU_TYPE_NAME("970fx_v3.1");
+}
+
+static void powermac7_3_instance_init(Object *obj)
+{
+    Core99MachineState *cms = CORE99_MACHINE(obj);
+
+    /* Fixed configuration, remove the "via" property inherited from mac99 */
+    object_property_del(obj, "via");
+    cms->via_config = CORE99_VIA_CONFIG_PMU;
+}
+
+static const TypeInfo powermac7_3_machine_info = {
+    .name          = MACHINE_TYPE_NAME("powermac7_3"),
+    .parent        = TYPE_CORE99_MACHINE,
+    .class_init    = powermac7_3_machine_class_init,
+    .instance_init = powermac7_3_instance_init,
+};
+#endif
+
 static void mac_machine_register_types(void)
 {
     type_register_static(&core99_machine_info);
+    type_register_static(&powermac3_1_machine_info);
+    type_register_static(&powerbook3_2_machine_info);
+#ifdef TARGET_PPC64
+    type_register_static(&powermac7_3_machine_info);
+#endif
 }
 
 type_init(mac_machine_register_types)
