@@ -5422,6 +5422,21 @@ static void register_970_lpar_sprs(CPUPPCState *env)
                  SPR_NOACCESS, SPR_NOACCESS,
                  &spr_read_generic, &spr_write_generic,
                  0x00000000);
+
+    /*
+     * The 970 implements HSPRG0/HSPRG1 (SPR 304/305).  With hypervisor
+     * facilities strapped off (Apple mode) they are plain scratch
+     * registers available to the supervisor, and Mac OS X uses HSPRG0 to
+     * carry a GPR across the tail of its exception return path.
+     */
+    spr_register(env, SPR_HSPRG0, "HSPRG0",
+                 SPR_NOACCESS, SPR_NOACCESS,
+                 &spr_read_generic, &spr_write_generic,
+                 0x00000000);
+    spr_register(env, SPR_HSPRG1, "HSPRG1",
+                 SPR_NOACCESS, SPR_NOACCESS,
+                 &spr_read_generic, &spr_write_generic,
+                 0x00000000);
 #endif
 }
 
