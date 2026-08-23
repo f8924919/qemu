@@ -55,6 +55,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/nvram/mac_nvram.h"
 #include "hw/core/boards.h"
+#include "hw/pci/pci_bridge.h"
 #include "hw/pci-host/uninorth.h"
 #include "hw/input/adb.h"
 #include "hw/ppc/mac_dbdma.h"
@@ -146,6 +147,8 @@ static void ppc_core99_init(MachineState *machine)
     hwaddr kernel_base = 0, initrd_base = 0, cmdline_base = 0;
     long kernel_size = 0, initrd_size = 0;
     PCIBus *pci_bus;
+    DeviceState *u3_ht_dev = NULL;
+    PCIBus *ht_bus = NULL, *k2_bus = NULL;
     bool has_pmu, has_adb;
     Object *macio;
     MACIOIDEState *macio_ide;
@@ -325,9 +328,18 @@ static void ppc_core99_init(MachineState *machine)
              * bridge is found first).
              */
             s = SYS_BUS_DEVICE(qdev_new(TYPE_U3_HT_HOST_BRIDGE));
+            u3_ht_dev = DEVICE(s);
             sysbus_realize_and_unref(s, &error_fatal);
-            /* Self registers: 0xf8000000 + U3_HT_CONFIG_BASE */
-            sysbus_mmio_map(s, 0, 0xf8070000);
+            /*
+             * Self registers: 0xf8000000 + U3_HT_CONFIG_BASE.  The
+             * window falls inside the range covered by the mpic
+             * region at 0xf8040000 (mapped later); the mpic container
+             * has a hole there, but map with an explicit priority so
+             * the layering survives mpic region changes.  The real
+             * device tree has the same containment (/u3/mpic reg
+             * covers 0x40000-0x80000).
+             */
+            sysbus_mmio_map_overlap(s, 0, 0xf8070000, 1);
             /*
              * External config window, at the address used by the real
              * machine (and hardcoded by the Linux HT PIC scan). The
@@ -336,6 +348,8 @@ static void ppc_core99_init(MachineState *machine)
             sysbus_mmio_map(s, 1, 0xf2000000);
             /* HT I/O space, fixed address expected by kernels */
             sysbus_mmio_map(s, 2, 0xf4000000);
+            /* HT PCI memory window (16 MB, identity-mapped) */
+            sysbus_mmio_map(s, 3, 0xfa000000);
         }
         /* Uninorth AGP bus */
         uninorth_pci_dev = qdev_new(TYPE_U3_AGP_HOST_BRIDGE);
@@ -397,23 +411,58 @@ static void ppc_core99_init(MachineState *machine)
     /* init basic PC hardware */
     pci_bus = PCI_HOST_BRIDGE(uninorth_pci_dev)->bus;
 
+    if (u3_ht_dev) {
+        PCIDevice *br;
+
+        ht_bus = PCI_HOST_BRIDGE(u3_ht_dev)->bus;
+        /*
+         * K2 HT-PCI bridge at dev 3, carrying the MacIO on its
+         * secondary bus at dev 7 (both devfns match the real 7,3:
+         * 0001:00:03.0 / 0001:01:07.0).
+         */
+        br = pci_new(PCI_DEVFN(3, 0), TYPE_U3_HT_PCI_BRIDGE);
+        pci_bridge_map_irq(PCI_BRIDGE(br), "ht.1", NULL);
+        pci_realize_and_unref(br, ht_bus, &error_fatal);
+        k2_bus = pci_bridge_get_sec_bus(PCI_BRIDGE(br));
+    }
+
     /* MacIO */
-    macio = OBJECT(pci_new(-1, TYPE_NEWWORLD_MACIO));
+    macio = OBJECT(pci_new(k2_bus ? PCI_DEVFN(7, 0) : -1,
+                           TYPE_NEWWORLD_MACIO));
     dev = DEVICE(macio);
     qdev_prop_set_uint64(dev, "frequency", tbfreq);
     qdev_prop_set_bit(dev, "has-pmu", has_pmu);
     qdev_prop_set_bit(dev, "has-adb", has_adb);
+    if (u3_ht_dev) {
+        /* The mpic lives inside the U3, not in the MacIO BAR */
+        qdev_prop_set_bit(dev, "pic-in-bar", false);
+    }
 
     dev = DEVICE(object_resolve_path_component(macio, "escc"));
     qdev_prop_set_chr(dev, "chrA", serial_hd(0));
     qdev_prop_set_chr(dev, "chrB", serial_hd(1));
 
-    pci_realize_and_unref(PCI_DEVICE(macio), pci_bus, &error_fatal);
+    pci_realize_and_unref(PCI_DEVICE(macio), k2_bus ? k2_bus : pci_bus,
+                          &error_fatal);
 
     pic_dev = DEVICE(object_resolve_path_component(macio, "pic"));
+    if (u3_ht_dev) {
+        /* mpic inside the U3 at 0xf8040000 (see the self window map) */
+        sysbus_mmio_map_overlap(SYS_BUS_DEVICE(pic_dev), 0, 0xf8040000, 0);
+    }
     for (i = 0; i < 4; i++) {
         qdev_connect_gpio_out(uninorth_pci_dev, i,
                               qdev_get_gpio_in(pic_dev, 0x1b + i));
+    }
+    if (u3_ht_dev) {
+        /*
+         * HT INTx to mpic pins 0x1f..0x22; must match the firmware's
+         * HT interrupt-map (OpenBIOS u3_ht_arch.irqs[]).
+         */
+        for (i = 0; i < 4; i++) {
+            qdev_connect_gpio_out(u3_ht_dev, i,
+                                  qdev_get_gpio_in(pic_dev, 0x1f + i));
+        }
     }
 
     /* TODO: additional PCI buses only wired up for 32-bit machines */
@@ -495,7 +544,7 @@ static void ppc_core99_init(MachineState *machine)
         graphic_depth = 15;
     }
 
-    pci_init_nic_devices(pci_bus, mc->default_nic);
+    pci_init_nic_devices(ht_bus ? ht_bus : pci_bus, mc->default_nic);
 
     /* The NewWorld NVRAM is not located in the MacIO device */
     if (kvm_enabled() && qemu_real_host_page_size() > 4096) {

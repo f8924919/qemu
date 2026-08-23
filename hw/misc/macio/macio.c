@@ -275,8 +275,10 @@ static void macio_newworld_realize(PCIDevice *d, Error **errp)
     qdev_prop_set_uint32(pic_dev, "model", OPENPIC_MODEL_KEYLARGO);
     sbd = SYS_BUS_DEVICE(&ns->pic);
     sysbus_realize_and_unref(sbd, &error_fatal);
-    memory_region_add_subregion(&s->bar, 0x40000,
-                                sysbus_mmio_get_region(sbd, 0));
+    if (ns->pic_in_bar) {
+        memory_region_add_subregion(&s->bar, 0x40000,
+                                    sysbus_mmio_get_region(sbd, 0));
+    }
 
     sbd = SYS_BUS_DEVICE(&s->escc);
     sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(pic_dev, NEWWORLD_ESCCB_IRQ));
@@ -408,6 +410,12 @@ static const VMStateDescription vmstate_macio_newworld = {
 static const Property macio_newworld_properties[] = {
     DEFINE_PROP_BOOL("has-pmu", NewWorldMacIOState, has_pmu, false),
     DEFINE_PROP_BOOL("has-adb", NewWorldMacIOState, has_adb, false),
+    /*
+     * The U3-based machines (PowerMac7,3) expose the mpic inside the
+     * U3 at 0xf8040000, not inside the MacIO BAR: the machine clears
+     * this and maps the pic's memory region itself.
+     */
+    DEFINE_PROP_BOOL("pic-in-bar", NewWorldMacIOState, pic_in_bar, true),
 };
 
 static void macio_newworld_class_init(ObjectClass *oc, const void *data)

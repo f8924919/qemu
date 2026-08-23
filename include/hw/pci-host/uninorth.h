@@ -68,12 +68,17 @@ struct U3HTHostState {
     MemoryRegion self_mem;
     MemoryRegion cfg_mem;
     MemoryRegion pci_mmio;
+    MemoryRegion pci_hole;
     MemoryRegion pci_io;
+    qemu_irq irqs[4];
 };
 
 typedef struct U3HTHostState U3HTHostState;
 DECLARE_INSTANCE_CHECKER(U3HTHostState, U3_HT_HOST_BRIDGE,
                          TYPE_U3_HT_HOST_BRIDGE)
+
+/* K2 HT-PCI bridge: the P2P bridge carrying the MacIO on a real 7,3 */
+#define TYPE_U3_HT_PCI_BRIDGE "u3-ht-pci-bridge"
 
 struct UNINState {
     SysBusDevice parent_obj;

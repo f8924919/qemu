@@ -28,6 +28,8 @@
 #include "qemu/module.h"
 #include "hw/pci/pci_device.h"
 #include "hw/pci/pci_host.h"
+#include "hw/pci/pci_bridge.h"
+#include "hw/pci/pci_bus.h"
 #include "hw/pci-host/uninorth.h"
 #include "trace.h"
 
@@ -229,8 +231,12 @@ static void pci_u3_ht_set_irq(void *opaque, int irq_num, int level)
 {
     /*
      * The real bridge delivers interrupts via HT-APIC capability
-     * blocks, not INTx pins; nothing is wired up yet.
+     * blocks; here INTx is routed to mpic input pins by the machine
+     * (0x1f..0x22, matching the firmware's HT interrupt-map).
      */
+    U3HTHostState *s = opaque;
+
+    qemu_set_irq(s->irqs[irq_num], level);
 }
 
 static uint32_t u3_ht_get_config_reg(hwaddr addr)
@@ -344,9 +350,20 @@ static void pci_u3_ht_init(Object *obj)
     memory_region_init_io(&s->pci_io, OBJECT(s), &unassigned_io_ops, obj,
                           "u3-ht-pci-io", 0x00400000);
 
+    /*
+     * PCI memory window: identity-mapped 16 MB at 0xfa000000,
+     * matching decode register bit i=10 (0xf0000000 + (i << 24)).
+     */
+    memory_region_init_alias(&s->pci_hole, OBJECT(s),
+                             "u3-ht-pci-hole", &s->pci_mmio,
+                             0xfa000000ULL, 0x01000000ULL);
+
     sysbus_init_mmio(sbd, &s->self_mem);
     sysbus_init_mmio(sbd, &s->cfg_mem);
     sysbus_init_mmio(sbd, &s->pci_io);
+    sysbus_init_mmio(sbd, &s->pci_hole);
+
+    qdev_init_gpio_out(DEVICE(obj), s->irqs, ARRAY_SIZE(s->irqs));
 }
 
 static void pci_unin_agp_realize(DeviceState *dev, Error **errp)
@@ -452,17 +469,14 @@ static void u3_ht_pci_host_realize(PCIDevice *d, Error **errp)
 
     /*
      * Region decode register, read by Linux's parse_region_decode() at
-     * config offset 0x80.  Set the three regions the Linux kernel
-     * comment names as enabled on a real machine, bits i = 4, 8, 9
-     * (bit i meaning a 16 MB window at 0xf0000000 + (i << 24), i.e.
-     * 0xf4000000 (HT I/O), 0xf8000000 and 0xf9000000).  Real machines
-     * presumably also enable windows at 0xfa000000 and up for device
-     * BARs; those can be added once the HT bus has devices needing
-     * them.  Linux masks the value with 0x003fffff, dropping i <= 9,
-     * so no PCI memory resources result from it as long as the HT bus
-     * is otherwise empty.  Read-only.
+     * config offset 0x80.  Bits i = 4, 8, 9 are the regions the Linux
+     * kernel comment names as enabled on a real machine (bit i meaning
+     * a 16 MB window at 0xf0000000 + (i << 24), i.e. 0xf4000000
+     * (HT I/O), 0xf8000000 and 0xf9000000); bit i = 10 advertises the
+     * PCI memory window at 0xfa000000 backing the BARs of the devices
+     * on the HT bus.  Read-only.
      */
-    pci_set_long(d->config + 0x80, 0x08c00000);
+    pci_set_long(d->config + 0x80, 0x08e00000);
     pci_set_long(d->wmask + 0x80, 0);
 }
 
@@ -551,6 +565,73 @@ static const TypeInfo u3_ht_pci_host_info = {
     .parent = TYPE_PCI_DEVICE,
     .instance_size = sizeof(PCIDevice),
     .class_init = u3_ht_pci_host_class_init,
+    .interfaces = (const InterfaceInfo[]) {
+        { INTERFACE_CONVENTIONAL_PCI_DEVICE },
+        { },
+    },
+};
+
+/*
+ * K2 HT-PCI bridge (106b:0045): on a real PowerMac7,3 this is the P2P
+ * bridge at HT bus 0 / dev 3 carrying the K2 KeyLargo MacIO on its
+ * secondary bus.
+ */
+/*
+ * The firmware writes the bridge windows but never sets the command
+ * register, so enable memory decoding here (same reasoning as the
+ * Simba bridge) and allow 32-bit I/O addresses.  Must be re-applied
+ * on reset: the generic PCI device reset clears the writable COMMAND
+ * bits again after realize.
+ */
+static void u3_ht_pci_bridge_setup(PCIDevice *dev)
+{
+    pci_set_word(dev->config + PCI_COMMAND, PCI_COMMAND_MEMORY);
+    pci_set_word(dev->config + PCI_STATUS,
+                 PCI_STATUS_66MHZ | PCI_STATUS_DEVSEL_MEDIUM);
+
+    pci_set_word(dev->config + PCI_IO_BASE, PCI_IO_RANGE_TYPE_32);
+    pci_set_word(dev->config + PCI_IO_LIMIT, PCI_IO_RANGE_TYPE_32);
+
+    pci_bridge_update_mappings(PCI_BRIDGE(dev));
+}
+
+static void u3_ht_pci_bridge_realize(PCIDevice *dev, Error **errp)
+{
+    pci_bridge_initfn(dev, TYPE_PCI_BUS);
+
+    pci_set_word(dev->wmask + PCI_IO_BASE_UPPER16, 0xffff);
+    pci_set_word(dev->wmask + PCI_IO_LIMIT_UPPER16, 0xffff);
+
+    u3_ht_pci_bridge_setup(dev);
+}
+
+static void u3_ht_pci_bridge_reset(DeviceState *qdev)
+{
+    pci_bridge_reset(qdev);
+    u3_ht_pci_bridge_setup(PCI_DEVICE(qdev));
+}
+
+static void u3_ht_pci_bridge_class_init(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
+
+    k->realize = u3_ht_pci_bridge_realize;
+    k->exit = pci_bridge_exitfn;
+    k->vendor_id = PCI_VENDOR_ID_APPLE;
+    k->device_id = 0x0045; /* K2 HT-PCI bridge */
+    k->revision = 0x00;
+    k->config_write = pci_bridge_write_config;
+    set_bit(DEVICE_CATEGORY_BRIDGE, dc->categories);
+    device_class_set_legacy_reset(dc, u3_ht_pci_bridge_reset);
+    dc->vmsd = &vmstate_pci_device;
+}
+
+static const TypeInfo u3_ht_pci_bridge_info = {
+    .name          = TYPE_U3_HT_PCI_BRIDGE,
+    .parent        = TYPE_PCI_BRIDGE,
+    .instance_size = sizeof(PCIBridge),
+    .class_init    = u3_ht_pci_bridge_class_init,
     .interfaces = (const InterfaceInfo[]) {
         { INTERFACE_CONVENTIONAL_PCI_DEVICE },
         { },
@@ -757,6 +838,7 @@ static void unin_register_types(void)
     type_register_static(&unin_main_pci_host_info);
     type_register_static(&u3_agp_pci_host_info);
     type_register_static(&u3_ht_pci_host_info);
+    type_register_static(&u3_ht_pci_bridge_info);
     type_register_static(&unin_agp_pci_host_info);
     type_register_static(&unin_internal_pci_host_info);
 
