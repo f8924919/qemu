@@ -59,6 +59,17 @@
 /* HT PCI memory window (identity-mapped, 16MB) */
 #define U3_HT_MEM_BASE    0xfa000000ULL
 
+/*
+ * UniNorth/U3 register block: the version register is at offset 0 of
+ * the /u3 (resp. /uni-n) reg window.  Mac OS X's AppleU3::start()
+ * refuses to drive anything reporting <= 0x2f ("UniN version 0x%x not
+ * supported"), so a machine that calls itself a U3 must report a
+ * U3-class version.  mac99 stays on the UniNorth 1.0.8 value.
+ */
+#define UNIN_BASE         0xf8000000ULL
+#define UNIN_VERSION_U3   0x30
+#define UNIN_VERSION_10A  0x07
+
 /* U3_HT_CFA0(devfn, off) = (devfn << 8) | off */
 #define CFA0(devfn, off)  (((devfn) << 8) | (off))
 /* U3_HT_CFA1(bus, devfn, off) = CFA0(devfn, off) + (bus << 16) + 0x01000000 */
@@ -259,6 +270,31 @@ static void test_fw_cfg_not_shadowed(void)
     qtest_quit(qts);
 }
 
+static void test_unin_version(void)
+{
+    QTestState *qts = qtest_init("-machine powermac7_3");
+
+    /*
+     * The version register is big-endian, so qtest_readl() returns it
+     * as-is.  Anything <= 0x2f makes Mac OS X's AppleU3::start() bail
+     * out, which leaves an IOSimpleLock held and panics the config
+     * thread with "thread_invoke: preemption_level 1".
+     */
+    g_assert_cmphex(qtest_readl(qts, UNIN_BASE), ==, UNIN_VERSION_U3);
+
+    qtest_quit(qts);
+}
+
+static void test_mac99_unin_version(void)
+{
+    QTestState *qts = qtest_init("-machine mac99");
+
+    /* mac99 is a UniNorth machine and must keep the UniNorth version */
+    g_assert_cmphex(qtest_readl(qts, UNIN_BASE), ==, UNIN_VERSION_10A);
+
+    qtest_quit(qts);
+}
+
 static void test_mac99_unmapped(void)
 {
     QTestState *qts = qtest_init("-machine mac99 -cpu 970fx");
@@ -298,6 +334,8 @@ int main(int argc, char **argv)
     qtest_add_func("/u3-ht/agp-io-mapped", test_agp_io_mapped);
     qtest_add_func("/u3-ht/agp-config", test_agp_config);
     qtest_add_func("/u3-ht/fw-cfg-not-shadowed", test_fw_cfg_not_shadowed);
+    qtest_add_func("/u3-ht/unin-version", test_unin_version);
+    qtest_add_func("/u3-ht/mac99-unin-version", test_mac99_unin_version);
     qtest_add_func("/u3-ht/mac99-unmapped", test_mac99_unmapped);
 
     return g_test_run();

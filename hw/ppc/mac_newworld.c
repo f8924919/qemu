@@ -306,7 +306,18 @@ static void ppc_core99_init(MachineState *machine)
     }
 
     /* UniN init */
-    s = SYS_BUS_DEVICE(qdev_new(TYPE_UNI_NORTH));
+    dev = qdev_new(TYPE_UNI_NORTH);
+    if (core99_machine->has_u3_ht) {
+        /*
+         * powermac7_3 publishes a /u3 node, so the memory controller has
+         * to identify itself as a U3.  Mac OS X's AppleU3::start() bails
+         * out on anything below 0x30 and, on the way out, leaves an
+         * IOSimpleLock held: the config thread then panics with
+         * "thread_invoke: preemption_level 1".
+         */
+        qdev_prop_set_uint32(dev, "version", UNINORTH_VERSION_U3);
+    }
+    s = SYS_BUS_DEVICE(dev);
     sysbus_realize_and_unref(s, &error_fatal);
     memory_region_add_subregion(get_system_memory(), 0xf8000000,
                                 sysbus_mmio_get_region(s, 0));

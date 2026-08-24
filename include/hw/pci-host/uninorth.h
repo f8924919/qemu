@@ -30,6 +30,15 @@
 
 /* UniNorth version */
 #define UNINORTH_VERSION_10A    0x7
+/*
+ * U3 memory controllers report 0x30 and up.  Mac OS X's AppleU3::start()
+ * refuses to drive a /u3 node whose version register reads 0x2f or less
+ * ("AppleU3::start - UniN version 0x%x not supported"), so a machine that
+ * builds a U3 device tree has to report a U3-class version here.  0x30 is
+ * the plain U3: versions 0x34-0x37 are U3H and additionally require a
+ * "platform-chip-fault" property that this machine does not provide.
+ */
+#define UNINORTH_VERSION_U3     0x30
 
 #define TYPE_UNI_NORTH_PCI_HOST_BRIDGE "uni-north-pci-pcihost"
 #define TYPE_UNI_NORTH_AGP_HOST_BRIDGE "uni-north-agp-pcihost"
@@ -83,6 +92,7 @@ DECLARE_INSTANCE_CHECKER(U3HTHostState, U3_HT_HOST_BRIDGE,
 struct UNINState {
     SysBusDevice parent_obj;
 
+    uint32_t version;
     MemoryRegion mem;
 };
 

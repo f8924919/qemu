@@ -798,11 +798,12 @@ static void unin_write(void *opaque, hwaddr addr, uint64_t value,
 
 static uint64_t unin_read(void *opaque, hwaddr addr, unsigned size)
 {
+    UNINState *s = opaque;
     uint32_t value;
 
     switch (addr) {
     case 0:
-        value = UNINORTH_VERSION_10A;
+        value = s->version;
         break;
     default:
         value = 0;
@@ -829,10 +830,20 @@ static void unin_init(Object *obj)
     sysbus_init_mmio(sbd, &s->mem);
 }
 
+/*
+ * The version register tells the guest which memory controller generation
+ * it is talking to.  Keep the UniNorth value as the default and let the
+ * machine raise it to a U3 value when it builds a U3 device tree.
+ */
+static const Property unin_properties[] = {
+    DEFINE_PROP_UINT32("version", UNINState, version, UNINORTH_VERSION_10A),
+};
+
 static void unin_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
+    device_class_set_props(dc, unin_properties);
     set_bit(DEVICE_CATEGORY_BRIDGE, dc->categories);
 }
 
