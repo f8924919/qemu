@@ -342,8 +342,9 @@ static void ppc_core99_init(MachineState *machine)
             sysbus_mmio_map_overlap(s, 0, 0xf8070000, 1);
             /*
              * External config window, at the address used by the real
-             * machine (and hardcoded by the Linux HT PIC scan). The
-             * AGP ISA IO space moves to 0xf6000000 to make room.
+             * machine (and hardcoded by the Linux HT PIC scan).  The
+             * AGP ISA IO space lives at its own domain base and does
+             * not contend for this address.
              */
             sysbus_mmio_map(s, 1, 0xf2000000);
             /* HT I/O space, fixed address expected by kernels */
@@ -361,14 +362,15 @@ static void ppc_core99_init(MachineState *machine)
         memory_region_add_subregion(get_system_memory(), 0x80000000,
                                     sysbus_mmio_get_region(s, 2));
         /*
-         * Register 8 MB of ISA IO space. On powermac7_3 the U3 HT
-         * config window claims the historical 0xf2000000 address, so
-         * the IO space moves to the slot the config window vacated;
-         * mac99 with a 970 keeps the old layout.
+         * Register 8 MB of ISA IO space at the base of the AGP domain.
+         * The domain is one 32 MB window: IO at +0, CONFIG_ADDR at
+         * +0x800000 and CONFIG_DATA at +0xc00000, matching the layout
+         * the other UniNorth domains use.  Linux hardcodes the config
+         * registers at 0xf0000000 + 0x800000/0xc00000 while Mac OS X
+         * derives them from the IO window base in the device tree, so
+         * the window has to sit at the base the registers belong to.
          */
-        memory_region_add_subregion(get_system_memory(),
-                                    core99_machine->has_u3_ht ? 0xf6000000
-                                                              : 0xf2000000,
+        memory_region_add_subregion(get_system_memory(), 0xf0000000,
                                     sysbus_mmio_get_region(s, 3));
     } else {
         machine_arch = ARCH_MAC99;
@@ -568,8 +570,14 @@ static void ppc_core99_init(MachineState *machine)
     object_property_add_child(OBJECT(machine), TYPE_FW_CFG, OBJECT(fw_cfg));
     s = SYS_BUS_DEVICE(dev);
     sysbus_realize_and_unref(s, &error_fatal);
-    sysbus_mmio_map(s, 0, CFG_ADDR);
-    sysbus_mmio_map(s, 1, CFG_ADDR + 2);
+    /*
+     * fw_cfg sits at ISA port 0x510 of the AGP domain, so on the 970
+     * machines it lands inside the ISA IO window registered above.  Map
+     * both regions with priority so they keep answering instead of being
+     * shadowed by the window; OpenBIOS reads the machine id from here.
+     */
+    sysbus_mmio_map_overlap(s, 0, CFG_ADDR, 1);
+    sysbus_mmio_map_overlap(s, 1, CFG_ADDR + 2, 1);
 
     fw_cfg_add_i16(fw_cfg, FW_CFG_NB_CPUS, (uint16_t)machine->smp.cpus);
     fw_cfg_add_i16(fw_cfg, FW_CFG_MAX_CPUS, (uint16_t)machine->smp.max_cpus);

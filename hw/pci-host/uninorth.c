@@ -460,6 +460,17 @@ static void u3_agp_pci_host_realize(PCIDevice *d, Error **errp)
 {
     d->config[PCI_CACHE_LINE_SIZE] = 0x08;
     d->config[PCI_LATENCY_TIMER] = 0x10;
+
+    /*
+     * Set kMacRISCPCIAddressSelect (0x48) register to indicate PCI
+     * memory space with base 0x80000000, size 0x10000000 for Apple's
+     * AppleMacRiscPCI driver, the same way the UniNorth main bridge
+     * does.  Without it the driver has no memory range to work with.
+     */
+    d->config[0x48] = 0x0;
+    d->config[0x49] = 0x0;
+    d->config[0x4a] = 0x0;
+    d->config[0x4b] = 0x1;
 }
 
 static void u3_ht_pci_host_realize(PCIDevice *d, Error **errp)

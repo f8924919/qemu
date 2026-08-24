@@ -19,8 +19,26 @@
 #define U3_HT_SELF_BASE   0xf8070000ULL
 #define U3_HT_CFG_BASE    0xf2000000ULL
 
-/* AGP (ISA) PCI I/O window, moved out of the way of the config window */
-#define U3_AGP_IO_BASE    0xf6000000ULL
+/*
+ * The AGP domain is a single 32MB window: I/O at +0, CONFIG_ADDR at
+ * +0x800000 and CONFIG_DATA at +0xc00000.  Derive all three from one
+ * base so that they cannot drift apart: Linux hardcodes the config
+ * registers at 0xf0000000 + 0x800000/0xc00000 while Mac OS X computes
+ * them from the I/O window base in the device tree, so moving only one
+ * of them silently breaks one of the two guests.
+ */
+#define U3_AGP_BASE       0xf0000000ULL
+#define U3_AGP_IO_BASE    (U3_AGP_BASE)
+#define U3_AGP_CFG_ADDR   (U3_AGP_BASE + 0x800000)
+#define U3_AGP_CFG_DATA   (U3_AGP_BASE + 0xc00000)
+
+/* The AGP host bridge sits at dev 11; UniNorth encodes bus 0 as 1 << dev */
+#define U3_AGP_HOST_DEVFN (11 << 3)
+#define U3_AGP_CFA(dev, off)  ((1u << (dev)) | (off))
+#define U3_AGP_IDS        ((0x004b << 16) | 0x106b)
+
+/* fw_cfg lives at ISA port 0x510 of the AGP domain */
+#define FW_CFG_CTL        (U3_AGP_BASE + 0x510)
 
 /* IDs of the u3-ht host bridge itself (Apple CPC945 HT bridge) */
 #define U3_HT_IDS         ((0x004a << 16) | 0x106b)
@@ -191,12 +209,52 @@ static void test_agp_io_mapped(void)
     QTestState *qts = qtest_init("-machine powermac7_3");
 
     /*
-     * The AGP ISA I/O window must follow the machine to 0xf6000000.
      * A mapped PCI I/O region with no BAR behind it reads as all-ones
      * (unassigned_io_ops), while unmapped system memory reads as 0,
      * so this distinguishes "window mapped" from "nothing there".
+     * Read above the legacy port range so that the probe cannot be
+     * answered by a device sitting at a low ISA port.
      */
-    g_assert_cmphex(qtest_readl(qts, U3_AGP_IO_BASE), ==, 0xffffffff);
+    g_assert_cmphex(qtest_readl(qts, U3_AGP_IO_BASE + 0x1000), ==, 0xffffffff);
+
+    qtest_quit(qts);
+}
+
+/*
+ * Mac OS X derives the AGP config registers from the I/O window base in
+ * the device tree, so a config round trip through them is what ties the
+ * window position to the registers.  Nothing else in the test suite
+ * covers the AGP config path.
+ */
+static void test_agp_config(void)
+{
+    QTestState *qts = qtest_init("-machine powermac7_3");
+    uint32_t addr = U3_AGP_CFA(11, 0);
+
+    /* The CONFIG_ADDR register must read back exactly what was written */
+    qtest_writel(qts, U3_AGP_CFG_ADDR, bswap32(addr));
+    g_assert_cmphex(bswap32(qtest_readl(qts, U3_AGP_CFG_ADDR)), ==, addr);
+
+    /* ... and CONFIG_DATA must then return the host bridge's own IDs */
+    g_assert_cmphex(bswap32(qtest_readl(qts, U3_AGP_CFG_DATA)), ==,
+                    U3_AGP_IDS);
+
+    qtest_quit(qts);
+}
+
+/*
+ * fw_cfg sits inside the AGP I/O window; it must keep priority over it,
+ * otherwise OpenBIOS cannot read the machine id and the guest never
+ * boots.  Note this only catches a regression, not a missing overlap:
+ * fw_cfg is mapped after the window, so at equal priority it would still
+ * win by ordering.
+ */
+static void test_fw_cfg_not_shadowed(void)
+{
+    QTestState *qts = qtest_init("-machine powermac7_3");
+
+    /* An unbacked I/O port reads all-ones; fw_cfg must not do that */
+    g_assert_cmphex(qtest_readw(qts, FW_CFG_CTL), !=, 0xffff);
 
     qtest_quit(qts);
 }
@@ -205,16 +263,17 @@ static void test_mac99_unmapped(void)
 {
     QTestState *qts = qtest_init("-machine mac99 -cpu 970fx");
 
-    /*
-     * mac99 must not grow the HT bridge.  Only the self-register window
-     * can be checked as unmapped (reads of unassigned memory return 0):
-     * the config window address 0xf2000000 hosts the AGP ISA I/O window
-     * on mac99 + 970fx, where a read returns all-ones, not 0.
-     */
+    /* mac99 must not grow the HT bridge: nothing answers where it lives */
     g_assert_cmphex(qtest_readl(qts, U3_HT_SELF_BASE), ==, 0);
 
-    /* AGP ISA I/O stays at 0xf2000000 on mac99 + 970fx (mapped: all-1s) */
-    g_assert_cmphex(qtest_readl(qts, U3_HT_CFG_BASE), ==, 0xffffffff);
+    /*
+     * The AGP I/O window moved to the AGP domain base on mac99 + 970fx
+     * too, so nothing answers at the old 0xf2000000 address any more.
+     */
+    g_assert_cmphex(qtest_readl(qts, U3_HT_CFG_BASE), ==, 0);
+
+    /* ... and the window is where powermac7_3 has it */
+    g_assert_cmphex(qtest_readl(qts, U3_AGP_IO_BASE + 0x1000), ==, 0xffffffff);
 
     /* The HT PCI memory window must not appear on mac99 */
     g_assert_cmphex(qtest_readl(qts, U3_HT_MEM_BASE), ==, 0);
@@ -237,6 +296,8 @@ int main(int argc, char **argv)
     qtest_add_func("/u3-ht/cfa1-bridge", test_cfa1_bridge);
     qtest_add_func("/u3-ht/ht-mem-window", test_ht_mem_window);
     qtest_add_func("/u3-ht/agp-io-mapped", test_agp_io_mapped);
+    qtest_add_func("/u3-ht/agp-config", test_agp_config);
+    qtest_add_func("/u3-ht/fw-cfg-not-shadowed", test_fw_cfg_not_shadowed);
     qtest_add_func("/u3-ht/mac99-unmapped", test_mac99_unmapped);
 
     return g_test_run();

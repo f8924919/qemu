@@ -36,7 +36,11 @@ static const TestCase test_cases[] = {
     { "ppc", "g3beige", 0xfe000000, .bswap = true, .superio = "i82378" },
     { "ppc", "40p", 0x80000000, .bswap = true },
     { "ppc", "bamboo", 0xe8000000, .bswap = true, .superio = "i82378" },
-    { "ppc64", "mac99", 0xf2000000, .bswap = true, .superio = "i82378" },
+    /*
+     * mac99 defaults to a 970 on ppc64, so its ISA I/O comes from the
+     * AGP domain, whose window sits at the domain base 0xf0000000.
+     */
+    { "ppc64", "mac99", 0xf0000000, .bswap = true, .superio = "i82378" },
     { "ppc64", "pseries", (1ULL << 45), .bswap = true, .superio = "i82378" },
     { "ppc64", "pseries-2.7", 0x10080000000ULL,
       .bswap = true, .superio = "i82378" },
