@@ -141,6 +141,7 @@ struct NewWorldMacIOState {
     bool has_adb;
     OpenPICState pic;
     bool pic_in_bar;
+    MemoryRegion pic_alias;
     MACIOIDEState ide[2];
     MacIOGPIOState gpio;
 };

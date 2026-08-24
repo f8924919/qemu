@@ -278,6 +278,21 @@ static void macio_newworld_realize(PCIDevice *d, Error **errp)
     if (ns->pic_in_bar) {
         memory_region_add_subregion(&s->bar, 0x40000,
                                     sysbus_mmio_get_region(sbd, 0));
+    } else {
+        /*
+         * PowerMac7,3 maps the mpic on the sysbus at 0xf8040000 instead of
+         * inside the BAR.  On real hardware both are the same registers,
+         * because the K2 BAR covers 0xf8000000 and the mpic sits at
+         * BAR + 0x40000, and the device tree exposes the mpic twice: once
+         * under /u3 and once as a child of mac-io.  Mac OS X resolves the
+         * latter, so mirror the region into the BAR to keep the "reg" of
+         * that node pointing at the real thing.
+         */
+        MemoryRegion *pic_mr = sysbus_mmio_get_region(sbd, 0);
+
+        memory_region_init_alias(&ns->pic_alias, OBJECT(ns), "pic-alias",
+                                 pic_mr, 0, memory_region_size(pic_mr));
+        memory_region_add_subregion(&s->bar, 0x40000, &ns->pic_alias);
     }
 
     sbd = SYS_BUS_DEVICE(&s->escc);
