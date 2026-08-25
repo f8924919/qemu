@@ -449,6 +449,13 @@ static void unin_main_pci_host_realize(PCIDevice *d, Error **errp)
     d->config[0x4b] = 0x1;
 }
 
+/*
+ * Where the AGP capability sits in the U3 bridge's config space.  Anything
+ * past the Apple-specific registers at 0x48-0x4b will do; 0x80 is the offset
+ * the UniNorth bridge below was going to use.
+ */
+#define U3_AGP_CAP_OFFSET  0x80
+
 static void unin_agp_pci_host_realize(PCIDevice *d, Error **errp)
 {
     d->config[PCI_CACHE_LINE_SIZE] = 0x08;
@@ -471,6 +478,35 @@ static void u3_agp_pci_host_realize(PCIDevice *d, Error **errp)
     d->config[0x49] = 0x0;
     d->config[0x4a] = 0x0;
     d->config[0x4b] = 0x1;
+
+    /*
+     * Advertise an AGP capability.  Mac OS X's AppleMacRiscAGP::configure()
+     * opens with
+     *   findPCICapability(getBridgeSpace(), kIOPCIAGPCapability, ...)
+     * and returns false without logging anything when the bridge has no
+     * capability list, so the whole AGP domain fails to start and no nub is
+     * published for the devices below it - on powermac7_3 that includes the
+     * VGA adapter, leaving the guest stuck on the text console.
+     *
+     * Only the presence of the capability matters to that driver: a video
+     * card is driven as an AGP master through its own AGP capability, which
+     * the emulated VGA adapter does not have, so the bridge is never asked
+     * to enable AGP transfers.  The status register therefore reads as zero
+     * (no rate supported) and the command register keeps AGP disabled, which
+     * is the honest description of what is emulated.
+     */
+    if (pci_add_capability(d, PCI_CAP_ID_AGP, U3_AGP_CAP_OFFSET,
+                           PCI_AGP_SIZEOF, errp) < 0) {
+        return;
+    }
+    /*
+     * The revision field has to name some AGP revision, and 2.0 is the
+     * highest one that does not describe anything beyond what is here: a
+     * real U3 reports AGP 3.0 (Mac OS X publishes AAPL,agp3-mode on the
+     * card it drives), but 3.0 comes with a transfer mode that is not
+     * emulated at all.
+     */
+    d->config[U3_AGP_CAP_OFFSET + PCI_AGP_VERSION] = 0x20;
 }
 
 static void u3_ht_pci_host_realize(PCIDevice *d, Error **errp)

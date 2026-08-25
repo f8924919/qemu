@@ -37,6 +37,19 @@
 #define U3_AGP_CFA(dev, off)  ((1u << (dev)) | (off))
 #define U3_AGP_IDS        ((0x004b << 16) | 0x106b)
 
+/*
+ * PCI config offsets and values used by the AGP capability test.  Mac OS X's
+ * AppleMacRiscAGP::configure() starts with
+ *   findPCICapability(getBridgeSpace(), kIOPCIAGPCapability, ...)
+ * and returns false without logging anything when it comes up empty, so a
+ * host bridge without a capability list makes the whole AGP domain fail to
+ * start: no nub is published for anything below it, the VGA included.
+ */
+#define PCI_CFG_STATUS       0x04    /* dword: command | status << 16 */
+#define PCI_STATUS_CAP_LIST  0x10
+#define PCI_CFG_CAP_PTR      0x34
+#define PCI_CAP_ID_AGP       0x02
+
 /* fw_cfg lives at ISA port 0x510 of the AGP domain */
 #define FW_CFG_CTL        (U3_AGP_BASE + 0x510)
 
@@ -270,6 +283,99 @@ static void test_fw_cfg_not_shadowed(void)
     qtest_quit(qts);
 }
 
+/*
+ * Read one config dword of an AGP-domain device through CONFIG_ADDR/DATA.
+ *
+ * In the CFA0 encoding the register offset is split: CONFIG_ADDR carries
+ * bits 3-7 while bits 0-2 come from the address used to touch CONFIG_DATA
+ * (see unin_get_config_reg()).  Putting the whole offset in CONFIG_ADDR
+ * silently reads the dword at the start of the same 8-byte group instead.
+ */
+static uint32_t agp_cfg_readl(QTestState *qts, int dev, uint32_t off)
+{
+    qtest_writel(qts, U3_AGP_CFG_ADDR, bswap32(U3_AGP_CFA(dev, off & 0xf8)));
+    return bswap32(qtest_readl(qts, U3_AGP_CFG_DATA + (off & 4)));
+}
+
+/*
+ * Walk the capability chain of the AGP host bridge and return the offset of
+ * the given capability, or 0 when it is absent.  The walk is bounded so that
+ * a malformed chain fails the test instead of hanging it.
+ */
+static uint32_t agp_find_capability(QTestState *qts, int dev, uint8_t id)
+{
+    uint32_t off = agp_cfg_readl(qts, dev, PCI_CFG_CAP_PTR) & 0xfc;
+    int guard;
+
+    for (guard = 0; off >= 0x40 && guard < 48; guard++) {
+        uint32_t cap = agp_cfg_readl(qts, dev, off);
+
+        if ((cap & 0xff) == id) {
+            return off;
+        }
+        off = (cap >> 8) & 0xfc;
+    }
+    g_assert_cmpint(guard, <, 48);
+    return 0;
+}
+
+/*
+ * The U3 AGP host bridge must advertise an AGP capability.  Without it
+ * AppleMacRiscAGP::configure() bails out and Mac OS X never brings up the
+ * AGP domain, which is where powermac7_3 puts the VGA adapter.
+ */
+static void test_agp_capability(void)
+{
+    QTestState *qts = qtest_init("-machine powermac7_3");
+    uint32_t status = agp_cfg_readl(qts, 11, PCI_CFG_STATUS) >> 16;
+    uint32_t cap;
+
+    g_assert_cmphex(status & PCI_STATUS_CAP_LIST, ==, PCI_STATUS_CAP_LIST);
+
+    cap = agp_find_capability(qts, 11, PCI_CAP_ID_AGP);
+    g_assert_cmphex(cap, !=, 0);
+
+    /*
+     * Mac OS X only checks that the capability exists, but leaving the
+     * revision at zero would advertise a nonexistent AGP revision.
+     */
+    g_assert_cmphex((agp_cfg_readl(qts, 11, cap) >> 20) & 0xf, !=, 0);
+
+    qtest_quit(qts);
+}
+
+/*
+ * The capability belongs to the U3 AGP bridge, so it follows the CPU rather
+ * than the machine name: mac_newworld picks the AGP host bridge on
+ * PPC_FLAGS_INPUT_970, not on the u3-ht machine property, and mac99 defaults
+ * to a 970 on a ppc64 build.  Asking for a G4 selects the UniNorth AGP
+ * bridge instead, which is the configuration the Tiger regression gate boots
+ * (mac99,via=pmu -cpu g4).  Pin it as untouched by the U3 change; whether
+ * the UniNorth bridge should grow a capability of its own is a separate
+ * question, and no guest has been seen to need one.
+ */
+static void test_mac99_g4_no_agp_capability(void)
+{
+    QTestState *qts = qtest_init("-machine mac99 -cpu g4");
+    uint32_t status;
+
+    /*
+     * The UniNorth AGP bridge uses the plain pci_host_data_le_ops, so its
+     * CONFIG_ADDR takes the ordinary x86 encoding rather than the CFA0 slot
+     * bitmap the U3 bridge decodes in unin_get_config_reg().
+     */
+    qtest_writel(qts, U3_AGP_CFG_ADDR, bswap32(0x80000000u | (11 << 11)));
+    g_assert_cmphex(bswap32(qtest_readl(qts, U3_AGP_CFG_DATA)), ==,
+                    (0x0020 << 16) | 0x106b);
+
+    qtest_writel(qts, U3_AGP_CFG_ADDR,
+                 bswap32(0x80000000u | (11 << 11) | PCI_CFG_STATUS));
+    status = bswap32(qtest_readl(qts, U3_AGP_CFG_DATA)) >> 16;
+    g_assert_cmphex(status & PCI_STATUS_CAP_LIST, ==, 0);
+
+    qtest_quit(qts);
+}
+
 static void test_unin_version(void)
 {
     QTestState *qts = qtest_init("-machine powermac7_3");
@@ -333,6 +439,9 @@ int main(int argc, char **argv)
     qtest_add_func("/u3-ht/ht-mem-window", test_ht_mem_window);
     qtest_add_func("/u3-ht/agp-io-mapped", test_agp_io_mapped);
     qtest_add_func("/u3-ht/agp-config", test_agp_config);
+    qtest_add_func("/u3-ht/agp-capability", test_agp_capability);
+    qtest_add_func("/u3-ht/mac99-g4-no-agp-capability",
+                   test_mac99_g4_no_agp_capability);
     qtest_add_func("/u3-ht/fw-cfg-not-shadowed", test_fw_cfg_not_shadowed);
     qtest_add_func("/u3-ht/unin-version", test_unin_version);
     qtest_add_func("/u3-ht/mac99-unin-version", test_mac99_unin_version);
