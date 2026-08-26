@@ -11,7 +11,7 @@ PPC64_SYSTEM_SRC=$(SRC_PATH)/tests/tcg/ppc64/system
 VPATH+=$(PPC64_SYSTEM_SRC)
 
 # These objects provide the basic boot code and helper functions for all tests
-CRT_OBJS=boot.o
+CRT_OBJS=boot.o mmufault.o
 
 PPC64_TEST_SRCS=$(wildcard $(PPC64_SYSTEM_SRC)/*.c)
 PPC64_TESTS = $(patsubst $(PPC64_SYSTEM_SRC)/%.c, %, $(PPC64_TEST_SRCS))
@@ -22,7 +22,7 @@ LDFLAGS=-Wl,-T$(LINK_SCRIPT)
 TESTS+=$(PPC64_TESTS) $(MULTIARCH_TESTS)
 # ELFv2 keeps boot.S free of function descriptor handling
 CFLAGS+=-nostdlib -g -O1 -mabi=elfv2 -mcpu=970
-CFLAGS+=$(MINILIB_INC)
+CFLAGS+=$(MINILIB_INC) -I$(PPC64_SYSTEM_SRC)
 # the build-id note would land in front of _start, which is the reset vector
 LDFLAGS+=-static -nostdlib -Wl,--build-id=none $(CRT_OBJS) $(MINILIB_OBJS) -lgcc
 
