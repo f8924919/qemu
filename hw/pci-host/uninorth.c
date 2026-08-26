@@ -623,39 +623,9 @@ static const TypeInfo u3_ht_pci_host_info = {
  * bridge at HT bus 0 / dev 3 carrying the K2 KeyLargo MacIO on its
  * secondary bus.
  */
-/*
- * The firmware writes the bridge windows but never sets the command
- * register, so enable memory decoding here (same reasoning as the
- * Simba bridge) and allow 32-bit I/O addresses.  Must be re-applied
- * on reset: the generic PCI device reset clears the writable COMMAND
- * bits again after realize.
- */
-static void u3_ht_pci_bridge_setup(PCIDevice *dev)
-{
-    pci_set_word(dev->config + PCI_COMMAND, PCI_COMMAND_MEMORY);
-    pci_set_word(dev->config + PCI_STATUS,
-                 PCI_STATUS_66MHZ | PCI_STATUS_DEVSEL_MEDIUM);
-
-    pci_set_word(dev->config + PCI_IO_BASE, PCI_IO_RANGE_TYPE_32);
-    pci_set_word(dev->config + PCI_IO_LIMIT, PCI_IO_RANGE_TYPE_32);
-
-    pci_bridge_update_mappings(PCI_BRIDGE(dev));
-}
-
 static void u3_ht_pci_bridge_realize(PCIDevice *dev, Error **errp)
 {
     pci_bridge_initfn(dev, TYPE_PCI_BUS);
-
-    pci_set_word(dev->wmask + PCI_IO_BASE_UPPER16, 0xffff);
-    pci_set_word(dev->wmask + PCI_IO_LIMIT_UPPER16, 0xffff);
-
-    u3_ht_pci_bridge_setup(dev);
-}
-
-static void u3_ht_pci_bridge_reset(DeviceState *qdev)
-{
-    pci_bridge_reset(qdev);
-    u3_ht_pci_bridge_setup(PCI_DEVICE(qdev));
 }
 
 static void u3_ht_pci_bridge_class_init(ObjectClass *klass, const void *data)
@@ -670,7 +640,7 @@ static void u3_ht_pci_bridge_class_init(ObjectClass *klass, const void *data)
     k->revision = 0x00;
     k->config_write = pci_bridge_write_config;
     set_bit(DEVICE_CATEGORY_BRIDGE, dc->categories);
-    device_class_set_legacy_reset(dc, u3_ht_pci_bridge_reset);
+    device_class_set_legacy_reset(dc, pci_bridge_reset);
     dc->vmsd = &vmstate_pci_device;
 }
 

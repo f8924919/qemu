@@ -15,6 +15,7 @@
 #include "qemu/osdep.h"
 #include "qemu/bswap.h"
 #include "libqtest.h"
+#include "hw/pci/pci_regs.h"
 
 #define U3_HT_SELF_BASE   0xf8070000ULL
 #define U3_HT_CFG_BASE    0xf2000000ULL
@@ -115,14 +116,24 @@ static void cfg_writew(QTestState *qts, uint64_t addr, uint16_t val)
  * config cycles and downstream memory decoding by hand: bus numbers,
  * a memory window covering 0xfa000000-0xfaffffff and memory decoding.
  */
-static void k2_program_bridge(QTestState *qts)
+static void k2_program_bridge_windows(QTestState *qts)
 {
     qtest_writeb(qts, U3_HT_CFG_BASE + CFA0(K2_DEVFN, 0x18), 0); /* primary */
     qtest_writeb(qts, U3_HT_CFG_BASE + CFA0(K2_DEVFN, 0x19), 1); /* secondary */
     qtest_writeb(qts, U3_HT_CFG_BASE + CFA0(K2_DEVFN, 0x1a), 1); /* subord. */
     cfg_writew(qts, U3_HT_CFG_BASE + CFA0(K2_DEVFN, 0x20), 0xfa00);
     cfg_writew(qts, U3_HT_CFG_BASE + CFA0(K2_DEVFN, 0x22), 0xfaf0);
-    cfg_writew(qts, U3_HT_CFG_BASE + CFA0(K2_DEVFN, 4), 0x0002);
+}
+
+static void k2_enable_bridge_decoding(QTestState *qts)
+{
+    cfg_writew(qts, U3_HT_CFG_BASE + CFA0(K2_DEVFN, 4), PCI_COMMAND_MEMORY);
+}
+
+static void k2_program_bridge(QTestState *qts)
+{
+    k2_program_bridge_windows(qts);
+    k2_enable_bridge_decoding(qts);
 }
 
 static void test_self_window(void)
@@ -196,6 +207,43 @@ static void test_cfa1_bridge(void)
     /* CFA1 bus field [23:16]: macio behind the K2 bridge on bus 1 */
     g_assert_cmphex(cfg_readl(qts, U3_HT_CFG_BASE + CFA1(1, MACIO_DEVFN, 0)),
                     ==, MACIO_IDS);
+
+    qtest_quit(qts);
+}
+
+/*
+ * Memory decoding on the K2 bridge is off until someone turns it on.  The
+ * board comes up with COMMAND clear and nothing in QEMU puts the bit back:
+ * arranging the windows is the firmware's job, or the guest's if it runs
+ * without one.  Check that by driving the two halves separately.
+ */
+static void test_k2_decoding_off_until_enabled(void)
+{
+    QTestState *qts = qtest_init("-machine powermac7_3 "
+                                 "-device pci-testdev,bus=ht.1,addr=8,"
+                                 "membar=4096,membar-backed=true");
+    uint64_t bar = U3_HT_MEM_BASE + 0x100000;
+    uint32_t devfn = 8 << 3;
+
+    /* Everything except the bridge's own COMMAND. */
+    k2_program_bridge_windows(qts);
+    cfg_writel(qts, U3_HT_CFG_BASE + CFA1(1, devfn, 0x18), (uint32_t)bar);
+    cfg_writel(qts, U3_HT_CFG_BASE + CFA1(1, devfn, 0x1c), 0);
+    cfg_writew(qts, U3_HT_CFG_BASE + CFA1(1, devfn, 4), PCI_COMMAND_MEMORY);
+
+    /*
+     * The access must not reach the device.  Nothing claims the address
+     * while the window is closed, so the write is dropped and the read
+     * comes back as whatever an unclaimed read gives (0 today); what
+     * matters is only that it is not what we wrote.
+     */
+    qtest_writel(qts, bar + 8, 0x12345678);
+    g_assert_cmphex(qtest_readl(qts, bar + 8), !=, 0x12345678);
+
+    k2_enable_bridge_decoding(qts);
+
+    qtest_writel(qts, bar + 8, 0x12345678);
+    g_assert_cmphex(qtest_readl(qts, bar + 8), ==, 0x12345678);
 
     qtest_quit(qts);
 }
@@ -436,6 +484,8 @@ int main(int argc, char **argv)
     qtest_add_func("/u3-ht/cfa0", test_cfa0);
     qtest_add_func("/u3-ht/cfa1-master-abort", test_cfa1_master_abort);
     qtest_add_func("/u3-ht/cfa1-bridge", test_cfa1_bridge);
+    qtest_add_func("/u3-ht/k2-decoding-off",
+                   test_k2_decoding_off_until_enabled);
     qtest_add_func("/u3-ht/ht-mem-window", test_ht_mem_window);
     qtest_add_func("/u3-ht/agp-io-mapped", test_agp_io_mapped);
     qtest_add_func("/u3-ht/agp-config", test_agp_config);
