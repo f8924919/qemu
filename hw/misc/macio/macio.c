@@ -283,10 +283,11 @@ static void macio_newworld_realize(PCIDevice *d, Error **errp)
          * PowerMac7,3 maps the mpic on the sysbus at 0xf8040000 instead of
          * inside the BAR.  On real hardware both are the same registers,
          * because the K2 BAR covers 0xf8000000 and the mpic sits at
-         * BAR + 0x40000, and the device tree exposes the mpic twice: once
-         * under /u3 and once as a child of mac-io.  Mac OS X resolves the
-         * latter, so mirror the region into the BAR to keep the "reg" of
-         * that node pointing at the real thing.
+         * BAR + 0x40000, and the device tree exposes the mpic twice: as a
+         * child of mac-io and again under /u3.  The mac-io one is the root
+         * PIC that both Mac OS X and Linux drive, and its "reg" is BAR
+         * relative, so mirror the region into the BAR to make that reg
+         * point at the real thing.
          */
         MemoryRegion *pic_mr = sysbus_mmio_get_region(sbd, 0);
 
@@ -426,9 +427,11 @@ static const Property macio_newworld_properties[] = {
     DEFINE_PROP_BOOL("has-pmu", NewWorldMacIOState, has_pmu, false),
     DEFINE_PROP_BOOL("has-adb", NewWorldMacIOState, has_adb, false),
     /*
-     * The U3-based machines (PowerMac7,3) expose the mpic inside the
-     * U3 at 0xf8040000, not inside the MacIO BAR: the machine clears
-     * this and maps the pic's memory region itself.
+     * Whether the pic's registers are mapped inside the MacIO BAR.  The
+     * U3-based machines (PowerMac7,3) put them on the sysbus at
+     * 0xf8040000 instead: the machine clears this and maps the pic's
+     * memory region itself, and MacIO then mirrors it back into the BAR
+     * at the offset the device tree's mac-io/mpic node describes.
      */
     DEFINE_PROP_BOOL("pic-in-bar", NewWorldMacIOState, pic_in_bar, true),
 };

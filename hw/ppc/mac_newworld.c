@@ -447,7 +447,12 @@ static void ppc_core99_init(MachineState *machine)
     qdev_prop_set_bit(dev, "has-pmu", has_pmu);
     qdev_prop_set_bit(dev, "has-adb", has_adb);
     if (u3_ht_dev) {
-        /* The mpic lives inside the U3, not in the MacIO BAR */
+        /*
+         * The mpic's registers live on the sysbus inside the U3 rather
+         * than inside the MacIO BAR; the machine maps them itself below
+         * and mirrors them back into the BAR, because the device tree
+         * describes the same registers from both places.
+         */
         qdev_prop_set_bit(dev, "pic-in-bar", false);
     }
 
@@ -460,7 +465,12 @@ static void ppc_core99_init(MachineState *machine)
 
     pic_dev = DEVICE(object_resolve_path_component(macio, "pic"));
     if (u3_ht_dev) {
-        /* mpic inside the U3 at 0xf8040000 (see the self window map) */
+        /*
+         * mpic inside the U3 at 0xf8040000 (see the self window map).
+         * This is only where the registers are; the node the OS drives
+         * is the one below mac-io, which reaches them through the alias
+         * MacIO puts in its BAR.
+         */
         sysbus_mmio_map_overlap(SYS_BUS_DEVICE(pic_dev), 0, 0xf8040000, 0);
     }
     for (i = 0; i < 4; i++) {
