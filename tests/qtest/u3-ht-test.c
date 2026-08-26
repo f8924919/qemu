@@ -145,9 +145,11 @@ static void test_self_window(void)
 
     /*
      * Region decode register = config offset 0x80.  Linux reads it at
-     * cfg_addr + 0x80 in units of u32, i.e. byte offset 0x200.  Fixed
-     * value mimics the real machine: bits i=4,8,9,10 (0x80000000 >> i);
-     * i=10 advertises the 0xfa000000 PCI memory window.
+     * cfg_addr + 0x80 in units of u32, i.e. byte offset 0x200.  Bits
+     * i=4,8,9 (0x80000000 >> i) are the ones the Linux kernel comment
+     * names as enabled on a real machine; i=10 is added here to
+     * advertise the 0xfa000000 PCI memory window that backs the BARs
+     * of the devices on the HT bus.
      */
     g_assert_cmphex(qtest_readl(qts, U3_HT_SELF_BASE + 0x200), ==,
                     0x08e00000);
