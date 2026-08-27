@@ -24,7 +24,11 @@
 
 #include <minilib.h>
 
+#include "progfault.h"
+
 #define SPR_SDR1 25
+
+#define VEC_PROGRAM 0x700UL
 
 #define MSR_HV_BIT 60
 
@@ -55,7 +59,7 @@ static unsigned long get_msr(void)
 
 int main(void)
 {
-    unsigned long msr, sdr1;
+    unsigned long msr, sdr1, vec;
     int ok = 1;
 
     /*
@@ -85,6 +89,23 @@ int main(void)
     if (sdr1 != SDR1_PATTERN) {
         ml_printf("FAIL: hvmode SDR1 reads back 0x%lx, expected 0x%lx\n",
                   sdr1, SDR1_PATTERN);
+        ok = 0;
+    }
+
+    /*
+     * An undefined instruction has to come back as a program interrupt.
+     * QEMU turns a hypervisor emulation assist into one only while the core
+     * has no MSR[HV]; with HV and no 0xe40 vector to deliver it to, the
+     * emulator aborts instead and the guest is gone.
+     */
+    vec = take_program_fault();
+    if (vec != VEC_PROGRAM) {
+        ml_printf("FAIL: hvmode undefined instruction took vector 0x%lx, "
+                  "expected 0x%lx\n", vec, VEC_PROGRAM);
+        ok = 0;
+    } else if (prog_srr0 != prog_expect) {
+        ml_printf("FAIL: hvmode program interrupt reports 0x%lx, "
+                  "expected 0x%lx\n", prog_srr0, prog_expect);
         ok = 0;
     }
 
