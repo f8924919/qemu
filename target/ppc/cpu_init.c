@@ -5413,10 +5413,12 @@ static void register_970_lpar_sprs(CPUPPCState *env)
 #if !defined(CONFIG_USER_ONLY)
     /*
      * PPC970: HID4 covers things later controlled by the LPCR and
-     * RMOR in later CPUs, but with a different encoding.  We only
-     * support the 970 in "Apple mode" which has all hypervisor
-     * facilities disabled by strapping, so we can basically just
-     * ignore it
+     * RMOR in later CPUs, but with a different encoding.  Whether the
+     * hypervisor facilities are strapped on is a board decision, taken
+     * through the hv-strap property; either way nothing here acts on
+     * HID4, so it stays plain storage.  A guest that finds itself in
+     * hypervisor state will write it -- Linux does, in
+     * __setup_cpu_ppc970() -- and reads it back unchanged.
      */
     spr_register(env, SPR_970_HID4, "HID4",
                  SPR_NOACCESS, SPR_NOACCESS,
@@ -5995,6 +5997,32 @@ static void init_proc_970(CPUPPCState *env)
     ppc970_irq_init(env_archcpu(env));
 }
 
+static bool ppc_cpu_get_hv_strap(Object *obj, Error **errp)
+{
+    return !!(POWERPC_CPU(obj)->env.msr_mask & MSR_HVB);
+}
+
+/*
+ * The hypervisor facilities of a 970 are strapped on or off by the board.
+ * Apple wires them on: MSR[HV] reads as one there, which is what lets
+ * Linux's __cpu_preinit_ppc970() run and undo the 32-byte dcbz mode that
+ * Open Firmware leaves enabled.  Boards that present the part the other way
+ * round leave this off, which is the default and the historical behaviour.
+ */
+static void ppc_cpu_set_hv_strap(Object *obj, bool value, Error **errp)
+{
+    CPUPPCState *env = &POWERPC_CPU(obj)->env;
+
+    if (value) {
+        env->msr_mask |= MSR_HVB;
+    } else {
+        env->msr_mask &= ~MSR_HVB;
+    }
+#if !defined(CONFIG_USER_ONLY)
+    env->has_hv_mode = !!(env->msr_mask & MSR_HVB);
+#endif
+}
+
 POWERPC_FAMILY(970)(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
@@ -6035,6 +6063,11 @@ POWERPC_FAMILY(970)(ObjectClass *oc, const void *data)
 #endif
     pcc->excp_model = POWERPC_EXCP_970;
     pcc->bus_model = PPC_FLAGS_INPUT_970;
+    object_class_property_add_bool(oc, "hv-strap",
+                                   ppc_cpu_get_hv_strap,
+                                   ppc_cpu_set_hv_strap);
+    object_class_property_set_description(oc, "hv-strap",
+        "Present the hypervisor facilities as strapped on (Apple wiring)");
     pcc->bfd_mach = bfd_mach_ppc64;
     pcc->flags = POWERPC_FLAG_VRE | POWERPC_FLAG_SE |
                  POWERPC_FLAG_BE | POWERPC_FLAG_PMM |
@@ -7436,10 +7469,10 @@ static void ppc_cpu_instance_init(Object *obj)
      * Mark HV mode as supported if the CPU has an MSR_HV bit in the
      * msr_mask. The mask can later be cleared by PAPR mode but the hv
      * mode support will remain, thus enforcing that we cannot use
-     * priv. instructions in guest in PAPR mode. For 970 we currently
-     * simply don't set HV in msr_mask thus simulating an "Apple mode"
-     * 970. If we ever want to support 970 HV mode, we'll have to add
-     * a processor attribute of some sort.
+     * priv. instructions in guest in PAPR mode. The 970 leaves HV out
+     * of msr_mask by default, which is the strapping a board without
+     * hypervisor facilities presents; boards that wire them on ask for
+     * it with the hv-strap property, which adjusts both of these.
      */
 #if !defined(CONFIG_USER_ONLY)
     env->has_hv_mode = !!(env->msr_mask & MSR_HVB);
