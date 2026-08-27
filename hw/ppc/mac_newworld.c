@@ -47,6 +47,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "target/ppc/helper_regs.h"
 #include "qemu/datadir.h"
 #include "qemu/units.h"
 #include "qapi/error.h"
@@ -130,6 +131,18 @@ static void ppc_core99_reset(void *opaque)
     cpu_reset(CPU(cpu));
     /* 970 CPUs want to get their initial IP as part of their boot protocol */
     cpu->env.nip = PROM_BASE + 0x100;
+
+    /*
+     * A strapped-on 970 comes out of reset in hypervisor state.  Reset itself
+     * cannot establish that: hreg_store_msr() refuses to raise MSR[HV] from a
+     * core that is not already in it, so set the bit the way the PowerNV cores
+     * do and recompute what depends on it.
+     */
+    if (cpu->env.msr_mask & MSR_HVB) {
+        cpu->env.msr |= MSR_HVB;
+        hreg_compute_hflags(&cpu->env);
+        ppc_maybe_interrupt(&cpu->env);
+    }
 }
 
 /* PowerPC Mac99 hardware initialisation */
@@ -164,7 +177,21 @@ static void ppc_core99_init(MachineState *machine)
 
     /* init CPUs */
     for (i = 0; i < machine->smp.cpus; i++) {
-        cpu = POWERPC_CPU(cpu_create(machine->cpu_type));
+        Object *cpuobj = object_new(machine->cpu_type);
+
+        /*
+         * A PowerMac7,3 straps the 970's hypervisor facilities on, so the
+         * part comes up with MSR[HV] set the way it does on the hardware.
+         * Linux checks that bit before it undoes the 32-byte dcbz mode the
+         * firmware leaves enabled, and dies clearing pages without it.
+         */
+        if (core99_machine->has_u3_ht &&
+            object_property_find(cpuobj, "hv-strap")) {
+            object_property_set_bool(cpuobj, "hv-strap", true, &error_fatal);
+        }
+
+        qdev_realize(DEVICE(cpuobj), NULL, &error_fatal);
+        cpu = POWERPC_CPU(cpuobj);
         env = &cpu->env;
 
         /* Set time-base frequency to 100 Mhz */
