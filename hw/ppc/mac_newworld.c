@@ -468,7 +468,7 @@ static void ppc_core99_init(MachineState *machine)
 
     /* MacIO */
     macio = OBJECT(pci_new(k2_bus ? PCI_DEVFN(7, 0) : -1,
-                           TYPE_NEWWORLD_MACIO));
+                           u3_ht_dev ? TYPE_K2_MACIO : TYPE_NEWWORLD_MACIO));
     dev = DEVICE(macio);
     qdev_prop_set_uint64(dev, "frequency", tbfreq);
     qdev_prop_set_bit(dev, "has-pmu", has_pmu);
@@ -690,7 +690,13 @@ static char *core99_fw_dev_path(FWPathProvider *p, BusState *bus,
     PCIDevice *pci;
     MACIOIDEState *macio_ide;
 
-    if (!strcmp(object_get_typename(OBJECT(dev)), "macio-newworld")) {
+    /*
+     * Match the type rather than its name: the PowerMac7,3 plugs in a
+     * macio-k2, which is a macio-newworld with a different PCI id, and a
+     * name comparison would walk straight past it and hand out a device
+     * path built from the type name.
+     */
+    if (object_dynamic_cast(OBJECT(dev), TYPE_NEWWORLD_MACIO)) {
         pci = PCI_DEVICE(dev);
         return g_strdup_printf("mac-io@%x", PCI_SLOT(pci->devfn));
     }

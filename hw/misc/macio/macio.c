@@ -484,6 +484,24 @@ static const TypeInfo macio_newworld_type_info = {
     .class_init    = macio_newworld_class_init,
 };
 
+/*
+ * The K2 KeyLargo differs from the plain KeyLargo only in the id it
+ * reports.  Everything else - the child devices, the properties, the
+ * migration state - comes from the parent type.
+ */
+static void macio_k2_class_init(ObjectClass *oc, const void *data)
+{
+    PCIDeviceClass *pdc = PCI_DEVICE_CLASS(oc);
+
+    pdc->device_id = PCI_DEVICE_ID_APPLE_K2_KEYL;
+}
+
+static const TypeInfo macio_k2_type_info = {
+    .name          = TYPE_K2_MACIO,
+    .parent        = TYPE_NEWWORLD_MACIO,
+    .class_init    = macio_k2_class_init,
+};
+
 static const TypeInfo macio_type_info = {
     .name          = TYPE_MACIO,
     .parent        = TYPE_PCI_DEVICE,
@@ -503,6 +521,7 @@ static void macio_register_types(void)
     type_register_static(&macio_type_info);
     type_register_static(&macio_oldworld_type_info);
     type_register_static(&macio_newworld_type_info);
+    type_register_static(&macio_k2_type_info);
 }
 
 type_init(macio_register_types)

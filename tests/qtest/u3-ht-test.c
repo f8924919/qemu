@@ -68,7 +68,13 @@
 #define K2_DEVFN          (3 << 3)
 #define K2_IDS            ((0x0045 << 16) | 0x106b)
 #define MACIO_DEVFN       (7 << 3)
-#define MACIO_IDS         ((0x0022 << 16) | 0x106b)
+/*
+ * The real 7,3 carries a K2 KeyLargo (106b:0041), not the plain KeyLargo
+ * (106b:0022) the mac99 machines have.  Linux picks the macio chip type
+ * from the device tree's "compatible", and OpenBIOS in turn keys the node
+ * off the PCI id, so the id is what splits the two machines apart.
+ */
+#define MACIO_IDS         ((0x0041 << 16) | 0x106b)
 
 /* HT PCI memory window (identity-mapped, 16MB) */
 #define U3_HT_MEM_BASE    0xfa000000ULL

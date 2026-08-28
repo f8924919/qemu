@@ -132,6 +132,13 @@ struct OldWorldMacIOState {
 #define TYPE_NEWWORLD_MACIO "macio-newworld"
 OBJECT_DECLARE_SIMPLE_TYPE(NewWorldMacIOState, NEWWORLD_MACIO)
 
+/*
+ * The K2 KeyLargo of a PowerMac7,3: a macio-newworld that reports the id
+ * of the real chip.  OpenBIOS keys the device tree node off that id, so
+ * this is what makes the node come out as "K2-Keylargo".
+ */
+#define TYPE_K2_MACIO "macio-k2"
+
 struct NewWorldMacIOState {
     /*< private >*/
     MacIOState parent_obj;
