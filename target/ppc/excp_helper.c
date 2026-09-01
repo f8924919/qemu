@@ -1435,7 +1435,9 @@ static void powerpc_excp_books(PowerPCCPU *cpu, int excp)
      * unless running a nested-hv guest, in which case the L1
      * kernel wants the interrupt.
      */
-    if (excp == POWERPC_EXCP_HV_EMU && !(env->msr_mask & MSR_HVB) &&
+    if (excp == POWERPC_EXCP_HV_EMU &&
+            (!(env->msr_mask & MSR_HVB) ||
+             env->excp_vectors[POWERPC_EXCP_HV_EMU] == (target_ulong)-1ULL) &&
             !books_vhyp_handles_hv_excp(cpu)) {
         excp = POWERPC_EXCP_PROGRAM;
     }
@@ -1477,10 +1479,20 @@ static void powerpc_excp_books(PowerPCCPU *cpu, int excp)
         break;
     case POWERPC_EXCP_EXTERNAL:  /* External input                           */
     {
+        PowerPCCPUClass *pcc = POWERPC_CPU_GET_CLASS(cpu);
         bool lpes0;
 
         /* LPES0 is only taken into consideration if we support HV mode */
         if (!env->has_hv_mode) {
+            break;
+        }
+        /*
+         * A core can have a hypervisor state without implementing LPCR: the
+         * 970 is one, and routes external interrupts to SRR0/1 the way LPES0
+         * describes.  Reading the register as zero would send them to HSRR0/1
+         * instead, which such a core has no way to return from.
+         */
+        if (!(pcc->lpcr_mask & LPCR_LPES0)) {
             break;
         }
         lpes0 = !!(env->spr[SPR_LPCR] & LPCR_LPES0);
