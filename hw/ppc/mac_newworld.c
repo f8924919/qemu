@@ -333,11 +333,21 @@ static void ppc_core99_init(MachineState *machine)
     }
 
     openpic_irqs = g_new0(IrqLines, machine->smp.cpus);
-    dev = DEVICE(cpu);
     for (i = 0; i < machine->smp.cpus; i++) {
-        /* Mac99 IRQ connection between OpenPIC outputs pins
-         * and PowerPC input pins
+        /*
+         * Mac99 IRQ connection between OpenPIC outputs pins
+         * and PowerPC input pins.
+         *
+         * Take the CPU for this destination rather than whichever one the
+         * loop above happened to leave behind: with more than one of them
+         * every destination would otherwise land on the last CPU, and the
+         * first would never see an interrupt.
          */
+        CPUState *cs = qemu_get_cpu(i);
+
+        dev = DEVICE(cs);
+        env = &POWERPC_CPU(cs)->env;
+
         switch (PPC_INPUT(env)) {
         case PPC_FLAGS_INPUT_6xx:
             openpic_irqs[i].irq[OPENPIC_OUTPUT_INT] =
