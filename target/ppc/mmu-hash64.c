@@ -342,8 +342,32 @@ static int ppc_find_slb_vsid(PowerPCCPU *cpu, target_ulong rb,
 void helper_SLBMTE(CPUPPCState *env, target_ulong rb, target_ulong rs)
 {
     PowerPCCPU *cpu = env_archcpu(env);
+    target_ulong slot, esid;
 
-    if (ppc_store_slb(cpu, rb & 0xfff, rb & ~0xfffULL, rs) < 0) {
+    /*
+     * Decode RB the way hardware does.  Power ISA v3.0B says of slbmte that
+     * "the hardware ignores the contents of RS and RB listed below and
+     * software must set them to 0s", and lists (RB)37:51 among them.  The
+     * index in (RB)52:63 only has to have the bits beyond the size of the
+     * SLB zeroed by software; the architecture does not say what happens
+     * when they are not, and hardware truncates.
+     *
+     * Mac OS X leans on both.  Its page fault handler builds RB straight out
+     * of the faulting effective address: it ORs in the valid bit and drops
+     * the entry number into the low six bits, leaving the rest of the
+     * address in the reserved field and in the top half of the index.
+     * Handing that to ppc_store_slb() unmasked makes it refuse the store,
+     * which turns the slbmte into an illegal instruction and takes the guest
+     * down.  Linux masks the effective address itself, which is why this has
+     * gone unnoticed; KVM's own slbmte emulation ignores the extra bits just
+     * like the hardware.
+     *
+     * Every SLB size we model is a power of two, so size - 1 is the mask.
+     */
+    slot = rb & (cpu->hash64_opts->slb_size - 1);
+    esid = rb & (SLB_ESID_ESID | SLB_ESID_V);
+
+    if (ppc_store_slb(cpu, slot, esid, rs) < 0) {
         raise_exception_err_ra(env, POWERPC_EXCP_PROGRAM,
                                POWERPC_EXCP_INVAL, GETPC());
     }
