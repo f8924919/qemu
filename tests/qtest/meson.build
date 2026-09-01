@@ -197,6 +197,7 @@ qtests_ppc64 = \
   (config_all_devices.has_key('CONFIG_USB_UHCI') ? ['usb-hcd-uhci-test'] : []) +             \
   (config_all_devices.has_key('CONFIG_USB_XHCI_NEC') ? ['usb-hcd-xhci-test'] : []) +         \
   (config_all_devices.has_key('CONFIG_MAC_NEWWORLD') and config_all_devices.has_key('CONFIG_PCI_TESTDEV') ? ['u3-ht-test'] : []) + \
+  (config_all_devices.has_key('CONFIG_MAC_NEWWORLD') ? ['powermac7_3-smp-test'] : []) + \
   qtests_pci + ['migration-test', 'cpu-plug-test', 'drive_del-test']
 
 qtests_sh4 = (config_all_devices.has_key('CONFIG_ISA_TESTDEV') ? ['endianness-test'] : [])

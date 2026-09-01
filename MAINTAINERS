@@ -1619,6 +1619,7 @@ F: pc-bios/qemu_vga.ndrv
 F: tests/functional/ppc/test_mac.py
 F: tests/functional/ppc64/test_mac99.py
 F: tests/qtest/u3-ht-test.c
+F: tests/qtest/powermac7_3-smp-test.c
 
 Old World (g3beige)
 M: Mark Cave-Ayland <mark.cave-ayland@ilande.co.uk>
