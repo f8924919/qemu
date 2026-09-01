@@ -47,7 +47,6 @@
  */
 
 #include "qemu/osdep.h"
-#include "target/ppc/helper_regs.h"
 #include "qemu/datadir.h"
 #include "qemu/units.h"
 #include "qapi/error.h"
@@ -131,18 +130,6 @@ static void ppc_core99_reset(void *opaque)
     cpu_reset(CPU(cpu));
     /* 970 CPUs want to get their initial IP as part of their boot protocol */
     cpu->env.nip = PROM_BASE + 0x100;
-
-    /*
-     * A strapped-on 970 comes out of reset in hypervisor state.  Reset itself
-     * cannot establish that: hreg_store_msr() refuses to raise MSR[HV] from a
-     * core that is not already in it, so set the bit the way the PowerNV cores
-     * do and recompute what depends on it.
-     */
-    if (cpu->env.msr_mask & MSR_HVB) {
-        cpu->env.msr |= MSR_HVB;
-        hreg_compute_hflags(&cpu->env);
-        ppc_maybe_interrupt(&cpu->env);
-    }
 }
 
 /* PowerPC Mac99 hardware initialisation */
