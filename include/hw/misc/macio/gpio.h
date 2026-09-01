@@ -33,6 +33,13 @@
 #define TYPE_MACIO_GPIO "macio-gpio"
 OBJECT_DECLARE_SIMPLE_TYPE(MacIOGPIOState, MACIO_GPIO)
 
+/*
+ * One output line per CPU reset GPIO, deasserted when the guest lets the
+ * corresponding processor out of reset.  The register indices behind them
+ * are not consecutive, so gpio.c keeps the mapping rather than deriving it.
+ */
+#define MACIO_GPIO_RESET_CPU_CNT KEYLARGO_MAX_CPU
+
 struct MacIOGPIOState {
     /*< private >*/
     SysBusDevice parent;
@@ -40,6 +47,7 @@ struct MacIOGPIOState {
 
     MemoryRegion gpiomem;
     qemu_irq gpio_extirqs[10];
+    qemu_irq cpu_reset_irqs[MACIO_GPIO_RESET_CPU_CNT];
     uint8_t gpio_levels[8];
     uint8_t gpio_regs[36]; /* XXX Check count */
 };

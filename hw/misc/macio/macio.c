@@ -273,6 +273,7 @@ static void macio_newworld_realize(PCIDevice *d, Error **errp)
 
     /* OpenPIC */
     qdev_prop_set_uint32(pic_dev, "model", OPENPIC_MODEL_KEYLARGO);
+    qdev_prop_set_uint32(pic_dev, "nb_cpus", ns->nb_cpus);
     sbd = SYS_BUS_DEVICE(&ns->pic);
     sysbus_realize_and_unref(sbd, &error_fatal);
     if (ns->pic_in_bar) {
@@ -333,6 +334,14 @@ static void macio_newworld_realize(PCIDevice *d, Error **errp)
                            NEWWORLD_EXTING_GPIO9));
         memory_region_add_subregion(&s->bar, 0x50,
                                     sysbus_mmio_get_region(sbd, 0));
+
+        /*
+         * The CPU reset lines are wired to the board, which is the only
+         * thing here that knows about processors.  Republish them on MacIO
+         * itself so that the machine does not have to reach inside for the
+         * GPIO controller.
+         */
+        qdev_pass_gpios(DEVICE(&ns->gpio), DEVICE(s), "cpu-reset");
 
         /* PMU */
         object_initialize_child(OBJECT(s), "pmu", &s->pmu, TYPE_VIA_PMU);
@@ -434,6 +443,14 @@ static const Property macio_newworld_properties[] = {
      * at the offset the device tree's mac-io/mpic node describes.
      */
     DEFINE_PROP_BOOL("pic-in-bar", NewWorldMacIOState, pic_in_bar, true),
+    /*
+     * How many CPUs the pic has to be able to deliver to.  The board knows
+     * this and MacIO does not, and the two have to agree: the board wires
+     * OPENPIC_OUTPUT_NB lines per CPU, so a pic that sized itself for fewer
+     * destinations runs out of sysbus IRQs while the board is still
+     * connecting them.
+     */
+    DEFINE_PROP_UINT32("nb_cpus", NewWorldMacIOState, nb_cpus, 1),
 };
 
 static void macio_newworld_class_init(ObjectClass *oc, const void *data)

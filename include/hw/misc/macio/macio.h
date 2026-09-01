@@ -146,6 +146,7 @@ struct NewWorldMacIOState {
 
     bool has_pmu;
     bool has_adb;
+    uint32_t nb_cpus;
     OpenPICState pic;
     bool pic_in_bar;
     MemoryRegion pic_alias;

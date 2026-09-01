@@ -65,6 +65,7 @@
 #include "hw/nvram/fw_cfg.h"
 #include "hw/char/escc.h"
 #include "hw/misc/macio/macio.h"
+#include "hw/core/irq.h"
 #include "hw/ppc/openpic.h"
 #include "hw/core/loader.h"
 #include "hw/core/fw-path-provider.h"
@@ -128,8 +129,51 @@ static void ppc_core99_reset(void *opaque)
     PowerPCCPU *cpu = opaque;
 
     cpu_reset(CPU(cpu));
-    /* 970 CPUs want to get their initial IP as part of their boot protocol */
-    cpu->env.nip = PROM_BASE + 0x100;
+    /*
+     * 970 CPUs want to get their initial IP as part of their boot protocol.
+     *
+     * Only the CPU that runs the firmware, though: a held processor is
+     * released by a soft reset and has to come out of it at the real vector,
+     * where the OS has left a trampoline for it, rather than in ROM.  The
+     * pic can raise OPENPIC_OUTPUT_RESET on any CPU, so make that true
+     * whatever ends up unhalting it.
+     */
+    if (!CPU(cpu)->start_powered_off) {
+        cpu->env.nip = PROM_BASE + 0x100;
+    }
+}
+
+/*
+ * Bring a CPU out of reset the way the KeyLargo reset GPIO does on the
+ * hardware.  Linux patches the reset vector at physical 0x100 with a branch
+ * to its secondary entry point, pulses the line and puts the original
+ * instruction back a millisecond later, so the processor has to start
+ * executing at the architected vector: cpu_reset() leaves nip there and
+ * nothing must overwrite it.
+ */
+static void ppc_core99_cpu_reset_work(CPUState *cs, run_on_cpu_data arg)
+{
+    cpu_reset(cs);
+    cs->halted = 0;
+}
+
+static void ppc_core99_cpu_reset_line(void *opaque, int n, int level)
+{
+    CPUState *cs = opaque;
+
+    /* Active low: releasing the line is what starts the processor. */
+    if (!level) {
+        return;
+    }
+
+    /*
+     * cpu_reset() invalidates TLBs and breakpoints, so it cannot run
+     * underneath the target while it is executing.  The write that got us
+     * here came from another vCPU thread holding the BQL; waiting for this
+     * to finish there would stall that guest's store, so hand it over and
+     * let it happen exclusively on the CPU being reset.
+     */
+    async_safe_run_on_cpu(cs, ppc_core99_cpu_reset_work, RUN_ON_CPU_NULL);
 }
 
 /* PowerPC Mac99 hardware initialisation */
@@ -180,6 +224,16 @@ static void ppc_core99_init(MachineState *machine)
         qdev_realize(DEVICE(cpuobj), NULL, &error_fatal);
         cpu = POWERPC_CPU(cpuobj);
         env = &cpu->env;
+
+        /*
+         * Only the boot processor runs the firmware.  The rest wait for the
+         * OS to release them through the KeyLargo reset GPIO, which is how
+         * the hardware does it.
+         */
+        if (i != 0) {
+            object_property_set_bool(cpuobj, "start-powered-off", true,
+                                     &error_fatal);
+        }
 
         /* Set time-base frequency to 100 Mhz */
         cpu_ppc_tb_init(env, TBFREQ);
@@ -460,6 +514,7 @@ static void ppc_core99_init(MachineState *machine)
     qdev_prop_set_uint64(dev, "frequency", tbfreq);
     qdev_prop_set_bit(dev, "has-pmu", has_pmu);
     qdev_prop_set_bit(dev, "has-adb", has_adb);
+    qdev_prop_set_uint32(dev, "nb_cpus", machine->smp.cpus);
     if (u3_ht_dev) {
         /*
          * The mpic's registers live on the sysbus inside the U3 rather
@@ -476,6 +531,25 @@ static void ppc_core99_init(MachineState *machine)
 
     pci_realize_and_unref(PCI_DEVICE(macio), k2_bus ? k2_bus : pci_bus,
                           &error_fatal);
+
+    /*
+     * Hook the KeyLargo CPU reset lines up to the processors they name.
+     * MacIO only grows them when it has a PMU, which is what carries the
+     * GPIO controller.
+     */
+    if (has_pmu) {
+        CPUState *cs;
+
+        CPU_FOREACH(cs) {
+            if (cs->cpu_index >= MACIO_GPIO_RESET_CPU_CNT) {
+                break;
+            }
+            qdev_connect_gpio_out_named(DEVICE(macio), "cpu-reset",
+                                        cs->cpu_index,
+                                        qemu_allocate_irq(
+                                            ppc_core99_cpu_reset_line, cs, 0));
+        }
+    }
 
     pic_dev = DEVICE(object_resolve_path_component(macio, "pic"));
     if (u3_ht_dev) {
@@ -850,6 +924,13 @@ static void powermac7_3_machine_class_init(ObjectClass *oc, const void *data)
 
     mc->desc = "Apple Power Mac G5 (Niagara)";
     mc->default_cpu_type = POWERPC_CPU_TYPE_NAME("970fx_v3.1");
+    /*
+     * A PowerMac7,3 is a 2-way machine.  The KeyLargo pic can address more
+     * (KEYLARGO_MAX_CPU) and so can the OS, but no such G5 was built, so
+     * keep the machine to what the hardware had.  The base class leaves
+     * mac99 and the G4 machines uniprocessor.
+     */
+    mc->max_cpus = 2;
 }
 
 static void powermac7_3_instance_init(Object *obj)
