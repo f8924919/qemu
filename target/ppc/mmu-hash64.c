@@ -1093,6 +1093,15 @@ bool ppc_hash64_xlate(PowerPCCPU *cpu, vaddr eaddr, MMUAccessType access_type,
             cs->exception_index = POWERPC_EXCP_DSEG;
             env->error_code = 0;
             env->spr[SPR_DAR] = eaddr;
+            /*
+             * The architecture leaves DSISR undefined here, but no hash
+             * table lookup was performed, so reporting a page table miss
+             * is actively misleading and hardware does not do it.  Mac OS X
+             * turns the data segment interrupt into a DSI and then tells a
+             * missing segment from a missing PTE by that very bit, so a
+             * stale DSISR makes it retry the access forever.
+             */
+            env->spr[SPR_DSISR] = 0;
             break;
         default:
             g_assert_not_reached();
