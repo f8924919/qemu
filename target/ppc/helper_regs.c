@@ -308,6 +308,18 @@ int hreg_store_msr(CPUPPCState *env, target_ulong value, int alter_hv)
         value &= ~MSR_HVB;
         value |= env->msr & MSR_HVB;
     }
+
+    /*
+     * A core whose hypervisor facilities are strapped on has no partition to
+     * drop into: it comes out of reset in hypervisor state and cannot leave
+     * it.  Mac OS X builds MSR from 32-bit constants and returns through
+     * rfid, which would otherwise take MSR[HV] away from it and leave the
+     * kernel unable to reach SDR1.
+     */
+    if (env->excp_model == POWERPC_EXCP_970 && (env->msr_mask & MSR_HVB)) {
+        value |= MSR_HVB;
+    }
+
     /* Attempt to modify MSR[ME] in guest state is ignored */
     if (is_book3s_arch2x(env) && !(env->msr & MSR_HVB)) {
         value &= ~(1 << MSR_ME);
