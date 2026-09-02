@@ -54,3 +54,11 @@ config PMBUS
 config BCM2835_I2C
     bool
     select I2C
+
+config KEYWEST_I2C
+    bool
+    select I2C
+
+config MAC_HWCLOCK
+    bool
+    select I2C

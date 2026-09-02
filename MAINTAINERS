@@ -1618,8 +1618,11 @@ F: include/hw/input/adb*
 F: pc-bios/qemu_vga.ndrv
 F: tests/functional/ppc/test_mac.py
 F: tests/functional/ppc64/test_mac99.py
+F: hw/i2c/keywest_i2c.c
+F: hw/i2c/mac_hwclock.c
 F: tests/qtest/u3-ht-test.c
 F: tests/qtest/powermac7_3-smp-test.c
+F: tests/qtest/keywest-i2c-test.c
 
 Old World (g3beige)
 M: Mark Cave-Ayland <mark.cave-ayland@ilande.co.uk>

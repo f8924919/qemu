@@ -57,6 +57,7 @@
 #include "hw/core/boards.h"
 #include "hw/pci/pci_bridge.h"
 #include "hw/pci-host/uninorth.h"
+#include "hw/i2c/i2c.h"
 #include "hw/input/adb.h"
 #include "hw/ppc/mac_dbdma.h"
 #include "hw/pci/pci.h"
@@ -399,6 +400,33 @@ static void ppc_core99_init(MachineState *machine)
     sysbus_realize_and_unref(s, &error_fatal);
     memory_region_add_subregion(get_system_memory(), 0xf8000000,
                                 sysbus_mmio_get_region(s, 0));
+
+    if (core99_machine->has_u3_ht) {
+        /*
+         * The Keywest i2c controller inside U3.  Darwin needs it to freeze
+         * the timebase before it will use the second CPU, and Linux uses
+         * the very same clock chip for its own timebase sync, so this is
+         * what makes -smp 2 useful rather than merely accepted.
+         *
+         * Plain map, not an overlap: nothing else decodes 0xf8001000, and
+         * claiming priority here would silently hide whatever grew into
+         * the region later.
+         */
+        DeviceState *i2c_dev = qdev_new("keywest-i2c");
+        SysBusDevice *i2c_sbd = SYS_BUS_DEVICE(i2c_dev);
+
+        sysbus_realize_and_unref(i2c_sbd, &error_fatal);
+        sysbus_mmio_map(i2c_sbd, 0, 0xf8001000);
+
+        /*
+         * i2c-hwclock@d2 in the device tree: an 8-bit address, so the bus
+         * sees 0x69.  It lives on channel 0; the second channel exists
+         * because the firmware describes two, not because anything is on
+         * it.
+         */
+        i2c_slave_create_simple(I2C_BUS(qdev_get_child_bus(i2c_dev, "i2c0")),
+                                "mac-hwclock", 0xd2 >> 1);
+    }
 
     if (PPC_INPUT(env) == PPC_FLAGS_INPUT_970) {
         /*

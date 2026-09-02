@@ -147,6 +147,8 @@ config MAC_NEWWORLD
     select MAC_PMU
     select UNIN_PCI
     select FW_CFG_PPC
+    select KEYWEST_I2C
+    select MAC_HWCLOCK
 
 config E500
     bool

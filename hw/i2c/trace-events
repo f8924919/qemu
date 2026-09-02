@@ -61,3 +61,14 @@ pca954x_read_data(uint8_t value) "PCA954X read data: 0x%02x"
 
 imx_i2c_read(const char *id, const char *reg, uint64_t ofs, uint64_t value) "%s:[%s (0x%" PRIx64 ")] -> 0x%02" PRIx64
 imx_i2c_write(const char *id, const char *reg, uint64_t ofs, uint64_t value) "%s:[%s (0x%" PRIx64 ")] <- 0x%02" PRIx64
+
+# keywest_i2c.c
+keywest_i2c_reg_read(unsigned reg, uint64_t val) "reg %u -> 0x%02" PRIx64
+keywest_i2c_reg_write(unsigned reg, uint8_t val) "reg %u <- 0x%02x"
+keywest_i2c_xfer_start(uint8_t addr, uint8_t mode, uint8_t subaddr) "addr 0x%02x mode 0x%02x subaddr 0x%02x"
+keywest_i2c_nak(uint8_t addr, uint8_t mode) "addr 0x%02x mode 0x%02x"
+
+# mac_hwclock.c
+mac_hwclock_set_ptr(uint8_t ptr) "ptr 0x%02x"
+mac_hwclock_read(uint8_t reg, uint8_t val) "reg 0x%02x -> 0x%02x"
+mac_hwclock_write(uint8_t reg, uint8_t val) "reg 0x%02x <- 0x%02x"
