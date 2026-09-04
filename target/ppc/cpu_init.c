@@ -5071,7 +5071,21 @@ POWERPC_FAMILY(e600)(ObjectClass *oc, const void *data)
 
 static int check_pow_970(CPUPPCState *env)
 {
-    if (env->spr[SPR_HID0] & (HID0_DEEPNAP | HID0_DOZE | HID0_NAP)) {
+    /*
+     * HID0 is 64 bits wide on the 970: the power-save bits live in the
+     * upper word (nap = bit 9, doze = bit 8, deep nap = bit 7).
+     *
+     * The 970 only enters nap/doze when MSR[EE] is set; with EE clear
+     * the POW bit is ignored and execution continues (Mac OS X relies
+     * on this in machine_idle(), where it briefly sets POW with EE off
+     * while re-arming the decrementer).  Halting with EE clear would
+     * leave the CPU asleep for good, as nothing could wake it.
+     */
+    if (!FIELD_EX64(env->msr, MSR, EE)) {
+        return 0;
+    }
+    if (env->spr[SPR_HID0] &
+        ((uint64_t)(HID0_DEEPNAP | HID0_DOZE | HID0_NAP) << 32)) {
         return 1;
     }
 
@@ -5083,7 +5097,7 @@ static void register_970_hid_sprs(CPUPPCState *env)
     /* Hardware implementation registers */
     spr_register(env, SPR_HID0, "HID0",
                  SPR_NOACCESS, SPR_NOACCESS,
-                 &spr_read_generic, &spr_write_clear,
+                 &spr_read_generic, &spr_write_generic,
                  0x60000000);
     spr_register(env, SPR_HID1, "HID1",
                  SPR_NOACCESS, SPR_NOACCESS,
