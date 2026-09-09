@@ -20,6 +20,10 @@
 #define CHRP_PART_HDR_LEN   16
 #define CHRP_PART_NAME_LEN  12
 
+/* Fields behind the CHRP header at the start of a core99 bank */
+#define CORE99_ADLER_OFFSET 0x10
+#define CORE99_GEN_OFFSET   0x14
+
 /*
  * One entry of the CHRP partition chain.  The name is the string the field
  * is expected to hold; the field itself is twelve bytes and zero padded.
@@ -37,20 +41,22 @@ typedef struct {
     unsigned size;
     /* Number of banks the part is split into, each holding the same chain */
     unsigned nbanks;
+    /* Whether every bank starts with a core99 header */
+    bool core99;
     const NvramPart *parts;
     unsigned nparts;
 } NvramLayout;
 
 /*
- * A single bank: an Open Firmware half holding the variables and a free
- * partition, and a Mac OS X half.
+ * Two identical core99 banks: the header the guests validate a bank by, the
+ * Open Firmware variables and a free partition covering the rest.
  */
 static const NvramPart mac99_parts[] = {
-    { 0x70, "common" }, { 0x7f, "free" }, { 0x5a, "wwwwwwwwwww" },
+    { 0x5a, "nvram" }, { 0x70, "common" }, { 0x7f, "free" },
 };
 
 static const NvramLayout layouts[] = {
-    { "mac99", 1, 0x2000, 1, mac99_parts, ARRAY_SIZE(mac99_parts) },
+    { "mac99", 0, 0x4000, 2, true, mac99_parts, ARRAY_SIZE(mac99_parts) },
 };
 
 static void read_part(QTestState *qts, const NvramLayout *l, uint8_t *out)
@@ -72,6 +78,41 @@ static uint8_t chrp_checksum(const uint8_t *hdr)
         sum = (sum + ((sum & 0xff00) >> 8)) & 0xff;
     }
     return sum;
+}
+
+static uint32_t get_be32(const uint8_t *p)
+{
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) | p[3];
+}
+
+/*
+ * The adler32 over a core99 bank, as Linux computes it in
+ * arch/powerpc/platforms/powermac/nvram.c: from the generation field to
+ * the end of the bank, starting from the usual initial value of 1.
+ */
+static uint32_t core99_adler(const uint8_t *bank, unsigned bank_size)
+{
+    uint32_t low = 1, high = 0;
+    unsigned i;
+
+    for (i = CORE99_GEN_OFFSET; i < bank_size; i++) {
+        low = (low + bank[i]) % 65521;
+        high = (high + low) % 65521;
+    }
+    return (high << 16) | low;
+}
+
+/*
+ * The guests take the bank with the larger generation, so the banks are
+ * given different ones and the first bank wins.
+ */
+static void check_core99_bank(const uint8_t *bank, unsigned bank_size,
+                              uint32_t generation)
+{
+    g_assert_cmphex(get_be32(&bank[CORE99_GEN_OFFSET]), ==, generation);
+    g_assert_cmphex(get_be32(&bank[CORE99_ADLER_OFFSET]), ==,
+                    core99_adler(bank, bank_size));
 }
 
 /* Walk the partition chain from @off to @end and compare it with @parts */
@@ -115,6 +156,10 @@ static void test_nvram_partitions(const void *opaque)
     for (i = 0; i < l->nbanks; i++) {
         check_chain(data, i * bank_size, (i + 1) * bank_size,
                     l->parts, l->nparts);
+        if (l->core99) {
+            check_core99_bank(&data[i * bank_size], bank_size,
+                              l->nbanks - i);
+        }
     }
 }
 
