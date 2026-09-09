@@ -29,7 +29,17 @@
 #include "system/memory.h"
 #include "hw/core/sysbus.h"
 
+/*
+ * The OldWorld machines expose an 8 KiB NVRAM.  The NewWorld ones expose a
+ * 16 KiB window that the guest operating systems read as two 8 KiB "core99"
+ * banks laid out back to back; each bank is a complete image and carries a
+ * generation number, and the newer one wins.
+ */
 #define MACIO_NVRAM_SIZE 0x2000
+
+#define CORE99_NVRAM_BANK_SIZE 0x2000
+#define CORE99_NVRAM_NBANKS 2
+#define CORE99_NVRAM_SIZE (CORE99_NVRAM_BANK_SIZE * CORE99_NVRAM_NBANKS)
 
 #define TYPE_MACIO_NVRAM "macio-nvram"
 OBJECT_DECLARE_SIMPLE_TYPE(MacIONVRAMState, MACIO_NVRAM)
@@ -48,5 +58,6 @@ struct MacIONVRAMState {
 };
 
 void pmac_format_nvram_partition(MacIONVRAMState *nvr, int len);
+void pmac_format_nvram_partition_core99(MacIONVRAMState *nvr, int len);
 
 #endif /* MAC_NVRAM_H */

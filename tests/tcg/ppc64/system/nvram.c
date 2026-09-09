@@ -21,7 +21,7 @@
 
 /* Where mac99 and its derivatives map the NVRAM (hw/ppc/mac_newworld.c). */
 #define NVRAM_BASE      0xfff04000UL
-#define NVRAM_IT_SHIFT  1
+#define NVRAM_IT_SHIFT  0
 
 static void st8(unsigned long addr, unsigned char val)
 {
@@ -42,18 +42,17 @@ int main(void)
     int i;
 
     /*
-     * Byte stores have always worked; use them to plant a pattern.  With
-     * it_shift = 1 every NVRAM byte appears twice on the bus, so 8 bus
-     * bytes cover 4 NVRAM bytes and each shows up as a repeated pair.
+     * Byte stores have always worked; use them to plant a pattern.  The
+     * bytes are contiguous on the bus, so 8 bus bytes cover 8 NVRAM bytes.
      */
-    for (i = 0; i < 4; i++) {
+    for (i = 0; i < 8; i++) {
         st8(NVRAM_BASE + (i << NVRAM_IT_SHIFT), 0x10 + i);
     }
 
     val = ld64(NVRAM_BASE);
-    if (val != 0x1010111112121313UL) {
+    if (val != 0x1011121314151617UL) {
         ml_printf("FAIL: nvram 8-byte load returned 0x%lx, "
-                  "expected 0x1010111112121313\n", val);
+                  "expected 0x1011121314151617\n", val);
         return 0;
     }
 

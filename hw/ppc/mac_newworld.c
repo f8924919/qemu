@@ -702,12 +702,12 @@ static void ppc_core99_init(MachineState *machine)
         nvram_addr = 0xFFE00000;
     }
     dev = qdev_new(TYPE_MACIO_NVRAM);
-    qdev_prop_set_uint32(dev, "size", MACIO_NVRAM_SIZE);
-    qdev_prop_set_uint32(dev, "it_shift", 1);
+    qdev_prop_set_uint32(dev, "size", CORE99_NVRAM_SIZE);
+    qdev_prop_set_uint32(dev, "it_shift", 0);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, nvram_addr);
     nvr = MACIO_NVRAM(dev);
-    pmac_format_nvram_partition(nvr, MACIO_NVRAM_SIZE);
+    pmac_format_nvram_partition_core99(nvr, CORE99_NVRAM_SIZE);
     /* No PCI init: the BIOS will do it */
 
     dev = qdev_new(TYPE_FW_CFG_MEM);
@@ -763,6 +763,12 @@ static void ppc_core99_init(MachineState *machine)
     fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_CLOCKFREQ, CLOCKFREQ);
     fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_BUSFREQ, BUSFREQ);
     fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_NVRAM_ADDR, nvram_addr);
+    /*
+     * Tell OpenBIOS that the NVRAM bytes are contiguous.  Without this it
+     * assumes they are spaced out one every two addresses, halves the size
+     * it advertises in the device tree, and reads only every other byte.
+     */
+    fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_NVRAM_FLAT, 1);
 
     /* MacOS NDRV VGA driver */
     filename = qemu_find_file(QEMU_FILE_TYPE_BIOS, NDRV_VGA_FILENAME);
