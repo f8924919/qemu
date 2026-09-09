@@ -51,10 +51,21 @@ struct MacIONVRAMState {
 
     uint32_t size;
     uint32_t it_shift;
+    /*
+     * Size of an erase block, or zero on the parts that are plain SRAM.
+     * The NewWorld machines carry a flash part, and a store to it only
+     * lands once it has been unlocked by the command sequence below.
+     */
+    uint32_t block_size;
 
     MemoryRegion mem;
     uint8_t *data;
     BlockBackend *blk;
+
+    /* Flash command state, unused when block_size is zero */
+    uint8_t cmd;
+    uint8_t status;
+    bool reading_status;
 };
 
 void pmac_format_nvram_partition(MacIONVRAMState *nvr, int len);

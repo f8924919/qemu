@@ -163,6 +163,110 @@ static void test_nvram_partitions(const void *opaque)
     }
 }
 
+/*
+ * The NewWorld part is a flash part driven with the Sharp/Micron command
+ * set.  Every store is a command, so each case starts a machine of its own
+ * and prepares nothing by writing: it reads what the board formatted.
+ */
+#define FLASH_ERASE_SETUP   0x20
+#define FLASH_ERASE_CONFIRM 0xd0
+#define FLASH_WRITE_SETUP   0x40
+#define FLASH_READ_ARRAY    0xff
+#define FLASH_STATUS_DONE   0x80
+
+#define BANK1               0x2000
+#define BANK_SIZE           0x2000
+
+static void flash_erase(QTestState *qts, uint64_t addr)
+{
+    qtest_writeb(qts, addr, FLASH_ERASE_SETUP);
+    qtest_writeb(qts, addr, FLASH_ERASE_CONFIRM);
+}
+
+/* Erase confirm clears the block the address falls in, and only that one */
+static void test_flash_erase(const void *opaque)
+{
+    const NvramLayout *l = opaque;
+    QTestState *qts = qtest_initf("-M %s", l->machine);
+    unsigned i;
+
+    flash_erase(qts, NVRAM_ADDR + BANK1);
+    g_assert_cmphex(qtest_readb(qts, NVRAM_ADDR + BANK1), ==,
+                    FLASH_STATUS_DONE);
+    qtest_writeb(qts, NVRAM_ADDR + BANK1, FLASH_READ_ARRAY);
+
+    for (i = 0; i < BANK_SIZE; i++) {
+        g_assert_cmphex(qtest_readb(qts, NVRAM_ADDR + BANK1 + i), ==, 0xff);
+    }
+    g_assert_cmphex(qtest_readb(qts, NVRAM_ADDR), ==, 0x5a);
+
+    qtest_quit(qts);
+}
+
+/* Erase setup followed by anything but erase confirm leaves the block */
+static void test_flash_erase_setup_alone(const void *opaque)
+{
+    const NvramLayout *l = opaque;
+    QTestState *qts = qtest_initf("-M %s", l->machine);
+
+    qtest_writeb(qts, NVRAM_ADDR + BANK1, FLASH_ERASE_SETUP);
+    qtest_writeb(qts, NVRAM_ADDR + BANK1, FLASH_READ_ARRAY);
+    qtest_writeb(qts, NVRAM_ADDR + BANK1, FLASH_READ_ARRAY);
+
+    g_assert_cmphex(qtest_readb(qts, NVRAM_ADDR + BANK1), ==, 0x5a);
+
+    qtest_quit(qts);
+}
+
+/* A store that is not part of a command sequence does not change the part */
+static void test_flash_plain_store(const void *opaque)
+{
+    const NvramLayout *l = opaque;
+    QTestState *qts = qtest_initf("-M %s", l->machine);
+    uint64_t addr = NVRAM_ADDR + BANK1 - 1;
+    uint8_t old = qtest_readb(qts, addr);
+    uint8_t val = old == 0xa5 ? 0x5a : 0xa5;
+
+    qtest_writeb(qts, addr, val);
+    g_assert_cmphex(qtest_readb(qts, addr), ==, old);
+
+    qtest_quit(qts);
+}
+
+/*
+ * Write setup followed by a store programs one byte, and reads answer with
+ * the status until read array puts the part back.
+ */
+static void test_flash_program(const void *opaque)
+{
+    const NvramLayout *l = opaque;
+    QTestState *qts = qtest_initf("-M %s", l->machine);
+    uint64_t addr = NVRAM_ADDR + BANK1 + 0x10;
+
+    flash_erase(qts, addr);
+    qtest_writeb(qts, addr, FLASH_READ_ARRAY);
+
+    qtest_writeb(qts, addr, FLASH_WRITE_SETUP);
+    qtest_writeb(qts, addr, 0x12);
+    g_assert_cmphex(qtest_readb(qts, addr), ==, FLASH_STATUS_DONE);
+    g_assert_cmphex(qtest_readb(qts, addr + 1), ==, FLASH_STATUS_DONE);
+
+    qtest_writeb(qts, addr, FLASH_READ_ARRAY);
+    g_assert_cmphex(qtest_readb(qts, addr), ==, 0x12);
+    g_assert_cmphex(qtest_readb(qts, addr + 1), ==, 0xff);
+
+    qtest_quit(qts);
+}
+
+static void add_test(const NvramLayout *l, const char *name,
+                     GTestDataFunc fn)
+{
+    g_autofree char *path = g_strdup_printf("macio-nvram/%s/%s",
+                                            l->machine, name);
+
+    qtest_add_data_func(path, l, fn);
+}
+
 int main(int argc, char **argv)
 {
     unsigned i;
@@ -171,13 +275,18 @@ int main(int argc, char **argv)
 
     for (i = 0; i < ARRAY_SIZE(layouts); i++) {
         const NvramLayout *l = &layouts[i];
-        g_autofree char *path = NULL;
 
         if (!qtest_has_machine(l->machine)) {
             continue;
         }
-        path = g_strdup_printf("macio-nvram/%s/partitions", l->machine);
-        qtest_add_data_func(path, l, test_nvram_partitions);
+        add_test(l, "partitions", test_nvram_partitions);
+        if (l->core99) {
+            add_test(l, "flash/erase", test_flash_erase);
+            add_test(l, "flash/erase-setup-alone",
+                     test_flash_erase_setup_alone);
+            add_test(l, "flash/plain-store", test_flash_plain_store);
+            add_test(l, "flash/program", test_flash_program);
+        }
     }
 
     return g_test_run();
