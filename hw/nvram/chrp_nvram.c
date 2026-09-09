@@ -44,6 +44,13 @@ static int chrp_nvram_set_var(uint8_t *nvram, int addr, const char *str,
 /**
  * Create a "system partition", used for the Open Firmware
  * environment variables.
+ *
+ * The partition is named "common": that is the name LoPAPR gives it,
+ * the name both of the firmwares shipped with QEMU write when they
+ * create it (OpenBIOS in packages/nvram.c, SLOF in lib/libnvram), and
+ * the name the guest operating systems look for when they build their
+ * view of the Open Firmware variables (Mac OS X and Linux both do).
+ * The firmwares themselves find it by its signature alone.
  */
 int chrp_nvram_create_system_partition(uint8_t *data, int min_len, int max_len)
 {
@@ -57,7 +64,7 @@ int chrp_nvram_create_system_partition(uint8_t *data, int min_len, int max_len)
 
     part_header = (ChrpNvramPartHdr *)data;
     part_header->signature = CHRP_NVPART_SYSTEM;
-    pstrcpy(part_header->name, sizeof(part_header->name), "system");
+    pstrcpy(part_header->name, sizeof(part_header->name), "common");
 
     end = sizeof(ChrpNvramPartHdr);
     for (i = 0; i < nb_prom_envs; i++) {
