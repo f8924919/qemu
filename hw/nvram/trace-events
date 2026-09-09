@@ -22,3 +22,4 @@ fw_cfg_add_i64(uint16_t key_value, const char *key_name, uint64_t value) "key 0x
 # mac_nvram.c
 macio_nvram_read(uint32_t addr, uint8_t val) "read addr=0x%04"PRIx32" val=0x%02x"
 macio_nvram_write(uint32_t addr, uint8_t val) "write addr=0x%04"PRIx32" val=0x%02x"
+macio_nvram_flash_cmd(uint32_t addr, uint8_t val, uint8_t pending, uint8_t status) "flash addr=0x%04"PRIx32" val=0x%02x pending=0x%02x status=0x%02x"

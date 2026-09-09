@@ -34,10 +34,104 @@
 #include "qemu/cutils.h"
 #include "qemu/module.h"
 #include "qemu/error-report.h"
+#include "qemu/log.h"
 #include "trace.h"
 #include <zlib.h> /* for adler32 */
 
 #define DEF_SYSTEM_SIZE 0xc10
+
+/*
+ * Command set of the flash part behind macio on the NewWorld machines.
+ * Linux spells the same values out in arch/powerpc/platforms/powermac/
+ * nvram.c, and Mac OS X drives the part the same way: erase a bank, then
+ * program it a byte at a time.  A store that is not part of one of those
+ * sequences does not change what the part holds.
+ */
+#define SM_FLASH_CMD_ERASE_SETUP    0x20
+#define SM_FLASH_CMD_ERASE_CONFIRM  0xd0
+#define SM_FLASH_CMD_WRITE_SETUP    0x40
+#define SM_FLASH_CMD_WRITE_SETUP2   0x10
+#define SM_FLASH_CMD_CLEAR_STATUS   0x50
+#define SM_FLASH_CMD_READ_STATUS    0x70
+#define SM_FLASH_CMD_RESET          0xff
+
+#define SM_FLASH_STATUS_DONE        0x80
+#define SM_FLASH_STATUS_ERASE_ERR   0x20
+#define SM_FLASH_STATUS_WRITE_ERR   0x10
+
+static void macio_nvram_store(MacIONVRAMState *s, hwaddr addr, unsigned len)
+{
+    if (s->blk) {
+        if (blk_pwrite(s->blk, addr, len, &s->data[addr], 0) < 0) {
+            error_report("%s: write of NVRAM data to backing store failed",
+                         blk_name(s->blk));
+        }
+    }
+}
+
+/* Erase the block the address falls in, leaving the other blocks alone */
+static void macio_nvram_erase_block(MacIONVRAMState *s, hwaddr addr)
+{
+    hwaddr base = addr & ~((hwaddr)s->block_size - 1);
+
+    memset(&s->data[base], 0xff, s->block_size);
+    macio_nvram_store(s, base, s->block_size);
+}
+
+/* Consume one store, either inside a command sequence or starting one */
+static void macio_nvram_command(MacIONVRAMState *s, hwaddr addr, uint8_t value)
+{
+    switch (s->cmd) {
+    case SM_FLASH_CMD_ERASE_SETUP:
+        if (value == SM_FLASH_CMD_ERASE_CONFIRM) {
+            macio_nvram_erase_block(s, addr);
+            s->status |= SM_FLASH_STATUS_DONE;
+        } else {
+            s->status |= SM_FLASH_STATUS_DONE | SM_FLASH_STATUS_ERASE_ERR;
+        }
+        s->cmd = 0;
+        s->reading_status = true;
+        return;
+
+    case SM_FLASH_CMD_WRITE_SETUP:
+        s->data[addr] = value;
+        macio_nvram_store(s, addr, 1);
+        s->status |= SM_FLASH_STATUS_DONE;
+        s->cmd = 0;
+        s->reading_status = true;
+        return;
+
+    default:
+        break;
+    }
+
+    switch (value) {
+    case SM_FLASH_CMD_ERASE_SETUP:
+        s->cmd = value;
+        break;
+    case SM_FLASH_CMD_WRITE_SETUP:
+    case SM_FLASH_CMD_WRITE_SETUP2:
+        s->cmd = SM_FLASH_CMD_WRITE_SETUP;
+        break;
+    case SM_FLASH_CMD_READ_STATUS:
+        s->reading_status = true;
+        break;
+    case SM_FLASH_CMD_CLEAR_STATUS:
+        s->status = 0;
+        break;
+    case SM_FLASH_CMD_RESET:
+        s->reading_status = false;
+        break;
+    default:
+        /* Anything else leaves the part reading out its contents again */
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "macio-nvram: unknown flash command 0x%02x\n", value);
+        s->reading_status = false;
+        break;
+    }
+
+    /* Every store lands in one of the arms above; nothing to hand back */
+}
 
 /* macio style NVRAM device */
 static void macio_nvram_writeb(void *opaque, hwaddr addr,
@@ -47,13 +141,15 @@ static void macio_nvram_writeb(void *opaque, hwaddr addr,
 
     addr = (addr >> s->it_shift) & (s->size - 1);
     trace_macio_nvram_write(addr, value);
-    s->data[addr] = value;
-    if (s->blk) {
-        if (blk_pwrite(s->blk, addr, 1, &s->data[addr], 0) < 0) {
-            error_report("%s: write of NVRAM data to backing store failed",
-                         blk_name(s->blk));
-        }
+
+    if (s->block_size) {
+        trace_macio_nvram_flash_cmd(addr, value, s->cmd, s->status);
+        macio_nvram_command(s, addr, value);
+        return;
     }
+
+    s->data[addr] = value;
+    macio_nvram_store(s, addr, 1);
 }
 
 static uint64_t macio_nvram_readb(void *opaque, hwaddr addr,
@@ -63,6 +159,10 @@ static uint64_t macio_nvram_readb(void *opaque, hwaddr addr,
     uint32_t value;
 
     addr = (addr >> s->it_shift) & (s->size - 1);
+    if (s->block_size && s->reading_status) {
+        trace_macio_nvram_read(addr, s->status);
+        return s->status;
+    }
     value = s->data[addr];
     trace_macio_nvram_read(addr, value);
 
@@ -79,6 +179,30 @@ static const MemoryRegionOps macio_nvram_ops = {
     .endianness = DEVICE_BIG_ENDIAN,
 };
 
+static bool macio_nvram_flash_needed(void *opaque)
+{
+    MacIONVRAMState *s = opaque;
+
+    return s->block_size != 0;
+}
+
+/*
+ * Kept in a subsection so that the OldWorld machines, whose NVRAM has no
+ * command state at all, still migrate as they always did.
+ */
+static const VMStateDescription vmstate_macio_nvram_flash = {
+    .name = "macio_nvram/flash",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = macio_nvram_flash_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT8(cmd, MacIONVRAMState),
+        VMSTATE_UINT8(status, MacIONVRAMState),
+        VMSTATE_BOOL(reading_status, MacIONVRAMState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static const VMStateDescription vmstate_macio_nvram = {
     .name = "macio_nvram",
     .version_id = 1,
@@ -86,12 +210,22 @@ static const VMStateDescription vmstate_macio_nvram = {
     .fields = (const VMStateField[]) {
         VMSTATE_VBUFFER_UINT32(data, MacIONVRAMState, 0, NULL, size),
         VMSTATE_END_OF_LIST()
+    },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_macio_nvram_flash,
+        NULL
     }
 };
 
 
 static void macio_nvram_reset(DeviceState *dev)
 {
+    MacIONVRAMState *s = MACIO_NVRAM(dev);
+
+    s->cmd = 0;
+    /* A part that has nothing to do reports itself ready */
+    s->status = SM_FLASH_STATUS_DONE;
+    s->reading_status = false;
 }
 
 static void macio_nvram_realizefn(DeviceState *dev, Error **errp)
@@ -137,6 +271,7 @@ static void macio_nvram_unrealizefn(DeviceState *dev)
 static const Property macio_nvram_properties[] = {
     DEFINE_PROP_UINT32("size", MacIONVRAMState, size, 0),
     DEFINE_PROP_UINT32("it_shift", MacIONVRAMState, it_shift, 0),
+    DEFINE_PROP_UINT32("block-size", MacIONVRAMState, block_size, 0),
     DEFINE_PROP_DRIVE("drive", MacIONVRAMState, blk),
 };
 

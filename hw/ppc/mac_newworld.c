@@ -703,6 +703,11 @@ static void ppc_core99_init(MachineState *machine)
     }
     dev = qdev_new(TYPE_MACIO_NVRAM);
     qdev_prop_set_uint32(dev, "size", CORE99_NVRAM_SIZE);
+    /*
+     * The part is a flash chip, and the guests unlock it a bank at a time
+     * with the Sharp/Micron command set before they program it.
+     */
+    qdev_prop_set_uint32(dev, "block-size", CORE99_NVRAM_BANK_SIZE);
     qdev_prop_set_uint32(dev, "it_shift", 0);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, nvram_addr);
