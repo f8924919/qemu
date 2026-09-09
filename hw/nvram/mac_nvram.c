@@ -202,6 +202,75 @@ static void pmac_format_nvram_partition_osx(MacIONVRAMState *nvr, int off,
     stl_be_p(&data[16], adler32(0, &data[20], len - 20));
 }
 
+/*
+ * Offsets inside the 32-byte core99 header.  The first 16 bytes are an
+ * ordinary CHRP partition header, so a firmware that only knows about CHRP
+ * walks straight over it; Mac OS X and Linux read the two fields behind it.
+ */
+#define CORE99_ADLER_OFFSET     0x10
+#define CORE99_GENERATION_OFFSET 0x14
+#define CORE99_HEADER_SIZE      0x20
+
+/*
+ * Format one core99 bank: the header above, the "common" partition holding
+ * the Open Firmware variables, and a free partition covering the rest.
+ *
+ * Both Mac OS X (Core99NVRAM) and Linux (arch/powerpc/platforms/powermac)
+ * validate a bank by its signature, the CHRP checksum of its header, and an
+ * adler32 over everything from the generation field to the end of the bank.
+ */
+static void pmac_format_nvram_bank_core99(uint8_t *bank, uint32_t generation)
+{
+    ChrpNvramPartHdr *hdr = (ChrpNvramPartHdr *)bank;
+    int end;
+
+    hdr->signature = OSX_NVRAM_SIGNATURE;
+    pstrcpy(hdr->name, sizeof(hdr->name), "nvram");
+    chrp_nvram_finish_partition(hdr, CORE99_HEADER_SIZE);
+
+    /* The bank with the larger generation is the one the guest reads */
+    stl_be_p(&bank[CORE99_GENERATION_OFFSET], generation);
+
+    end = CORE99_HEADER_SIZE +
+          chrp_nvram_create_system_partition(&bank[CORE99_HEADER_SIZE],
+                                             DEF_SYSTEM_SIZE,
+                                             CORE99_NVRAM_BANK_SIZE -
+                                             CORE99_HEADER_SIZE);
+    if (end < CORE99_NVRAM_BANK_SIZE) {
+        chrp_nvram_create_free_partition(&bank[end],
+                                         CORE99_NVRAM_BANK_SIZE - end);
+    }
+
+    /*
+     * Covers everything that follows it, so it has to be computed last.
+     * The seed is the adler32 initial value of 1, which is what the guests
+     * use: Linux starts its open-coded loop with low = 1, and Mac OS X
+     * calls the ordinary two-argument adler32().
+     */
+    stl_be_p(&bank[CORE99_ADLER_OFFSET],
+             adler32(adler32(0, NULL, 0), &bank[CORE99_GENERATION_OFFSET],
+                     CORE99_NVRAM_BANK_SIZE - CORE99_GENERATION_OFFSET));
+}
+
+/* Set up NVRAM as the two core99 banks the NewWorld guests expect */
+void pmac_format_nvram_partition_core99(MacIONVRAMState *nvr, int len)
+{
+    int i;
+
+    assert(len == CORE99_NVRAM_SIZE);
+
+    /*
+     * Every bank is a complete image.  They are given different generations
+     * so that no tie has to be broken: Mac OS X 10.4 takes the second bank
+     * when the generations are equal, Linux the first one.  Counting down
+     * from the first bank makes both of them pick that one.
+     */
+    for (i = 0; i < CORE99_NVRAM_NBANKS; i++) {
+        pmac_format_nvram_bank_core99(&nvr->data[i * CORE99_NVRAM_BANK_SIZE],
+                                      CORE99_NVRAM_NBANKS - i);
+    }
+}
+
 /* Set up NVRAM with OF and OSX partitions */
 void pmac_format_nvram_partition(MacIONVRAMState *nvr, int len)
 {
