@@ -76,6 +76,8 @@
 #include "system/reset.h"
 #include "kvm_ppc.h"
 #include "hw/usb/usb.h"
+#include "system/blockdev.h"
+#include "system/block-backend.h"
 #include "hw/core/sysbus.h"
 #include "trace.h"
 
@@ -200,6 +202,7 @@ static void ppc_core99_init(MachineState *machine)
     BusState *adb_bus;
     MacIONVRAMState *nvr;
     DriveInfo *hd[MAX_IDE_BUS * MAX_IDE_DEVS];
+    DriveInfo *dinfo;
     void *fw_cfg;
     SysBusDevice *s;
     DeviceState *dev, *pic_dev, *uninorth_pci_dev;
@@ -709,6 +712,11 @@ static void ppc_core99_init(MachineState *machine)
      */
     qdev_prop_set_uint32(dev, "block-size", CORE99_NVRAM_BANK_SIZE);
     qdev_prop_set_uint32(dev, "it_shift", 0);
+    /* Same interface the OldWorld machine takes its NVRAM image on */
+    dinfo = drive_get(IF_MTD, 0, 0);
+    if (dinfo) {
+        qdev_prop_set_drive(dev, "drive", blk_by_legacy_dinfo(dinfo));
+    }
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, nvram_addr);
     nvr = MACIO_NVRAM(dev);
