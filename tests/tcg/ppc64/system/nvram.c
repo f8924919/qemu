@@ -38,6 +38,7 @@
 #define SM_CLEAR_STATUS     0x50
 #define SM_RESET            0xff
 #define SM_STATUS_DONE      0x80
+#define SM_STATUS_ERASE_ERR 0x20
 
 /* A byte that means nothing to the part, so it can only be data */
 #define NOT_A_COMMAND       0xa5
@@ -83,6 +84,27 @@ int main(void)
     if (ld8(NVRAM_BASE) != was) {
         ml_printf("FAIL: a bare store changed the nvram (0x%x -> 0x%x)\n",
                   was, ld8(NVRAM_BASE));
+        return 0;
+    }
+
+    /*
+     * Erase setup on its own does not erase anything.  A bank holds text,
+     * and 0x20 is a space, so a part that erased on the setup cycle would
+     * lose a bank to a variable that happens to contain one.
+     */
+    val = ld64(NVRAM_BASE);
+    st8(NVRAM_BASE, SM_ERASE_SETUP);
+    st8(NVRAM_BASE, 0x00);              /* eaten as an invalid confirm */
+    status = ld8(NVRAM_BASE);
+    if (!(status & SM_STATUS_ERASE_ERR)) {
+        ml_printf("FAIL: a bad erase sequence left status 0x%x\n", status);
+        return 0;
+    }
+    st8(NVRAM_BASE, SM_CLEAR_STATUS);
+    st8(NVRAM_BASE, SM_RESET);
+    if (ld64(NVRAM_BASE) != val) {
+        ml_printf("FAIL: erase setup without confirm erased the bank "
+                  "(0x%lx -> 0x%lx)\n", val, ld64(NVRAM_BASE));
         return 0;
     }
 
