@@ -31,6 +31,26 @@ Missing devices
 
  * To be identified
 
+Non Volatile RAM
+----------------
+
+The NVRAM holds the Open Firmware variables, and the guest operating
+systems keep their own settings there as well.  It starts out empty
+unless a backing image is given, and its contents are lost when QEMU
+exits.
+
+To keep them, pass an image with ``-drive if=mtd,file=<filename>,format=raw``,
+or give the drive an ID (``-drive if=none,file=<filename>,format=raw,id=nvid``)
+and hand that to the device with ``-global macio-nvram.drive=nvid``.  The
+image has to be the size of the part: 16 KiB on ``mac99`` and its
+derivatives, 8 KiB on ``g3beige``.
+
+An image that does not hold an NVRAM yet - an empty file of the right
+size will do - is initialised on the first run and written back, so
+``-prom-env`` still has its usual effect.  Once the image holds one it is
+left alone, and the settings in it win over ``-prom-env``.  Note that
+``-snapshot`` covers this drive too, so nothing is kept with it.
+
 Firmware
 --------
 
