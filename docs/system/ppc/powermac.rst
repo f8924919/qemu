@@ -51,6 +51,13 @@ size will do - is initialised on the first run and written back, so
 left alone, and the settings in it win over ``-prom-env``.  Note that
 ``-snapshot`` covers this drive too, so nothing is kept with it.
 
+Migrating a machine hands its NVRAM to the image on the destination as
+well.  That happens once the destination is running, so an image read
+right after the migration has finished still holds what it did before, and
+one on a destination started with ``-S`` is only brought up to date by
+``cont``.  The size of the part is not part of what is migrated, so both
+ends have to be the same machine.
+
 Firmware
 --------
 
