@@ -35,6 +35,7 @@
 #include "qemu/module.h"
 #include "qemu/error-report.h"
 #include "qemu/log.h"
+#include "system/system.h"
 #include "trace.h"
 #include <zlib.h> /* for adler32 */
 
@@ -299,6 +300,61 @@ static void macio_nvram_register_types(void)
     type_register_static(&macio_nvram_type_info);
 }
 
+/*
+ * The machines format the NVRAM once the device has been realized, which
+ * throws away whatever a backing image holds.  An image a guest has
+ * already written is worth keeping: say whether this one looks like one.
+ *
+ * A bank the guest is in the middle of erasing reads back as all ones, and
+ * that is a normal state of the ping-pong the core99 layout runs on, so one
+ * good bank is enough.  Anything past that - the adler32 over the bank, the
+ * generation numbers - is what the guests themselves check, and getting it
+ * wrong here would throw away an image they could have used.
+ */
+static bool pmac_nvram_image_valid(MacIONVRAMState *nvr, int len)
+{
+    int bank = nvr->block_size ? nvr->block_size : len;
+    int off;
+
+    for (off = 0; off + bank <= len; off += bank) {
+        const ChrpNvramPartHdr *hdr = (ChrpNvramPartHdr *)&nvr->data[off];
+
+        if (hdr->signature != 0x00 && hdr->signature != 0xff &&
+            hdr->checksum == chrp_nvram_checksum(hdr)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool pmac_nvram_keep_image(MacIONVRAMState *nvr, int len)
+{
+    if (!nvr->blk || !pmac_nvram_image_valid(nvr, len)) {
+        return false;
+    }
+
+    /*
+     * The Open Firmware variables live in the image from now on, and the
+     * ones on the command line only ever reach the NVRAM through the
+     * formatting below.
+     */
+    if (nb_prom_envs) {
+        warn_report("macio-nvram: keeping the backing image, "
+                    "-prom-env is ignored");
+    }
+
+    return true;
+}
+
+/* Hand the freshly formatted contents to the backing image, if there is one */
+static void pmac_nvram_flush(MacIONVRAMState *nvr, int len)
+{
+    if (nvr->blk) {
+        macio_nvram_store(nvr, 0, len);
+    }
+}
+
 /* Set up a system OpenBIOS NVRAM partition */
 static void pmac_format_nvram_partition_of(MacIONVRAMState *nvr, int off,
                                            int len)
@@ -394,6 +450,11 @@ void pmac_format_nvram_partition_core99(MacIONVRAMState *nvr, int len)
 
     assert(len == CORE99_NVRAM_SIZE);
 
+    if (pmac_nvram_keep_image(nvr, len)) {
+        return;
+    }
+    memset(nvr->data, 0, len);
+
     /*
      * Every bank is a complete image.  They are given different generations
      * so that no tie has to be broken: Mac OS X 10.4 takes the second bank
@@ -404,11 +465,18 @@ void pmac_format_nvram_partition_core99(MacIONVRAMState *nvr, int len)
         pmac_format_nvram_bank_core99(&nvr->data[i * CORE99_NVRAM_BANK_SIZE],
                                       CORE99_NVRAM_NBANKS - i);
     }
+
+    pmac_nvram_flush(nvr, len);
 }
 
 /* Set up NVRAM with OF and OSX partitions */
 void pmac_format_nvram_partition(MacIONVRAMState *nvr, int len)
 {
+    if (pmac_nvram_keep_image(nvr, len)) {
+        return;
+    }
+    memset(nvr->data, 0, len);
+
     /*
      * Mac OS X expects side "B" of the flash at the second half of NVRAM,
      * so we use half of the chip for OF and the other half for a free OSX
@@ -416,5 +484,7 @@ void pmac_format_nvram_partition(MacIONVRAMState *nvr, int len)
      */
     pmac_format_nvram_partition_of(nvr, 0, len / 2);
     pmac_format_nvram_partition_osx(nvr, len / 2, len / 2);
+
+    pmac_nvram_flush(nvr, len);
 }
 type_init(macio_nvram_register_types)
