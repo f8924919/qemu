@@ -167,6 +167,44 @@ static void test_nvram_image(const void *opaque)
 }
 
 /*
+ * A backing image has to be the size of the part, and a machine given the
+ * wrong size refuses to start.  The message has to say both what the part
+ * wanted and what it got: the length is not an errno, and putting it through
+ * one leaves the user with "Unknown error -8192" and nothing to act on.
+ *
+ * A refused realize is a refused startup, so qtest_init() cannot watch it
+ * happen: run QEMU and read what it said.  QTEST_QEMU_BINARY may carry
+ * arguments of its own, hence the split into an argv.
+ */
+static void test_nvram_wrong_size(const void *opaque)
+{
+    const NvramLayout *l = opaque;
+    /* The other layout's size: too small on NewWorld, too large on OldWorld */
+    unsigned wrong = l->size == 0x4000 ? 0x2000 : 0x4000;
+    g_autofree char *path = make_image(wrong);
+    g_autofree char *cmdline = NULL;
+    g_autofree char *expected = NULL;
+    g_autofree char *err = NULL;
+    g_auto(GStrv) argv = NULL;
+    int status = 0;
+
+    cmdline = g_strdup_printf("%s -M %s -accel qtest -display none "
+                              "-drive if=mtd,format=raw,file=%s",
+                              qtest_qemu_binary(NULL), l->machine, path);
+    g_assert_true(g_shell_parse_argv(cmdline, NULL, &argv, NULL));
+    g_assert_true(g_spawn_sync(NULL, argv, NULL, G_SPAWN_SEARCH_PATH |
+                               G_SPAWN_STDOUT_TO_DEV_NULL, NULL, NULL,
+                               NULL, &err, &status, NULL));
+    g_assert_cmpint(status, !=, 0);
+
+    expected = g_strdup_printf("is %u bytes, must be %u", wrong, l->size);
+    g_assert_nonnull(strstr(err, expected));
+    g_assert_null(strstr(err, "Unknown error"));
+
+    unlink(path);
+}
+
+/*
  * Walk the partition chain an empty machine leaves behind and check the
  * signature and the whole twelve byte name field of every partition.  The
  * offsets are not written down: they follow from the lengths, so a chain
@@ -471,6 +509,7 @@ int main(int argc, char *argv[])
         g_autofree char *no_drive = NULL;
         g_autofree char *erased = NULL;
         g_autofree char *erased_last = NULL;
+        g_autofree char *wrong = NULL;
 
         if (!qtest_has_machine(layouts[i].machine)) {
             continue;
@@ -479,6 +518,9 @@ int main(int argc, char *argv[])
 
         parts = g_strdup_printf("%s/partitions", name);
         qtest_add_data_func(parts, &layouts[i], test_nvram_partitions);
+
+        wrong = g_strdup_printf("%s/wrong-size", name);
+        qtest_add_data_func(wrong, &layouts[i], test_nvram_wrong_size);
 
         rubbish = g_strdup_printf("%s/rubbish", name);
         qtest_add_data_func(rubbish, &layouts[i], test_nvram_rubbish);
