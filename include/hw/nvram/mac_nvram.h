@@ -66,6 +66,9 @@ struct MacIONVRAMState {
     uint8_t cmd;
     uint8_t status;
     bool reading_status;
+
+    /* Set while a migration is waiting to hand the contents to the image */
+    VMChangeStateEntry *vmstate;
 };
 
 void pmac_format_nvram_partition(MacIONVRAMState *nvr, int len);

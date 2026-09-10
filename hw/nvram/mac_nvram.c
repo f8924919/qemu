@@ -181,6 +181,41 @@ static const MemoryRegionOps macio_nvram_ops = {
     .endianness = DEVICE_BIG_ENDIAN,
 };
 
+static void macio_nvram_postload_cb(void *opaque, bool running, RunState state)
+{
+    MacIONVRAMState *s = opaque;
+
+    /* This is called after bdrv_activate_all(), so the image can be written */
+    qemu_del_vm_change_state_handler(s->vmstate);
+    s->vmstate = NULL;
+
+    macio_nvram_store(s, 0, s->size);
+}
+
+/*
+ * The contents that arrived have to reach the backing image, or the guest
+ * would go on writing single bytes into an image still holding what the
+ * destination had before.  It cannot be written from here: the block
+ * backends are activated after the load, so wait for the machine to run.
+ */
+static int macio_nvram_post_load(void *opaque, int version_id)
+{
+    MacIONVRAMState *s = opaque;
+
+    /*
+     * Unlike the other devices that do this, drop a second registration:
+     * two loads without a vm_start() in between - loadvm twice on a stopped
+     * machine - would leave a handler behind, and the callback frees the
+     * one the list is about to walk to.
+     */
+    if (s->blk && !s->vmstate) {
+        s->vmstate = qemu_add_vm_change_state_handler(macio_nvram_postload_cb,
+                                                      s);
+    }
+
+    return 0;
+}
+
 static bool macio_nvram_flash_needed(void *opaque)
 {
     MacIONVRAMState *s = opaque;
@@ -209,6 +244,7 @@ static const VMStateDescription vmstate_macio_nvram = {
     .name = "macio_nvram",
     .version_id = 1,
     .minimum_version_id = 1,
+    .post_load = macio_nvram_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_VBUFFER_UINT32(data, MacIONVRAMState, 0, NULL, size),
         VMSTATE_END_OF_LIST()
@@ -267,6 +303,8 @@ static void macio_nvram_unrealizefn(DeviceState *dev)
 {
     MacIONVRAMState *s = MACIO_NVRAM(dev);
 
+    /* A load may have left one waiting for the machine to start */
+    qemu_del_vm_change_state_handler(s->vmstate);
     g_free(s->data);
 }
 
