@@ -1623,6 +1623,7 @@ F: hw/i2c/mac_hwclock.c
 F: tests/qtest/u3-ht-test.c
 F: tests/qtest/powermac7_3-smp-test.c
 F: tests/qtest/keywest-i2c-test.c
+F: tests/qtest/macio-nvram-test.c
 
 Old World (g3beige)
 M: Mark Cave-Ayland <mark.cave-ayland@ilande.co.uk>
