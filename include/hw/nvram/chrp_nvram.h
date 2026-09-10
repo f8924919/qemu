@@ -31,23 +31,28 @@ typedef struct {
 #define CHRP_NVPART_SYSTEM 0x70
 #define CHRP_NVPART_FREE 0x7f
 
-static inline void
-chrp_nvram_finish_partition(ChrpNvramPartHdr *header, uint32_t size)
+/* The stored checksum, at byte 1, is not part of what it covers */
+static inline uint8_t chrp_nvram_checksum(const ChrpNvramPartHdr *header)
 {
+    const uint8_t *tmpptr = (const uint8_t *)header;
     unsigned int i, sum;
-    uint8_t *tmpptr;
 
-    /* Length divided by 16 */
-    header->len = cpu_to_be16(size >> 4);
-
-    /* Checksum */
-    tmpptr = (uint8_t *)header;
     sum = *tmpptr;
     for (i = 0; i < 14; i++) {
         sum += tmpptr[2 + i];
         sum = (sum + ((sum & 0xff00) >> 8)) & 0xff;
     }
-    header->checksum = sum & 0xff;
+
+    return sum & 0xff;
+}
+
+static inline void
+chrp_nvram_finish_partition(ChrpNvramPartHdr *header, uint32_t size)
+{
+    /* Length divided by 16 */
+    header->len = cpu_to_be16(size >> 4);
+
+    header->checksum = chrp_nvram_checksum(header);
 }
 
 /* chrp_nvram_create_system_partition() failure is fatal */
