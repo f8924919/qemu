@@ -15,6 +15,9 @@
 
 #include "qemu/osdep.h"
 #include "libqtest.h"
+#include "migration/migration-qmp.h"
+#include "migration/migration-util.h"
+#include "qobject/qdict.h"
 
 /*
  * Both layouts carry a big endian generation number that the formatting
@@ -23,20 +26,27 @@
  */
 #define FORMATTED_GENERATION 2
 #define POKED_GENERATION     7
+#define OTHER_GENERATION     5
 
 typedef struct {
     const char *machine;
     unsigned size;
     unsigned bank;      /* Erase block, or the whole part where there is none */
     unsigned gen_off;
+    /*
+     * Where the part answers, or zero where it cannot be read without
+     * firmware: the OldWorld NVRAM sits behind a PCI BAR that nothing has
+     * given an address to.
+     */
+    uint64_t addr;
 } NvramLayout;
 
 static const NvramLayout layouts[] = {
     /* NewWorld: two core99 banks, generation inside the first bank header */
-    { "mac99",        0x4000, 0x2000, 0x14 },
-    { "powermac7_3",  0x4000, 0x2000, 0x14 },
+    { "mac99",        0x4000, 0x2000, 0x14,   0xfff04000 },
+    { "powermac7_3",  0x4000, 0x2000, 0x14,   0xfff04000 },
     /* OldWorld: an Open Firmware half and a Mac OS X half, one erase block */
-    { "g3beige",      0x2000, 0x2000, 0x1014 },
+    { "g3beige",      0x2000, 0x2000, 0x1014, 0 },
 };
 
 static char *make_image(unsigned size)
@@ -203,6 +213,162 @@ static void test_nvram_rubbish(const void *opaque)
     unlink(path);
 }
 
+/*
+ * A machine that is waiting for an incoming migration has its block
+ * backends inactive, so the initialisation must not write to them.  The
+ * image the migration brings replaces whatever is there anyway.
+ */
+static void test_nvram_incoming(const void *opaque)
+{
+    const NvramLayout *l = opaque;
+    g_autofree char *path = make_image(l->size);
+    g_autofree uint8_t *image = g_malloc0(l->size);
+    QTestState *qts;
+    QDict *rsp;
+    unsigned i;
+
+    qts = qtest_initf("-M %s -accel qtest -incoming defer "
+                      "-drive if=mtd,format=raw,file=%s", l->machine, path);
+
+    rsp = qtest_qmp_assert_success_ref(qts, "{ 'execute': 'query-status' }");
+    g_assert_cmpstr(qdict_get_str(rsp, "status"), ==, "inmigrate");
+    qobject_unref(rsp);
+    qtest_quit(qts);
+
+    /* Nothing was written, so the image is as empty as it started */
+    read_image(path, l->size, image);
+    for (i = 0; i < l->size; i++) {
+        if (image[i]) {
+            g_error("byte %u of the image was written to", i);
+        }
+    }
+
+    unlink(path);
+}
+
+static void wait_for_running(QTestState *qts)
+{
+    unsigned i;
+
+    /*
+     * The write back runs from vm_start(), and a QMP command is answered
+     * from the main loop after that has finished.  Waiting for the RESUME
+     * event instead would race: it is sent before the state handlers run.
+     */
+    for (i = 0; i < 5000; i++) {
+        QDict *rsp = qtest_qmp_assert_success_ref(qts,
+                                                  "{ 'execute': 'query-status' }");
+        bool running = qdict_get_bool(rsp, "running");
+
+        qobject_unref(rsp);
+        if (running) {
+            return;
+        }
+        g_usleep(1000);
+    }
+
+    g_error("the destination never started running");
+}
+
+/* Give a machine a valid image carrying a generation of its own */
+static void seed_image(const NvramLayout *l, const char *path, uint32_t gen)
+{
+    g_autofree uint8_t *image = g_malloc0(l->size);
+
+    run_machine(l, path);
+    read_image(path, l->size, image);
+    put_be32(&image[l->gen_off], gen);
+    write_image(path, image, l->size);
+}
+
+/*
+ * What the destination holds has to be replaced by what came over the
+ * wire.  Both sides start from a valid image so that the check cannot
+ * pass by the destination simply being formatted, and the two carry
+ * different generations so that the direction of the copy is visible.
+ */
+static void test_nvram_migrate(const void *opaque)
+{
+    const NvramLayout *l = opaque;
+    g_autofree char *src_path = make_image(l->size);
+    g_autofree char *dst_path = make_image(l->size);
+    g_autofree uint8_t *image = g_malloc0(l->size);
+    g_autofree uint8_t *sent = g_malloc0(l->size);
+    g_autofree char *uri = NULL;
+    QTestState *src, *dst;
+
+    seed_image(l, src_path, POKED_GENERATION);
+    seed_image(l, dst_path, OTHER_GENERATION);
+    read_image(src_path, l->size, sent);
+
+    /* The two must not share a file: the second one could not lock it */
+    uri = g_strdup_printf("unix:%s/macio-nvram-migrate-%s",
+                          g_get_tmp_dir(), l->machine);
+    unlink(uri + strlen("unix:"));
+
+    src = qtest_initf("-M %s -accel qtest "
+                      "-drive if=mtd,format=raw,file=%s", l->machine, src_path);
+    dst = qtest_initf("-M %s -accel qtest -incoming defer "
+                      "-drive if=mtd,format=raw,file=%s", l->machine, dst_path);
+
+    migrate_incoming_qmp(dst, uri, NULL, "{}");
+    migrate_qmp(src, NULL, uri, NULL, "{}");
+    wait_for_migration_complete(src);
+    wait_for_running(dst);
+
+    read_image(dst_path, l->size, image);
+    g_assert_cmpuint(get_be32(&image[l->gen_off]), ==, POKED_GENERATION);
+    g_assert_cmpmem(image, l->size, sent, l->size);
+
+    /* The source keeps what it had: it writes through on every store */
+    read_image(src_path, l->size, image);
+    g_assert_cmpmem(image, l->size, sent, l->size);
+
+    qtest_quit(dst);
+    qtest_quit(src);
+    unlink(src_path);
+    unlink(dst_path);
+    unlink(uri + strlen("unix:"));
+}
+
+/*
+ * Without a backing image there is nothing on disk to look at, so read the
+ * part itself.  The two ends are given different Open Firmware variables so
+ * that the comparison cannot pass by both having been formatted the same.
+ */
+static void test_nvram_migrate_no_drive(const void *opaque)
+{
+    const NvramLayout *l = opaque;
+    g_autofree uint8_t *from = g_malloc0(l->size);
+    g_autofree uint8_t *to = g_malloc0(l->size);
+    g_autofree char *uri = NULL;
+    QTestState *src, *dst;
+
+    uri = g_strdup_printf("unix:%s/macio-nvram-nodrive-%s",
+                          g_get_tmp_dir(), l->machine);
+    unlink(uri + strlen("unix:"));
+
+    src = qtest_initf("-M %s -accel qtest -prom-env g5mig=migrated",
+                      l->machine);
+    dst = qtest_initf("-M %s -accel qtest -incoming defer", l->machine);
+
+    qtest_memread(src, l->addr, from, l->size);
+    qtest_memread(dst, l->addr, to, l->size);
+    g_assert_cmpint(memcmp(from, to, l->size), !=, 0);
+
+    migrate_incoming_qmp(dst, uri, NULL, "{}");
+    migrate_qmp(src, NULL, uri, NULL, "{}");
+    wait_for_migration_complete(src);
+    wait_for_running(dst);
+
+    qtest_memread(dst, l->addr, to, l->size);
+    g_assert_cmpmem(to, l->size, from, l->size);
+
+    qtest_quit(dst);
+    qtest_quit(src);
+    unlink(uri + strlen("unix:"));
+}
+
 int main(int argc, char *argv[])
 {
     const char *arch = qtest_get_arch();
@@ -215,6 +381,9 @@ int main(int argc, char *argv[])
                                                 layouts[i].machine);
         g_autofree char *rubbish = NULL;
         g_autofree char *ones = NULL;
+        g_autofree char *incoming = NULL;
+        g_autofree char *migrate = NULL;
+        g_autofree char *no_drive = NULL;
         g_autofree char *erased = NULL;
         g_autofree char *erased_last = NULL;
 
@@ -229,6 +398,12 @@ int main(int argc, char *argv[])
         ones = g_strdup_printf("%s/all-ones", name);
         qtest_add_data_func(ones, &layouts[i], test_nvram_all_ones);
 
+        incoming = g_strdup_printf("%s/incoming", name);
+        qtest_add_data_func(incoming, &layouts[i], test_nvram_incoming);
+
+        migrate = g_strdup_printf("%s/migrate", name);
+        qtest_add_data_func(migrate, &layouts[i], test_nvram_migrate);
+
         /* Only a part with more than one erase block can lose one */
         if (layouts[i].size > layouts[i].bank) {
             erased = g_strdup_printf("%s/erased-first", name);
@@ -236,6 +411,12 @@ int main(int argc, char *argv[])
             erased_last = g_strdup_printf("%s/erased-last", name);
             qtest_add_data_func(erased_last, &layouts[i],
                                 test_nvram_erased_last);
+        }
+
+        if (layouts[i].addr) {
+            no_drive = g_strdup_printf("%s/migrate-no-drive", name);
+            qtest_add_data_func(no_drive, &layouts[i],
+                                test_nvram_migrate_no_drive);
         }
     }
 
