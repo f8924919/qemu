@@ -28,6 +28,42 @@
 #define POKED_GENERATION     7
 #define OTHER_GENERATION     5
 
+/*
+ * One entry of the CHRP partition chain, as the formatting code leaves it.
+ * The name is the string the field is expected to hold; the field itself is
+ * twelve bytes, zero padded, and a name of exactly twelve characters fills
+ * it with no terminator at all.  That case is the point of the check: Mac OS
+ * X compares the free space name with strncmp(..., 12), so a NUL in the last
+ * byte makes the match fail and the guest never finds the free space.
+ */
+typedef struct {
+    uint8_t sig;
+    const char *name;
+} NvramPart;
+
+#define CHRP_PART_NAME_LEN 12
+
+/*
+ * An empty NewWorld machine formats its NVRAM into two identical banks:
+ * the 32 byte core99 header, the Open Firmware variables, and the free
+ * space that Mac OS X looks for by its twelve character name.
+ */
+static const NvramPart newworld_parts[] = {
+    { 0x5a, "nvram" }, { 0x70, "common" }, { 0x7f, "wwwwwwwwwwww" },
+    { 0x5a, "nvram" }, { 0x70, "common" }, { 0x7f, "wwwwwwwwwwww" },
+};
+
+/*
+ * OldWorld is left alone: it has no guest here to tell whether Mac OS X
+ * would go on to carve a panic partition out of the free space, so the
+ * names it writes are pinned as they are rather than changed blind.
+ */
+static const NvramPart oldworld_parts[] = {
+    { 0x70, "common" },
+    { 0x7f, "free" },
+    { 0x5a, "wwwwwwwwwww" },        /* Eleven, written with pstrcpy() */
+};
+
 typedef struct {
     const char *machine;
     unsigned size;
@@ -39,14 +75,19 @@ typedef struct {
      * given an address to.
      */
     uint64_t addr;
+    const NvramPart *parts;
+    unsigned nparts;
 } NvramLayout;
 
 static const NvramLayout layouts[] = {
     /* NewWorld: two core99 banks, generation inside the first bank header */
-    { "mac99",        0x4000, 0x2000, 0x14,   0xfff04000 },
-    { "powermac7_3",  0x4000, 0x2000, 0x14,   0xfff04000 },
+    { "mac99",        0x4000, 0x2000, 0x14,   0xfff04000,
+      newworld_parts, ARRAY_SIZE(newworld_parts) },
+    { "powermac7_3",  0x4000, 0x2000, 0x14,   0xfff04000,
+      newworld_parts, ARRAY_SIZE(newworld_parts) },
     /* OldWorld: an Open Firmware half and a Mac OS X half, one erase block */
-    { "g3beige",      0x2000, 0x2000, 0x1014, 0 },
+    { "g3beige",      0x2000, 0x2000, 0x1014, 0,
+      oldworld_parts, ARRAY_SIZE(oldworld_parts) },
 };
 
 static char *make_image(unsigned size)
@@ -121,6 +162,49 @@ static void test_nvram_image(const void *opaque)
     run_machine(l, path);
     read_image(path, l->size, image);
     g_assert_cmpuint(get_be32(&image[l->gen_off]), ==, POKED_GENERATION);
+
+    unlink(path);
+}
+
+/*
+ * Walk the partition chain an empty machine leaves behind and check the
+ * signature and the whole twelve byte name field of every partition.  The
+ * offsets are not written down: they follow from the lengths, so a chain
+ * that does not tile the part exactly is a failure on its own.
+ */
+static void test_nvram_partitions(const void *opaque)
+{
+    const NvramLayout *l = opaque;
+    g_autofree char *path = make_image(l->size);
+    g_autofree uint8_t *image = g_malloc0(l->size);
+    unsigned off = 0, i;
+
+    run_machine(l, path);
+    read_image(path, l->size, image);
+
+    for (i = 0; i < l->nparts; i++) {
+        char want[CHRP_PART_NAME_LEN];
+        unsigned len;
+
+        g_assert_cmpuint(off + 16, <=, l->size);
+
+        len = ((image[off + 2] << 8) | image[off + 3]) * 16;
+        g_assert_cmpuint(len, >=, 16);
+        g_assert_cmpuint(off + len, <=, l->size);
+
+        g_assert_cmphex(image[off], ==, l->parts[i].sig);
+
+        /* The field is zero padded, and a twelve character name fills it */
+        memset(want, 0, sizeof(want));
+        g_assert_cmpuint(strlen(l->parts[i].name), <=, sizeof(want));
+        memcpy(want, l->parts[i].name, strlen(l->parts[i].name));
+        g_assert_cmpmem(&image[off + 4], sizeof(want), want, sizeof(want));
+
+        off += len;
+    }
+
+    /* The chain covers the part and stops there */
+    g_assert_cmpuint(off, ==, l->size);
 
     unlink(path);
 }
@@ -379,6 +463,7 @@ int main(int argc, char *argv[])
     for (i = 0; i < ARRAY_SIZE(layouts); i++) {
         g_autofree char *name = g_strdup_printf("%s/macio-nvram/%s", arch,
                                                 layouts[i].machine);
+        g_autofree char *parts = NULL;
         g_autofree char *rubbish = NULL;
         g_autofree char *ones = NULL;
         g_autofree char *incoming = NULL;
@@ -391,6 +476,9 @@ int main(int argc, char *argv[])
             continue;
         }
         qtest_add_data_func(name, &layouts[i], test_nvram_image);
+
+        parts = g_strdup_printf("%s/partitions", name);
+        qtest_add_data_func(parts, &layouts[i], test_nvram_partitions);
 
         rubbish = g_strdup_printf("%s/rubbish", name);
         qtest_add_data_func(rubbish, &layouts[i], test_nvram_rubbish);
