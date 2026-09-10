@@ -36,6 +36,7 @@
 #include "qemu/error-report.h"
 #include "qemu/log.h"
 #include "system/system.h"
+#include "system/runstate.h"
 #include "trace.h"
 #include <zlib.h> /* for adler32 */
 
@@ -350,9 +351,21 @@ static bool pmac_nvram_keep_image(MacIONVRAMState *nvr, int len)
 /* Hand the freshly formatted contents to the backing image, if there is one */
 static void pmac_nvram_flush(MacIONVRAMState *nvr, int len)
 {
-    if (nvr->blk) {
-        macio_nvram_store(nvr, 0, len);
+    if (!nvr->blk) {
+        return;
     }
+
+    /*
+     * A machine waiting for an incoming migration has its block backends
+     * inactive, and writing to one of those trips an assertion.  There is
+     * nothing worth writing either: the contents that arrive replace what
+     * was formatted here, and the load hands those to the image instead.
+     */
+    if (runstate_check(RUN_STATE_INMIGRATE)) {
+        return;
+    }
+
+    macio_nvram_store(nvr, 0, len);
 }
 
 /* Set up a system OpenBIOS NVRAM partition */
