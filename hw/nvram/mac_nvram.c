@@ -466,6 +466,67 @@ static void pmac_format_nvram_partition_osx(MacIONVRAMState *nvr, int off,
  */
 #define CORE99_FREE_PART_NAME   "wwwwwwwwwwww"
 
+/* Does any -prom-env entry already set this variable? */
+static bool pmac_nvram_prom_env_has(const char *key)
+{
+    size_t keylen = strlen(key);
+    unsigned int i;
+
+    for (i = 0; i < nb_prom_envs; i++) {
+        if (!strncmp(prom_envs[i], key, keylen) &&
+            prom_envs[i][keylen] == '=') {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/*
+ * Escapes "len" raw bytes so Mac OS X 10.5's own
+ * IODTNVRAM::unescapeBytesToData() reconstructs them exactly: a run of
+ * up to 0x7f bytes of 0x00 or 0xff becomes 0xff followed by a count
+ * byte (bit 7 selects which value, the low 7 bits are the run
+ * length); every other byte passes through unchanged.  A CHRP system
+ * partition stores "name=value" as a NUL-terminated string, so the
+ * result must never contain a literal NUL byte other than the one
+ * this function appends as the terminator -- that is exactly what the
+ * escaping guarantees.
+ *
+ * This mirrors IODTNVRAM::escapeDataToData(), except that a run is
+ * capped at 0x7f rather than growing to 0x80: at exactly 0x80,
+ * escapeDataToData()'s own count byte becomes (byte & 0x80) | 0x80,
+ * which its low-7-bits mask then decodes as a run of zero.  Staying
+ * at 0x7f keeps every run round-trippable through the real decoder;
+ * the difference is unreachable here since len is always 16.
+ *
+ * "out" must be at least 2 * len + 1 bytes.
+ */
+static void pmac_nvram_escape_bytes(const uint8_t *bytes, unsigned int len,
+                                    char *out)
+{
+    unsigned int i = 0, o = 0;
+
+    while (i < len) {
+        uint8_t byte = bytes[i];
+
+        if (byte == 0x00 || byte == 0xff) {
+            unsigned int run = 1;
+
+            while (i + run < len && bytes[i + run] == byte && run < 0x7f) {
+                run++;
+            }
+            out[o++] = (char)0xff;
+            out[o++] = (char)((byte & 0x80) | run);
+            i += run;
+        } else {
+            out[o++] = (char)byte;
+            i++;
+        }
+    }
+    out[o] = '\0';
+}
+
 /*
  * Format one core99 bank: the header above, the "common" partition holding
  * the Open Firmware variables, and a free partition covering the rest.
@@ -477,7 +538,30 @@ static void pmac_format_nvram_partition_osx(MacIONVRAMState *nvr, int off,
 static void pmac_format_nvram_bank_core99(uint8_t *bank, uint32_t generation)
 {
     ChrpNvramPartHdr *hdr = (ChrpNvramPartHdr *)bank;
+    const char *envs[MAX_PROM_ENVS + 1];
+    unsigned int n = nb_prom_envs;
+    char platform_uuid_env[sizeof("platform-uuid=") - 1 +
+                           2 * sizeof(qemu_uuid.data) + 1];
     int end;
+
+    memcpy(envs, prom_envs, nb_prom_envs * sizeof(envs[0]));
+
+    /*
+     * Real hardware keeps "platform-uuid" in NVRAM; Mac OS X 10.5's
+     * IOPlatformExpert::registerNVRAMController() reads it from there
+     * (not from the OF device tree BootX hands off, which is rebuilt
+     * from this same NVRAM independently of it).  Seed it from -uuid
+     * the same way -prom-env seeds any other variable, unless the
+     * user already set one explicitly.
+     */
+    if (qemu_uuid_set && !pmac_nvram_prom_env_has("platform-uuid")) {
+        memcpy(platform_uuid_env, "platform-uuid=",
+               sizeof("platform-uuid=") - 1);
+        pmac_nvram_escape_bytes(qemu_uuid.data, sizeof(qemu_uuid.data),
+                                platform_uuid_env +
+                                sizeof("platform-uuid=") - 1);
+        envs[n++] = platform_uuid_env;
+    }
 
     hdr->signature = OSX_NVRAM_SIGNATURE;
     pstrcpy(hdr->name, sizeof(hdr->name), "nvram");
@@ -487,10 +571,11 @@ static void pmac_format_nvram_bank_core99(uint8_t *bank, uint32_t generation)
     stl_be_p(&bank[CORE99_GENERATION_OFFSET], generation);
 
     end = CORE99_HEADER_SIZE +
-          chrp_nvram_create_system_partition(&bank[CORE99_HEADER_SIZE],
-                                             DEF_SYSTEM_SIZE,
-                                             CORE99_NVRAM_BANK_SIZE -
-                                             CORE99_HEADER_SIZE);
+          chrp_nvram_create_system_partition_from(&bank[CORE99_HEADER_SIZE],
+                                                  DEF_SYSTEM_SIZE,
+                                                  CORE99_NVRAM_BANK_SIZE -
+                                                  CORE99_HEADER_SIZE,
+                                                  envs, n);
     if (end < CORE99_NVRAM_BANK_SIZE) {
         ChrpNvramPartHdr *free_hdr = (ChrpNvramPartHdr *)&bank[end];
 
@@ -525,6 +610,10 @@ void pmac_format_nvram_partition_core99(MacIONVRAMState *nvr, int len)
     assert(len == CORE99_NVRAM_SIZE);
 
     if (pmac_nvram_keep_image(nvr, len)) {
+        if (qemu_uuid_set) {
+            warn_report("macio-nvram: keeping platform-uuid from the "
+                        "backing image, -uuid is not applied");
+        }
         return;
     }
     memset(nvr->data, 0, len);

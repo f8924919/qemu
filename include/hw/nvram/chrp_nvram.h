@@ -57,6 +57,10 @@ chrp_nvram_finish_partition(ChrpNvramPartHdr *header, uint32_t size)
 
 /* chrp_nvram_create_system_partition() failure is fatal */
 int chrp_nvram_create_system_partition(uint8_t *data, int min_len, int max_len);
+int chrp_nvram_create_system_partition_from(uint8_t *data, int min_len,
+                                            int max_len,
+                                            const char * const *envs,
+                                            unsigned int n);
 int chrp_nvram_create_free_partition(uint8_t *data, int len);
 
 #endif

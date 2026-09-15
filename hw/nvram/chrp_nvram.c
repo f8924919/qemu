@@ -51,8 +51,15 @@ static int chrp_nvram_set_var(uint8_t *nvram, int addr, const char *str,
  * nvram-partition-type-common), and the name the guest operating
  * systems look for when they build their view of the Open Firmware
  * variables (Mac OS X and Linux both do).
+ *
+ * envs/n let a caller add its own "name=value" entries alongside
+ * -prom-env's (the PowerMac NewWorld boards use this to seed
+ * "platform-uuid" from -uuid; see pmac_format_nvram_bank_core99()).
  */
-int chrp_nvram_create_system_partition(uint8_t *data, int min_len, int max_len)
+int chrp_nvram_create_system_partition_from(uint8_t *data, int min_len,
+                                            int max_len,
+                                            const char * const *envs,
+                                            unsigned int n)
 {
     ChrpNvramPartHdr *part_header;
     unsigned int i;
@@ -67,8 +74,8 @@ int chrp_nvram_create_system_partition(uint8_t *data, int min_len, int max_len)
     pstrcpy(part_header->name, sizeof(part_header->name), "common");
 
     end = sizeof(ChrpNvramPartHdr);
-    for (i = 0; i < nb_prom_envs; i++) {
-        end = chrp_nvram_set_var(data, end, prom_envs[i], max_len - end);
+    for (i = 0; i < n; i++) {
+        end = chrp_nvram_set_var(data, end, envs[i], max_len - end);
         if (end == -1) {
             goto fail;
         }
@@ -90,6 +97,12 @@ int chrp_nvram_create_system_partition(uint8_t *data, int min_len, int max_len)
 fail:
     error_report("NVRAM is too small. Try to pass less data to -prom-env");
     exit(EXIT_FAILURE);
+}
+
+int chrp_nvram_create_system_partition(uint8_t *data, int min_len, int max_len)
+{
+    return chrp_nvram_create_system_partition_from(data, min_len, max_len,
+                                                    prom_envs, nb_prom_envs);
 }
 
 /**
