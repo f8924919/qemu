@@ -51,6 +51,14 @@ size will do - is initialised on the first run and written back, so
 left alone, and the settings in it win over ``-prom-env``.  Note that
 ``-snapshot`` covers this drive too, so nothing is kept with it.
 
+On ``mac99`` and its derivatives, giving ``-uuid`` also seeds the
+firmware's ``platform-uuid`` variable the same way ``-prom-env`` seeds
+any other one, so Mac OS X 10.5 exposes it as ``IOPlatformUUID``.  Like
+any other seeded variable, it only takes effect while the image is
+being initialised; once the guest (or an earlier run) has written its
+own ``platform-uuid``, that value wins and ``-uuid`` is ignored, with a
+warning on stderr.
+
 Migrating a machine hands its NVRAM to the image on the destination as
 well.  That happens once the destination is running, so an image read
 right after the migration has finished still holds what it did before, and
