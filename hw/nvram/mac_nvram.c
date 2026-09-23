@@ -32,6 +32,7 @@
 #include "system/block-backend.h"
 #include "migration/vmstate.h"
 #include "qemu/cutils.h"
+#include "qemu/host-utils.h"
 #include "qemu/module.h"
 #include "qemu/error-report.h"
 #include "qemu/log.h"
@@ -270,6 +271,14 @@ static void macio_nvram_realizefn(DeviceState *dev, Error **errp)
 {
     SysBusDevice *d = SYS_BUS_DEVICE(dev);
     MacIONVRAMState *s = MACIO_NVRAM(dev);
+
+    /* An erase clears the aligned block an address falls in */
+    if (s->block_size &&
+        (!is_power_of_2(s->block_size) || s->size % s->block_size)) {
+        error_setg(errp, "block-size %" PRIu32 " is not a power of two "
+                   "that divides the size %" PRIu32, s->block_size, s->size);
+        return;
+    }
 
     s->data = g_malloc0(s->size);
 
