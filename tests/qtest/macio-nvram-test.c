@@ -49,10 +49,12 @@ typedef struct {
 
 /*
  * Two identical core99 banks: the header the guests validate a bank by, the
- * Open Firmware variables and a free partition covering the rest.
+ * Open Firmware variables and a free partition covering the rest.  The free
+ * partition name fills the whole field with no terminator: Mac OS X finds
+ * the free space by comparing it with strncmp(..., 12).
  */
 static const NvramPart mac99_parts[] = {
-    { 0x5a, "nvram" }, { 0x70, "common" }, { 0x7f, "free" },
+    { 0x5a, "nvram" }, { 0x70, "common" }, { 0x7f, "wwwwwwwwwwww" },
 };
 
 static const NvramLayout layouts[] = {

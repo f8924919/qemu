@@ -94,6 +94,11 @@ fail:
 
 /**
  * Create a "free space" partition
+ *
+ * LoPAPR requires the name field of every free space partition to be
+ * set to "0x7...77".  Linux and Mac OS X both take that as twelve 0x77
+ * ('w') bytes with no terminator, and Mac OS X finds the free space by
+ * comparing the whole field with strncmp(..., 12).
  */
 int chrp_nvram_create_free_partition(uint8_t *data, int len)
 {
@@ -101,7 +106,7 @@ int chrp_nvram_create_free_partition(uint8_t *data, int len)
 
     part_header = (ChrpNvramPartHdr *)data;
     part_header->signature = CHRP_NVPART_FREE;
-    pstrcpy(part_header->name, sizeof(part_header->name), "free");
+    memset(part_header->name, 'w', sizeof(part_header->name));
 
     chrp_nvram_finish_partition(part_header, len);
 

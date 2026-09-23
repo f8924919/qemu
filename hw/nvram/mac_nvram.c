@@ -335,7 +335,7 @@ static void pmac_format_nvram_partition_osx(MacIONVRAMState *nvr, int off,
     /* empty partition */
     part_header = (ChrpNvramPartHdr *)data;
     part_header->signature = OSX_NVRAM_SIGNATURE;
-    pstrcpy(part_header->name, sizeof(part_header->name), "wwwwwwwwwwww");
+    memset(part_header->name, 'w', sizeof(part_header->name));
 
     chrp_nvram_finish_partition(part_header, len);
 
