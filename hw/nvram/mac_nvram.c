@@ -442,7 +442,7 @@ static void pmac_format_nvram_partition_osx(MacIONVRAMState *nvr, int off,
     /* empty partition */
     part_header = (ChrpNvramPartHdr *)data;
     part_header->signature = OSX_NVRAM_SIGNATURE;
-    pstrcpy(part_header->name, sizeof(part_header->name), "wwwwwwwwwwww");
+    memset(part_header->name, 'w', sizeof(part_header->name));
 
     chrp_nvram_finish_partition(part_header, len);
 
@@ -461,19 +461,6 @@ static void pmac_format_nvram_partition_osx(MacIONVRAMState *nvr, int off,
 #define CORE99_ADLER_OFFSET     0x10
 #define CORE99_GENERATION_OFFSET 0x14
 #define CORE99_HEADER_SIZE      0x20
-
-/*
- * The name a free space partition carries.  Mac OS X finds the free space
- * by this name alone, and it compares it with strncmp(..., 12): the field
- * is a fixed twelve bytes rather than a C string, so a terminator in the
- * last one makes the match fail.  Linux writes the same twelve characters
- * (memset(part->header.name, 'w', 12) in nvram_remove_partition()), which
- * is why the shorter "free" the CHRP helper writes is the odd one out.
- *
- * Once the name matches, Mac OS X carves a partition of its own out of the
- * free space to keep panic information in.
- */
-#define CORE99_FREE_PART_NAME   "wwwwwwwwwwww"
 
 /* Does any -prom-env entry already set this variable? */
 static bool pmac_nvram_prom_env_has(const char *key)
@@ -586,18 +573,8 @@ static void pmac_format_nvram_bank_core99(uint8_t *bank, uint32_t generation)
                                                   CORE99_HEADER_SIZE,
                                                   envs, n);
     if (end < CORE99_NVRAM_BANK_SIZE) {
-        ChrpNvramPartHdr *free_hdr = (ChrpNvramPartHdr *)&bank[end];
-
-        /*
-         * Written here rather than through chrp_nvram_create_free_partition()
-         * because that one is shared with the sparc and pSeries machines, and
-         * the name it writes cannot be checked on any of those from here.
-         */
-        QEMU_BUILD_BUG_ON(sizeof(CORE99_FREE_PART_NAME) - 1 !=
-                          sizeof(free_hdr->name));
-        free_hdr->signature = CHRP_NVPART_FREE;
-        memcpy(free_hdr->name, CORE99_FREE_PART_NAME, sizeof(free_hdr->name));
-        chrp_nvram_finish_partition(free_hdr, CORE99_NVRAM_BANK_SIZE - end);
+        chrp_nvram_create_free_partition(&bank[end],
+                                         CORE99_NVRAM_BANK_SIZE - end);
     }
 
     /*

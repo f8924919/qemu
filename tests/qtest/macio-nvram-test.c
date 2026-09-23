@@ -54,14 +54,14 @@ static const NvramPart newworld_parts[] = {
 };
 
 /*
- * OldWorld is left alone: it has no guest here to tell whether Mac OS X
- * would go on to carve a panic partition out of the free space, so the
- * names it writes are pinned as they are rather than changed blind.
+ * OldWorld: an Open Firmware half and a Mac OS X half.  The free space
+ * and the Mac OS X half carry the same twelve character name as on the
+ * NewWorld machines, as LoPAPR and the guests write it.
  */
 static const NvramPart oldworld_parts[] = {
     { 0x70, "common" },
-    { 0x7f, "free" },
-    { 0x5a, "wwwwwwwwwww" },        /* Eleven, written with pstrcpy() */
+    { 0x7f, "wwwwwwwwwwww" },
+    { 0x5a, "wwwwwwwwwwww" },
 };
 
 typedef struct {
