@@ -18,6 +18,7 @@
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 #include "qemu/osdep.h"
+#include "exec/g5-flushcnt.h"
 #include "qemu/units.h"
 #include "cpu.h"
 #include "exec/page-protection.h"
@@ -132,6 +133,7 @@ void helper_SLBIA(CPUPPCState *env, uint32_t ih)
      */
 
     env->tlb_need_flush |= TLB_NEED_LOCAL_FLUSH;
+    g5f_arm(env_cpu(env)->cpu_index, G5F_T_SLBIA);
 
     starting_entry = 1; /* default for IH=0,1,2,6 */
 
@@ -224,6 +226,7 @@ static void __helper_slbie(CPUPPCState *env, target_ulong addr,
          */
         env->tlb_need_flush |=
             (global == false ? TLB_NEED_LOCAL_FLUSH : TLB_NEED_GLOBAL_FLUSH);
+        g5f_arm(env_cpu(env)->cpu_index, G5F_T_SLBIE);
     }
 }
 

@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "exec/g5-flushcnt.h"
 #include "qemu/log.h"
 #include "cpu.h"
 #include "exec/cputlb.h"
@@ -164,7 +165,10 @@ void helper_store_sdr1(CPUPPCState *env, target_ulong val)
 {
     if (env->spr[SPR_SDR1] != val) {
         ppc_store_sdr1(env, val);
+        g5f_cur_tag = g5f_take(env_cpu(env)->cpu_index, 0, G5F_E_DIRECT,
+                               G5F_T_SDR1);
         tlb_flush(env_cpu(env));
+        g5f_cur_tag = 0;
     }
 }
 
