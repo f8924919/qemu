@@ -35,4 +35,10 @@ void queue_tb_flush(CPUState *cs);
 
 void tcg_flush_jmp_cache(CPUState *cs);
 
+/*
+ * Forget that the entries of @cs's jump cache were checked against the
+ * current address translation; used when the TLB is flushed.
+ */
+void tcg_uncheck_jmp_cache(CPUState *cs);
+
 #endif /* _TB_FLUSH_H_ */

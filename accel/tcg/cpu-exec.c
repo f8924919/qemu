@@ -195,6 +195,28 @@ static bool tb_lookup_cmp(const void *p, const void *d)
     return false;
 }
 
+/*
+ * Is @tb, found in the jump cache under a mapping that may have changed
+ * since, still what a QHT lookup of @s would return?  This applies the
+ * same test as the QHT lookup, so it may raise an exception in the same
+ * way.  A TB that is not in the QHT is either CF_INVALID, which the
+ * caller has already ruled out by comparing cflags, or a one-insn TB
+ * for a page without RAM, which is never reused: hence the -1 check.
+ */
+static bool tb_jmp_cache_recheck(CPUState *cpu, const TranslationBlock *tb,
+                                 TCGTBCPUState s)
+{
+    struct tb_desc desc;
+
+    desc.s = s;
+    desc.env = cpu_env(cpu);
+    desc.page_addr0 = get_page_addr_code(desc.env, s.pc);
+    if (desc.page_addr0 == -1) {
+        return false;
+    }
+    return tb_lookup_cmp(tb, &desc);
+}
+
 static TranslationBlock *tb_htable_lookup(CPUState *cpu, TCGTBCPUState s)
 {
     tb_page_addr_t phys_pc;
@@ -245,7 +267,13 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
                tb->cs_base == s.cs_base &&
                tb->flags == s.flags &&
                tb_cflags(tb) == s.cflags)) {
-        goto hit;
+        if (likely(tb_jmp_cache_is_checked(jc, hash))) {
+            goto hit;
+        }
+        if (tb_jmp_cache_recheck(cpu, tb, s)) {
+            tb_jmp_cache_set_checked(jc, hash);
+            goto hit;
+        }
     }
 
     tb = tb_htable_lookup(cpu, s);
@@ -255,6 +283,7 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
 
     jc->array[hash].pc = s.pc;
     qatomic_set(&jc->array[hash].tb, tb);
+    tb_jmp_cache_set_checked(jc, hash);
 
 hit:
     /*
@@ -981,6 +1010,7 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                 jc = cpu->tb_jmp_cache;
                 jc->array[h].pc = s.pc;
                 qatomic_set(&jc->array[h].tb, tb);
+                tb_jmp_cache_set_checked(jc, h);
             }
 
 #ifndef CONFIG_USER_ONLY

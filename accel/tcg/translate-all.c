@@ -636,3 +636,15 @@ void tcg_flush_jmp_cache(CPUState *cpu)
         qatomic_set(&jc->array[i].tb, NULL);
     }
 }
+
+void tcg_uncheck_jmp_cache(CPUState *cpu)
+{
+    CPUJumpCache *jc = cpu->tb_jmp_cache;
+
+    /* During early initialization, the cache may not yet be allocated. */
+    if (unlikely(jc == NULL)) {
+        return;
+    }
+
+    memset(jc->checked, 0, sizeof(jc->checked));
+}
