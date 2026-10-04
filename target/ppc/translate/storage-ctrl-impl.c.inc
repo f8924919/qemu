@@ -242,6 +242,7 @@ static bool do_tlbie(DisasContext *ctx, arg_X_tlbie *a, bool local)
         return true;
     }
 
+    gen_helper_g5f_tlbie_global(tcg_env);
     t1 = tcg_temp_new_i32();
     tcg_gen_ld_i32(t1, tcg_env, offsetof(CPUPPCState, tlb_need_flush));
     tcg_gen_ori_i32(t1, t1, TLB_NEED_GLOBAL_FLUSH);

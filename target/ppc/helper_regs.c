@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "exec/g5-flushcnt.h"
 #include "cpu.h"
 #include "qemu/main-loop.h"
 #include "exec/cputlb.h"
@@ -393,14 +394,18 @@ void check_tlb_flush(CPUPPCState *env, bool global)
     if (global && (env->tlb_need_flush & TLB_NEED_GLOBAL_FLUSH)) {
         env->tlb_need_flush &= ~TLB_NEED_GLOBAL_FLUSH;
         env->tlb_need_flush &= ~TLB_NEED_LOCAL_FLUSH;
+        g5f_cur_tag = g5f_take(cs->cpu_index, 1, g5f_cur_entry, 0);
         tlb_flush_all_cpus_synced(cs);
+        g5f_cur_tag = 0;
         return;
     }
 
     /* Then handle local ones */
     if (env->tlb_need_flush & TLB_NEED_LOCAL_FLUSH) {
         env->tlb_need_flush &= ~TLB_NEED_LOCAL_FLUSH;
+        g5f_cur_tag = g5f_take(cs->cpu_index, 0, g5f_cur_entry, 0);
         tlb_flush(cs);
+        g5f_cur_tag = 0;
     }
 }
 #endif /* !CONFIG_USER_ONLY */

@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "exec/g5-flushcnt.h"
 #include "qemu/main-loop.h"
 #include "qemu/target-info.h"
 #include "accel/tcg/cpu-loop.h"
@@ -92,6 +93,9 @@
 QEMU_BUILD_BUG_ON(sizeof(vaddr) > sizeof(run_on_cpu_data));
 
 #define ALL_MMUIDX_BITS ((1 << NB_MMU_MODES) - 1)
+
+/* qemu-g5 #364: the flush tag rides above the idxmap (NOT FOR UPSTREAM) */
+#define G5F_TAG_SHIFT 32
 
 static inline size_t tlb_n_entries(CPUTLBDescFast *fast)
 {
@@ -369,7 +373,8 @@ static void flush_all_helper(CPUState *src, run_on_cpu_func fn,
 
 static void tlb_flush_by_mmuidx_async_work(CPUState *cpu, run_on_cpu_data data)
 {
-    MMUIdxMap asked = data.host_int;
+    MMUIdxMap asked = (MMUIdxMap)(data.host_ulong & 0xffffffffUL);
+    uint32_t g5f_tag = data.host_ulong >> G5F_TAG_SHIFT;
     MMUIdxMap all_dirty, work, to_clean;
     int64_t now = get_clock_realtime();
 
@@ -393,6 +398,12 @@ static void tlb_flush_by_mmuidx_async_work(CPUState *cpu, run_on_cpu_data data)
 
     tcg_flush_jmp_cache(cpu);
 
+    g5f_work(cpu->cpu_index, g5f_tag,
+             to_clean == ALL_MMUIDX_BITS ? 0 : to_clean ? 1 : 2,
+             to_clean == ALL_MMUIDX_BITS ? 0 : ctpop16(to_clean),
+             to_clean == ALL_MMUIDX_BITS || to_clean == asked ? 0 :
+             ctpop16(asked & ~to_clean));
+
     if (to_clean == ALL_MMUIDX_BITS) {
         qatomic_set(&cpu->neg.tlb.c.full_flush_count,
                     cpu->neg.tlb.c.full_flush_count + 1);
@@ -413,7 +424,8 @@ void tlb_flush_by_mmuidx(CPUState *cpu, MMUIdxMap idxmap)
 
     assert_cpu_is_self(cpu);
 
-    tlb_flush_by_mmuidx_async_work(cpu, RUN_ON_CPU_HOST_INT(idxmap));
+    tlb_flush_by_mmuidx_async_work(cpu, RUN_ON_CPU_HOST_ULONG(
+        idxmap | ((unsigned long)g5f_cur_tag << G5F_TAG_SHIFT)));
 }
 
 void tlb_flush(CPUState *cpu)
@@ -427,8 +439,10 @@ void tlb_flush_by_mmuidx_all_cpus_synced(CPUState *src_cpu, MMUIdxMap idxmap)
 
     tlb_debug("mmu_idx: 0x%"PRIx16"\n", idxmap);
 
-    flush_all_helper(src_cpu, fn, RUN_ON_CPU_HOST_INT(idxmap));
-    async_safe_run_on_cpu(src_cpu, fn, RUN_ON_CPU_HOST_INT(idxmap));
+    unsigned long d = idxmap | ((unsigned long)g5f_cur_tag << G5F_TAG_SHIFT);
+
+    flush_all_helper(src_cpu, fn, RUN_ON_CPU_HOST_ULONG(d));
+    async_safe_run_on_cpu(src_cpu, fn, RUN_ON_CPU_HOST_ULONG(d));
 }
 
 void tlb_flush_all_cpus_synced(CPUState *src_cpu)

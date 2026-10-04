@@ -41,6 +41,7 @@ DEF_HELPER_1(handle_pmc5_overflow, void, env)
 DEF_HELPER_2(book3s_trace, void, env, tl)
 DEF_HELPER_1(check_tlb_flush_local, void, env)
 DEF_HELPER_1(check_tlb_flush_global, void, env)
+DEF_HELPER_1(g5f_tlbie_global, void, env)
 #endif
 
 DEF_HELPER_3(lmw, void, env, tl, i32)
