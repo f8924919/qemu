@@ -17,6 +17,7 @@
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 #include "qemu/osdep.h"
+#include "exec/g5-flushcnt.h"
 #include "qemu/main-loop.h"
 #include "qemu/log.h"
 #include "target/ppc/cpu.h"
@@ -525,7 +526,9 @@ static void do_rfi(CPUPPCState *env, target_ulong nip, target_ulong msr)
     env->reserve_addr = -1;
 
     /* Context synchronizing: check if TCG TLB needs flush */
+    g5f_cur_entry = G5F_E_RFI;
     check_tlb_flush(env, false);
+    g5f_cur_entry = G5F_E_NONE;
 }
 
 void helper_rfi(CPUPPCState *env)

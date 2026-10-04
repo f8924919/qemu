@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "exec/g5-flushcnt.h"
 #include "qemu/units.h"
 #include "cpu.h"
 #include "system/kvm.h"
@@ -252,7 +253,10 @@ void ppc_tlb_invalidate_all(CPUPPCState *env)
 #if defined(TARGET_PPC64)
     if (mmu_is_64bit(env->mmu_model)) {
         env->tlb_need_flush = 0;
+        g5f_cur_tag = g5f_take(env_cpu(env)->cpu_index, 1, G5F_E_DIRECT,
+                               G5F_T_RESET);
         tlb_flush(env_cpu(env));
+        g5f_cur_tag = 0;
     } else
 #endif /* defined(TARGET_PPC64) */
     switch (env->mmu_model) {
@@ -299,6 +303,7 @@ void ppc_tlb_invalidate_one(CPUPPCState *env, target_ulong addr)
          *      we just invalidate all TLBs
          */
         env->tlb_need_flush |= TLB_NEED_LOCAL_FLUSH;
+        g5f_arm(env_cpu(env)->cpu_index, G5F_T_TLBIE);
     } else
 #endif /* defined(TARGET_PPC64) */
     switch (env->mmu_model) {
@@ -390,6 +395,7 @@ void helper_tlbia(CPUPPCState *env)
 
 void helper_tlbie(CPUPPCState *env, target_ulong addr)
 {
+    g5f_tlbie_rb(env_cpu(env)->cpu_index, addr);
     ppc_tlb_invalidate_one(env, addr);
 }
 
@@ -1349,12 +1355,21 @@ void helper_booke206_tlbflush(CPUPPCState *env, target_ulong type)
 
 void helper_check_tlb_flush_local(CPUPPCState *env)
 {
+    g5f_cur_entry = G5F_E_ISYNC;
     check_tlb_flush(env, false);
+    g5f_cur_entry = G5F_E_NONE;
 }
 
 void helper_check_tlb_flush_global(CPUPPCState *env)
 {
+    g5f_cur_entry = G5F_E_PTESYNC;
     check_tlb_flush(env, true);
+    g5f_cur_entry = G5F_E_NONE;
+}
+
+void helper_g5f_tlbie_global(CPUPPCState *env)
+{
+    g5f_arm(env_cpu(env)->cpu_index, G5F_T_TLBIEG);
 }
 
 
