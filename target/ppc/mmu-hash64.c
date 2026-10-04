@@ -110,6 +110,7 @@ void helper_SLBIA(CPUPPCState *env, uint32_t ih)
     PowerPCCPU *cpu = env_archcpu(env);
     int starting_entry;
     int n;
+    int g5f_inv = 0;
 
     /*
      * slbia must always flush all TLB (which is equivalent to ERAT in ppc
@@ -175,7 +176,9 @@ void helper_SLBIA(CPUPPCState *env, uint32_t ih)
         }
 
         slb->esid &= ~SLB_ESID_V;
+        g5f_inv++;
     }
+    g5f_slbia(env_cpu(env)->cpu_index, g5f_inv == 0);
 }
 
 #if defined(TARGET_PPC64)
@@ -282,6 +285,9 @@ int ppc_store_slb(PowerPCCPU *cpu, target_ulong slot,
         return -1;
     }
 
+    /* qemu-g5 #369: an overwrite of a valid entry changes translations */
+    g5f_store(CPU(cpu)->cpu_index, (slb->esid & SLB_ESID_V) &&
+              (slb->esid != esid || slb->vsid != vsid));
     slb->esid = esid;
     slb->vsid = vsid;
     slb->sps = sps;
@@ -367,10 +373,13 @@ void helper_SLBMTE(CPUPPCState *env, target_ulong rb, target_ulong rs)
     slot = rb & (cpu->hash64_opts->slb_size - 1);
     esid = rb & (SLB_ESID_ESID | SLB_ESID_V);
 
+    g5f_store_caller = G5F_S_SLBMTE;
     if (ppc_store_slb(cpu, slot, esid, rs) < 0) {
+        g5f_store_caller = G5F_S_OTHER;
         raise_exception_err_ra(env, POWERPC_EXCP_PROGRAM,
                                POWERPC_EXCP_INVAL, GETPC());
     }
+    g5f_store_caller = G5F_S_OTHER;
 }
 
 target_ulong helper_SLBMFEE(CPUPPCState *env, target_ulong rb)
@@ -1250,6 +1259,7 @@ void ppc_hash64_tlb_flush_hpte(PowerPCCPU *cpu, target_ulong ptex,
      * mask) in QEMU, we just invalidate all TLBs
      */
     cpu->env.tlb_need_flush = TLB_NEED_GLOBAL_FLUSH | TLB_NEED_LOCAL_FLUSH;
+    g5f_arm(CPU(cpu)->cpu_index, G5F_T_HPTE);
 }
 
 #ifdef CONFIG_TCG

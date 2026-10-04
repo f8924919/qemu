@@ -362,7 +362,9 @@ void helper_store_sr(CPUPPCState *env, target_ulong srnum, target_ulong value)
         /* flags = flags */
         vsid |= ((value >> 27) & 0xf) << 8;
 
+        g5f_store_caller = G5F_S_MTSR;
         ppc_store_slb(cpu, srnum, esid, vsid);
+        g5f_store_caller = G5F_S_OTHER;
     } else
 #endif
     if (env->sr[srnum] != value) {
