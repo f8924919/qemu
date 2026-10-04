@@ -12,6 +12,7 @@ tcg_ss.add(files(
   'tb-maint.c',
   'tcg-all.c',
   'tcg-stats.c',
+  'g5-jccnt.c',
   'translate-all.c',
   'translator.c',
 ))

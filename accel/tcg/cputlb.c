@@ -31,6 +31,7 @@
 #include "accel/tcg/cpu-mmu-index.h"
 #include "exec/cputlb.h"
 #include "exec/tb-flush.h"
+#include "exec/g5-jccnt.h"
 #include "system/ramblock.h"
 #include "exec/mmu-access-type.h"
 #include "exec/tlb-common.h"
@@ -392,6 +393,9 @@ static void tlb_flush_by_mmuidx_async_work(CPUState *cpu, run_on_cpu_data data)
     qemu_spin_unlock(&cpu->neg.tlb.c.lock);
 
     tcg_uncheck_jmp_cache(cpu);
+    if (g5jc_old) {
+        tcg_flush_jmp_cache(cpu);   /* qemu-g5 #369: old behaviour */
+    }
 
     if (to_clean == ALL_MMUIDX_BITS) {
         qatomic_set(&cpu->neg.tlb.c.full_flush_count,

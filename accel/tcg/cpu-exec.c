@@ -42,6 +42,7 @@
 #include "exec/helper-proto-common.h"
 #include "tcg-accel-ops.h"
 #include "tb-jmp-cache.h"
+#include "exec/g5-jccnt.h"
 #include "tb-hash.h"
 #include "tb-context.h"
 #include "tb-internal.h"
@@ -212,9 +213,15 @@ static bool tb_jmp_cache_recheck(CPUState *cpu, const TranslationBlock *tb,
     desc.env = cpu_env(cpu);
     desc.page_addr0 = get_page_addr_code(desc.env, s.pc);
     if (desc.page_addr0 == -1) {
+        g5jc_count(cpu->cpu_index, G5JC_MINUS1);
         return false;
     }
-    return tb_lookup_cmp(tb, &desc);
+    if (!tb_lookup_cmp(tb, &desc)) {
+        g5jc_count(cpu->cpu_index, G5JC_CMPFAIL);
+        return false;
+    }
+    g5jc_count(cpu->cpu_index, G5JC_PASS);
+    return true;
 }
 
 static TranslationBlock *tb_htable_lookup(CPUState *cpu, TCGTBCPUState s)
@@ -261,21 +268,46 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
     hash = tb_jmp_cache_hash_func(s.pc);
     jc = cpu->tb_jmp_cache;
 
+    g5jc_count(cpu->cpu_index, G5JC_LOOKUP);
     tb = qatomic_read(&jc->array[hash].tb);
     if (likely(tb &&
                jc->array[hash].pc == s.pc &&
                tb->cs_base == s.cs_base &&
                tb->flags == s.flags &&
                tb_cflags(tb) == s.cflags)) {
+        bool ok;
+
         if (likely(tb_jmp_cache_is_checked(jc, hash))) {
+            g5jc_count(cpu->cpu_index, G5JC_HIT_CHECKED);
             goto hit;
         }
-        if (tb_jmp_cache_recheck(cpu, tb, s)) {
+        if (g5jc_skip_recheck) {
+            g5jc_count(cpu->cpu_index, G5JC_SKIPPED);
+            ok = true;
+        } else {
+            g5jc_count(cpu->cpu_index, G5JC_ENTER);
+            ok = tb_jmp_cache_recheck(cpu, tb, s);
+        }
+        if (ok) {
+            /* qemu-g5 #369: cross-check against the QHT, run its answer */
+            TranslationBlock *q = tb_htable_lookup(cpu, s);
+
+            g5jc_count(cpu->cpu_index, q == tb ? G5JC_X_SAME :
+                       q ? G5JC_X_DIFF : G5JC_X_NULL);
+            if (q == NULL) {
+                return NULL;
+            }
+            if (q != tb) {
+                tb = q;
+                jc->array[hash].pc = s.pc;
+                qatomic_set(&jc->array[hash].tb, tb);
+            }
             tb_jmp_cache_set_checked(jc, hash);
             goto hit;
         }
     }
 
+    g5jc_count(cpu->cpu_index, G5JC_QHT);
     tb = tb_htable_lookup(cpu, s);
     if (tb == NULL) {
         return NULL;
