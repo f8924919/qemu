@@ -85,6 +85,9 @@ void tcg_gen_goto_tb(unsigned idx);
  */
 void tcg_gen_lookup_and_goto_ptr(void);
 
+/* qemu-g5 #368 (NOT FOR UPSTREAM): goto_ptr on its own, for ppc */
+void tcg_gen_goto_ptr(TCGv_ptr ptr);
+
 void tcg_gen_plugin_cb(unsigned from);
 void tcg_gen_plugin_mem_cb(TCGv_i64 addr, unsigned meminfo);
 

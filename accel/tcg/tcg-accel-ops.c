@@ -26,6 +26,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "exec/g5-tbcnt.h"
 #include "accel/accel-ops.h"
 #include "accel/accel-cpu-ops.h"
 #include "accel/tcg/cpu-loop.h"
@@ -88,7 +89,7 @@ int tcg_cpu_exec(CPUState *cpu)
 
 static void tcg_cpu_reset_hold(CPUState *cpu)
 {
-    tcg_flush_jmp_cache(cpu);
+    g5t_flush_jmp_cache(cpu, G5T_C_RESET);
 
     tlb_flush(cpu);
 }

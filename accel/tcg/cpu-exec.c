@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "exec/g5-tbcnt.h"
 #include "qemu/qemu-print.h"
 #include "qapi/error.h"
 #include "qapi/type-helpers.h"
@@ -195,22 +196,27 @@ static bool tb_lookup_cmp(const void *p, const void *d)
     return false;
 }
 
-static TranslationBlock *tb_htable_lookup(CPUState *cpu, TCGTBCPUState s)
+static TranslationBlock *tb_htable_lookup(CPUState *cpu, TCGTBCPUState s,
+                                          int entry)
 {
     tb_page_addr_t phys_pc;
     struct tb_desc desc;
+    TranslationBlock *tb;
     uint32_t h;
 
     desc.s = s;
     desc.env = cpu_env(cpu);
     phys_pc = get_page_addr_code(desc.env, s.pc);
     if (phys_pc == -1) {
+        g5t_qht_res(cpu->cpu_index, entry, G5T_Q_NOPHYS);
         return NULL;
     }
     desc.page_addr0 = phys_pc;
     h = tb_hash_func(phys_pc, (s.cflags & CF_PCREL ? 0 : s.pc),
                      s.flags, s.cs_base, s.cflags);
-    return qht_lookup_custom(&tb_ctx.htable, &desc, h, tb_lookup_cmp);
+    tb = qht_lookup_custom(&tb_ctx.htable, &desc, h, tb_lookup_cmp);
+    g5t_qht_res(cpu->cpu_index, entry, tb ? G5T_Q_HIT : G5T_Q_MISS);
+    return tb;
 }
 
 /**
@@ -227,9 +233,10 @@ static TranslationBlock *tb_htable_lookup(CPUState *cpu, TCGTBCPUState s)
  *
  * Returns: an existing translation block or NULL.
  */
-static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
+static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s,
+                                          int entry, int kind)
 {
-    TranslationBlock *tb;
+    TranslationBlock *tb, *shadow_tb;
     CPUJumpCache *jc;
     uint32_t hash;
 
@@ -239,18 +246,30 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
     hash = tb_jmp_cache_hash_func(s.pc);
     jc = cpu->tb_jmp_cache;
 
+    g5t_lk_enter(cpu->cpu_index, entry, kind);
     tb = qatomic_read(&jc->array[hash].tb);
     if (likely(tb &&
                jc->array[hash].pc == s.pc &&
                tb->cs_base == s.cs_base &&
                tb->flags == s.flags &&
                tb_cflags(tb) == s.cflags)) {
+        g5t_lk_hit(cpu->cpu_index, entry, kind);
         goto hit;
     }
 
-    tb = tb_htable_lookup(cpu, s);
+    shadow_tb = g5t_lk_miss(cpu->cpu_index, entry, kind, hash, tb,
+                            jc->array[hash].pc, s.pc, s.cs_base, s.flags,
+                            s.cflags);
+    g5t_qht_try(cpu->cpu_index, entry);
+    tb = tb_htable_lookup(cpu, s, entry);
     if (tb == NULL) {
+        if (kind >= 0) {
+            g5t_kind_qht_miss(cpu->cpu_index, kind);
+        }
         return NULL;
+    }
+    if (shadow_tb == tb) {
+        g5t_b1(cpu->cpu_index, entry);
     }
 
     jc->array[hash].pc = s.pc;
@@ -374,9 +393,8 @@ static inline bool check_for_breakpoints(CPUState *cpu, vaddr pc,
  * If found, return the code pointer.  If not found, return
  * the tcg epilogue so that we return into cpu_tb_exec.
  */
-const void *HELPER(lookup_tb_ptr)(CPUArchState *env)
+const void *g5t_lookup_tb_ptr(CPUState *cpu, int kind)
 {
-    CPUState *cpu = env_cpu(env);
     TranslationBlock *tb;
 
     /*
@@ -395,8 +413,9 @@ const void *HELPER(lookup_tb_ptr)(CPUArchState *env)
         cpu_loop_exit(cpu);
     }
 
-    tb = tb_lookup(cpu, s);
+    tb = tb_lookup(cpu, s, G5T_E_HELPER, kind);
     if (tb == NULL) {
+        g5t_helper_missed(cpu->cpu_index, s.pc, s.flags, s.cflags);
         return tcg_code_gen_epilogue;
     }
 
@@ -405,6 +424,11 @@ const void *HELPER(lookup_tb_ptr)(CPUArchState *env)
     }
 
     return tb->tc.ptr;
+}
+
+const void *HELPER(lookup_tb_ptr)(CPUArchState *env)
+{
+    return g5t_lookup_tb_ptr(env_cpu(env), G5T_K_UNTAGGED);
 }
 
 /* Return the current PC from CPU, which may be cached in TB. */
@@ -574,7 +598,7 @@ void cpu_exec_step_atomic(CPUState *cpu)
          * Any breakpoint for this insn will have been recognized earlier.
          */
 
-        tb = tb_lookup(cpu, s);
+        tb = tb_lookup(cpu, s, G5T_E_ATOMIC, -1);
         if (tb == NULL) {
             mmap_lock();
             tb = tb_gen_code(cpu, s);
@@ -964,7 +988,8 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                 break;
             }
 
-            tb = tb_lookup(cpu, s);
+            tb = tb_lookup(cpu, s, g5t_loop_entry(cpu->cpu_index, s.pc,
+                                                  s.flags, s.cflags), -1);
             if (tb == NULL) {
                 CPUJumpCache *jc;
                 uint32_t h;

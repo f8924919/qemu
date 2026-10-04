@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "exec/g5-tbcnt.h"
 
 #include "trace.h"
 #include "disas/disas.h"
@@ -271,6 +272,7 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
     assert_memory_lock();
     qemu_thread_jit_write();
 
+    g5t_gen(cpu->cpu_index, G5T_G_ENTER);
     phys_pc = get_page_addr_code_hostp(env, s.pc, &host_pc);
 
     if (phys_pc == -1) {
@@ -518,6 +520,7 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
      */
     if (tb_page_addr0(tb) == -1) {
         assert_no_pages_locked();
+        g5t_gen(cpu->cpu_index, G5T_G_ONESHOT);
         return tb;
     }
 
@@ -535,8 +538,10 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
         orig_aligned -= ROUND_UP(sizeof(*tb), qemu_icache_linesize);
         qatomic_set(&tcg_ctx->code_gen_ptr, (void *)orig_aligned);
         tcg_tb_remove(tb);
+        g5t_gen(cpu->cpu_index, G5T_G_REPLACED);
         return existing_tb;
     }
+    g5t_gen(cpu->cpu_index, G5T_G_NEW);
     return tb;
 }
 
@@ -578,6 +583,7 @@ void cpu_io_recompile(CPUState *cpu, uintptr_t retaddr)
     const CPUClass *cc = cpu->cc;
     uint32_t n;
 
+    g5t_iorecomp(cpu->cpu_index);
     tb = tcg_tb_lookup(retaddr);
     if (!tb) {
         cpu_abort(cpu, "cpu_io_recompile: could not find TB for pc=%p",
@@ -625,14 +631,6 @@ void cpu_io_recompile(CPUState *cpu, uintptr_t retaddr)
  */
 void tcg_flush_jmp_cache(CPUState *cpu)
 {
-    CPUJumpCache *jc = cpu->tb_jmp_cache;
-
-    /* During early initialization, the cache may not yet be allocated. */
-    if (unlikely(jc == NULL)) {
-        return;
-    }
-
-    for (int i = 0; i < TB_JMP_CACHE_SIZE; i++) {
-        qatomic_set(&jc->array[i].tb, NULL);
-    }
+    /* qemu-g5 #368: callers not attributed to a cause land in "other" */
+    g5t_flush_jmp_cache(cpu, G5T_C_OTHER);
 }

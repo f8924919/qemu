@@ -32,6 +32,8 @@
 #include "exec/translator.h"
 #include "exec/translation-block.h"
 #include "exec/log.h"
+#include "exec/plugin-gen.h"
+#include "exec/g5-tbcnt.h"
 #include "qemu/atomic128.h"
 #include "spr_common.h"
 #include "power8-pmu.h"
@@ -3651,7 +3653,26 @@ static inline bool use_goto_tb(DisasContext *ctx, target_ulong dest)
     return translator_use_goto_tb(&ctx->base, dest);
 }
 
-static void gen_lookup_and_goto_ptr(DisasContext *ctx)
+/*
+ * qemu-g5 #368 (NOT FOR UPSTREAM): tcg_gen_lookup_and_goto_ptr() with the
+ * kind of the branch passed to the helper.  Same shape as upstream.
+ */
+static void gen_g5t_lookup_and_goto_ptr(DisasContext *ctx, int kind)
+{
+    TCGv_ptr ptr;
+
+    if (tb_cflags(ctx->base.tb) & CF_NO_GOTO_PTR) {
+        tcg_gen_exit_tb(NULL, 0);
+        return;
+    }
+
+    plugin_gen_disable_mem_helpers();
+    ptr = tcg_temp_new_ptr();
+    gen_helper_g5_lookup_tb_ptr(ptr, tcg_env, tcg_constant_i32(kind));
+    tcg_gen_goto_ptr(ptr);
+}
+
+static void gen_lookup_and_goto_ptr(DisasContext *ctx, int kind)
 {
     if (unlikely(ctx->singlestep_flags)) {
         gen_debug_exception(ctx, false);
@@ -3664,13 +3685,21 @@ static void gen_lookup_and_goto_ptr(DisasContext *ctx)
             pmu_count_insns(ctx);
         }
 
-        tcg_gen_lookup_and_goto_ptr();
+        gen_g5t_lookup_and_goto_ptr(ctx, kind);
     }
 }
 
+/* qemu-g5 #368: which instruction asked gen_goto_tb for a branch */
+enum {
+    G5T_H_OTHER,
+    G5T_H_B,
+    G5T_H_BC_TAKEN,
+    G5T_H_BC_FALL,
+};
+
 /***                                Branch                                 ***/
-static void gen_goto_tb(DisasContext *ctx, unsigned tb_slot_idx,
-                        target_ulong dest)
+static void gen_goto_tb_hint(DisasContext *ctx, unsigned tb_slot_idx,
+                             target_ulong dest, int hint)
 {
     if (NARROW_MODE(ctx)) {
         dest = (uint32_t) dest;
@@ -3681,9 +3710,26 @@ static void gen_goto_tb(DisasContext *ctx, unsigned tb_slot_idx,
         tcg_gen_movi_tl(cpu_nip, dest & ~3);
         tcg_gen_exit_tb(ctx->base.tb, tb_slot_idx);
     } else {
+        int kind = G5T_K_OTHER;
+
+        if (hint != G5T_H_OTHER) {
+            if (!translator_is_same_page(&ctx->base, dest)) {
+                kind = hint == G5T_H_B ? G5T_K_XPAGE_B :
+                       hint == G5T_H_BC_TAKEN ? G5T_K_XPAGE_BC_TAKEN :
+                       G5T_K_XPAGE_BC_FALL;
+            } else {
+                kind = G5T_K_NOGOTOTB;
+            }
+        }
         tcg_gen_movi_tl(cpu_nip, dest & ~3);
-        gen_lookup_and_goto_ptr(ctx);
+        gen_lookup_and_goto_ptr(ctx, kind);
     }
+}
+
+static void gen_goto_tb(DisasContext *ctx, unsigned tb_slot_idx,
+                        target_ulong dest)
+{
+    gen_goto_tb_hint(ctx, tb_slot_idx, dest, G5T_H_OTHER);
 }
 
 static inline void gen_setlr(DisasContext *ctx, target_ulong nip)
@@ -3713,7 +3759,7 @@ static void gen_b(DisasContext *ctx)
     } else {
         gen_update_branch_history(ctx, ctx->cia, NULL, BHRB_TYPE_OTHER);
     }
-    gen_goto_tb(ctx, 0, target);
+    gen_goto_tb_hint(ctx, 0, target, G5T_H_B);
     ctx->base.is_jmp = DISAS_NORETURN;
 }
 
@@ -3821,9 +3867,9 @@ static void gen_bcond(DisasContext *ctx, int type)
     if (type == BCOND_IM) {
         target_ulong li = (target_long)((int16_t)(BD(ctx->opcode)));
         if (likely(AA(ctx->opcode) == 0)) {
-            gen_goto_tb(ctx, 0, ctx->cia + li);
+            gen_goto_tb_hint(ctx, 0, ctx->cia + li, G5T_H_BC_TAKEN);
         } else {
-            gen_goto_tb(ctx, 0, li);
+            gen_goto_tb_hint(ctx, 0, li, G5T_H_BC_TAKEN);
         }
     } else {
         if (NARROW_MODE(ctx)) {
@@ -3831,12 +3877,14 @@ static void gen_bcond(DisasContext *ctx, int type)
         } else {
             tcg_gen_andi_tl(cpu_nip, target, ~3);
         }
-        gen_lookup_and_goto_ptr(ctx);
+        gen_lookup_and_goto_ptr(ctx, type == BCOND_CTR ? G5T_K_CTR :
+                                     type == BCOND_TAR ? G5T_K_TAR :
+                                     G5T_K_LR);
     }
     if ((bo & 0x14) != 0x14) {
         /* fallthrough case */
         gen_set_label(l1);
-        gen_goto_tb(ctx, 1, ctx->base.pc_next);
+        gen_goto_tb_hint(ctx, 1, ctx->base.pc_next, G5T_H_BC_FALL);
     }
     ctx->base.is_jmp = DISAS_NORETURN;
 }
@@ -6634,6 +6682,7 @@ static void ppc_tr_tb_stop(DisasContextBase *dcbase, CPUState *cs)
     DisasContext *ctx = container_of(dcbase, DisasContext, base);
     DisasJumpType is_jmp = ctx->base.is_jmp;
     target_ulong nip = ctx->base.pc_next;
+    int g5t_kind = G5T_K_OTHER;
 
     if (is_jmp == DISAS_NORETURN) {
         /* We have already exited the TB. */
@@ -6677,6 +6726,8 @@ static void ppc_tr_tb_stop(DisasContextBase *dcbase, CPUState *cs)
             tcg_gen_exit_tb(ctx->base.tb, 0);
             break;
         }
+        g5t_kind = translator_is_same_page(&ctx->base, nip) ?
+                   G5T_K_NOGOTOTB : G5T_K_PAGEEND;
         /* fall through */
     case DISAS_CHAIN_UPDATE:
         gen_update_nip(ctx, nip);
@@ -6690,7 +6741,7 @@ static void ppc_tr_tb_stop(DisasContextBase *dcbase, CPUState *cs)
             pmu_count_insns(ctx);
         }
 
-        tcg_gen_lookup_and_goto_ptr();
+        gen_g5t_lookup_and_goto_ptr(ctx, g5t_kind);
         break;
 
     case DISAS_EXIT_UPDATE:

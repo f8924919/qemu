@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "exec/g5-tbcnt.h"
 #include "qemu/main-loop.h"
 #include "qemu/target-info.h"
 #include "accel/tcg/cpu-loop.h"
@@ -145,21 +146,6 @@ static void tlb_window_reset(CPUTLBDesc *desc, int64_t ns,
 {
     desc->window_begin_ns = ns;
     desc->window_max_entries = max_entries;
-}
-
-static void tb_jmp_cache_clear_page(CPUState *cpu, vaddr page_addr)
-{
-    CPUJumpCache *jc = cpu->tb_jmp_cache;
-    int i, i0;
-
-    if (unlikely(!jc)) {
-        return;
-    }
-
-    i0 = tb_jmp_cache_hash_page(page_addr);
-    for (i = 0; i < TB_JMP_PAGE_SIZE; i++) {
-        qatomic_set(&jc->array[i0 + i].tb, NULL);
-    }
 }
 
 /**
@@ -391,7 +377,17 @@ static void tlb_flush_by_mmuidx_async_work(CPUState *cpu, run_on_cpu_data data)
 
     qemu_spin_unlock(&cpu->neg.tlb.c.lock);
 
-    tcg_flush_jmp_cache(cpu);
+    {
+        /* qemu-g5 #368: attribute the clear, exclusively per work item */
+        int cause = to_clean == ALL_MMUIDX_BITS ? G5T_C_ASYNC_FULL :
+                    to_clean ? G5T_C_ASYNC_PART : G5T_C_ASYNC_ELIDE;
+
+        g5t_flush_jmp_cache(cpu, cause);
+        g5t_abits(cpu->cpu_index,
+                  to_clean == ALL_MMUIDX_BITS ? 0 : ctpop16(to_clean),
+                  to_clean == ALL_MMUIDX_BITS || to_clean == asked ? 0 :
+                  ctpop16(asked & ~to_clean));
+    }
 
     if (to_clean == ALL_MMUIDX_BITS) {
         qatomic_set(&cpu->neg.tlb.c.full_flush_count,
@@ -550,8 +546,8 @@ static void tlb_flush_page_by_mmuidx_async_0(CPUState *cpu,
      * Discard jump cache entries for any tb which might potentially
      * overlap the flushed page, which includes the previous.
      */
-    tb_jmp_cache_clear_page(cpu, addr - TARGET_PAGE_SIZE);
-    tb_jmp_cache_clear_page(cpu, addr);
+    g5t_jmp_cache_clear_page(cpu, addr - TARGET_PAGE_SIZE, G5T_C_PAGE);
+    g5t_jmp_cache_clear_page(cpu, addr, G5T_C_PAGE);
 }
 
 /**
@@ -741,7 +737,7 @@ static void tlb_flush_range_by_mmuidx_async_0(CPUState *cpu,
      * longer to clear each entry individually than it will to clear it all.
      */
     if (d.len >= (TARGET_PAGE_SIZE * TB_JMP_CACHE_SIZE)) {
-        tcg_flush_jmp_cache(cpu);
+        g5t_flush_jmp_cache(cpu, G5T_C_RANGE_ALL);
         return;
     }
 
@@ -751,7 +747,7 @@ static void tlb_flush_range_by_mmuidx_async_0(CPUState *cpu,
      */
     d.addr -= TARGET_PAGE_SIZE;
     for (vaddr i = 0, n = d.len / TARGET_PAGE_SIZE + 1; i < n; i++) {
-        tb_jmp_cache_clear_page(cpu, d.addr);
+        g5t_jmp_cache_clear_page(cpu, d.addr, G5T_C_RANGE_PAGE);
         d.addr += TARGET_PAGE_SIZE;
     }
 }

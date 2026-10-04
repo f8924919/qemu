@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "exec/g5-tbcnt.h"
 #include "qemu/interval-tree.h"
 #include "qemu/qtree.h"
 #include "exec/cputlb.h"
@@ -779,7 +780,7 @@ void tb_flush__exclusive_or_serial(void)
            (current_cpu && cpu_in_serial_context(current_cpu)));
 
     CPU_FOREACH(cpu) {
-        tcg_flush_jmp_cache(cpu);
+        g5t_flush_jmp_cache(cpu, G5T_C_TBFLUSH);
     }
 
     qht_reset_size(&tb_ctx.htable, CODE_GEN_HTABLE_SIZE);
@@ -899,17 +900,13 @@ static void tb_jmp_cache_inval_tb(TranslationBlock *tb)
     if (tb_cflags(tb) & CF_PCREL) {
         /* A TB may be at any virtual address */
         CPU_FOREACH(cpu) {
-            tcg_flush_jmp_cache(cpu);
+            g5t_flush_jmp_cache(cpu, G5T_C_PCREL);
         }
     } else {
         uint32_t h = tb_jmp_cache_hash_func(tb->pc);
 
         CPU_FOREACH(cpu) {
-            CPUJumpCache *jc = cpu->tb_jmp_cache;
-
-            if (qatomic_read(&jc->array[h].tb) == tb) {
-                qatomic_set(&jc->array[h].tb, NULL);
-            }
+            g5t_jmp_cache_clear_slot(cpu, h, tb);
         }
     }
 }

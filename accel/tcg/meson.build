@@ -29,6 +29,7 @@ user_ss.add(files(
 
 system_ss.add(files(
   'cputlb.c',
+  'g5-tbcnt.c',
   'icount-common.c',
   'monitor.c',
   'tcg-accel-ops.c',

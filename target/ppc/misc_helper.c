@@ -26,8 +26,35 @@
 #include "qemu/main-loop.h"
 #include "mmu-book3s-v3.h"
 #include "hw/ppc/ppc.h"
+#include "exec/g5-tbcnt.h"
 
 #include "helper_regs.h"
+
+/*
+ * qemu-g5 #368 (NOT FOR UPSTREAM): helper_lookup_tb_ptr with the kind of the
+ * branch that generated the call.  For the register-indirect kinds, also
+ * check that nip really is the CTR / LR the branch used (a sanity check of
+ * the kind decided at translation time; bclrl / bcctrl rewrite LR before
+ * the helper runs, so a few LR mismatches are expected).
+ */
+const void *helper_g5_lookup_tb_ptr(CPUPPCState *env, uint32_t kind)
+{
+    CPUState *cs = env_cpu(env);
+
+    if (kind == G5T_K_CTR || kind == G5T_K_LR) {
+        target_ulong t = (kind == G5T_K_CTR ? env->ctr : env->lr) & ~3;
+        bool ok;
+
+#if defined(TARGET_PPC64)
+        if (!msr_is_64bit(env, env->msr)) {
+            t = (uint32_t)t;
+        }
+#endif
+        ok = env->nip == t;
+        g5t_kindchk(cs->cpu_index, kind, ok);
+    }
+    return g5t_lookup_tb_ptr(cs, kind);
+}
 
 /*****************************************************************************/
 /* SPR accesses */

@@ -1,5 +1,7 @@
 DEF_HELPER_FLAGS_3(raise_exception_err, TCG_CALL_NO_WG, noreturn, env, i32, i32)
 DEF_HELPER_FLAGS_2(raise_exception, TCG_CALL_NO_WG, noreturn, env, i32)
+/* qemu-g5 #368: lookup_tb_ptr that knows which branch kind called it */
+DEF_HELPER_FLAGS_2(g5_lookup_tb_ptr, TCG_CALL_NO_WG_SE, cptr, env, i32)
 DEF_HELPER_FLAGS_4(TW, TCG_CALL_NO_WG, void, env, tl, tl, i32)
 #if defined(TARGET_PPC64)
 DEF_HELPER_FLAGS_4(TD, TCG_CALL_NO_WG, void, env, tl, tl, i32)
