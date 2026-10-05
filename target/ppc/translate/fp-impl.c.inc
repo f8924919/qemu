@@ -9,9 +9,16 @@ static inline void gen_reset_fpstatus(void)
     gen_helper_reset_fpstatus(tcg_env);
 }
 
-static inline void gen_compute_fprf_float64(TCGv_i64 arg)
+/*
+ * The scalar FP helpers write their result through this pointer themselves,
+ * together with FPRF and the deferred exceptions, so that one helper call
+ * does the whole instruction.
+ */
+static TCGv_ptr gen_fpr_ptr(int reg)
 {
-    gen_helper_compute_fprf_check_status_float64(tcg_env, arg);
+    TCGv_ptr r = tcg_temp_new_ptr();
+    tcg_gen_addi_ptr(r, tcg_env, vsr_full_offset(reg));
+    return r;
 }
 
 #if defined(TARGET_PPC64)
@@ -30,22 +37,19 @@ static void gen_set_cr1_from_fpscr(DisasContext *ctx)
 
 /***                       Floating-Point arithmetic                       ***/
 static bool do_helper_acb(DisasContext *ctx, arg_A *a,
-                          void (*helper)(TCGv_i64, TCGv_ptr, TCGv_i64,
+                          void (*helper)(TCGv_ptr, TCGv_ptr, TCGv_i64,
                                          TCGv_i64, TCGv_i64))
 {
-    TCGv_i64 t0, t1, t2, t3;
+    TCGv_i64 t0, t1, t2;
     REQUIRE_INSNS_FLAGS(ctx, FLOAT);
     REQUIRE_FPU(ctx);
     t0 = tcg_temp_new_i64();
     t1 = tcg_temp_new_i64();
     t2 = tcg_temp_new_i64();
-    t3 = tcg_temp_new_i64();
     get_fpr(t0, a->fra);
     get_fpr(t1, a->frc);
     get_fpr(t2, a->frb);
-    helper(t3, tcg_env, t0, t1, t2);
-    set_fpr(a->frt, t3);
-    gen_compute_fprf_float64(t3);
+    helper(tcg_env, gen_fpr_ptr(a->frt), t0, t1, t2);
     if (unlikely(a->rc)) {
         gen_set_cr1_from_fpscr(ctx);
     }
@@ -53,20 +57,17 @@ static bool do_helper_acb(DisasContext *ctx, arg_A *a,
 }
 
 static bool do_helper_ab(DisasContext *ctx, arg_A_tab *a,
-                         void (*helper)(TCGv_i64, TCGv_ptr, TCGv_i64,
+                         void (*helper)(TCGv_ptr, TCGv_ptr, TCGv_i64,
                                         TCGv_i64))
 {
-    TCGv_i64 t0, t1, t2;
+    TCGv_i64 t0, t1;
     REQUIRE_INSNS_FLAGS(ctx, FLOAT);
     REQUIRE_FPU(ctx);
     t0 = tcg_temp_new_i64();
     t1 = tcg_temp_new_i64();
-    t2 = tcg_temp_new_i64();
     get_fpr(t0, a->fra);
     get_fpr(t1, a->frb);
-    helper(t2, tcg_env, t0, t1);
-    set_fpr(a->frt, t2);
-    gen_compute_fprf_float64(t2);
+    helper(tcg_env, gen_fpr_ptr(a->frt), t0, t1);
     if (unlikely(a->rc)) {
         gen_set_cr1_from_fpscr(ctx);
     }
@@ -74,20 +75,17 @@ static bool do_helper_ab(DisasContext *ctx, arg_A_tab *a,
 }
 
 static bool do_helper_ac(DisasContext *ctx, arg_A_tac *a,
-                         void (*helper)(TCGv_i64, TCGv_ptr, TCGv_i64,
+                         void (*helper)(TCGv_ptr, TCGv_ptr, TCGv_i64,
                                         TCGv_i64))
 {
-    TCGv_i64 t0, t1, t2;
+    TCGv_i64 t0, t1;
     REQUIRE_INSNS_FLAGS(ctx, FLOAT);
     REQUIRE_FPU(ctx);
     t0 = tcg_temp_new_i64();
     t1 = tcg_temp_new_i64();
-    t2 = tcg_temp_new_i64();
     get_fpr(t0, a->fra);
     get_fpr(t1, a->frc);
-    helper(t2, tcg_env, t0, t1);
-    set_fpr(a->frt, t2);
-    gen_compute_fprf_float64(t2);
+    helper(tcg_env, gen_fpr_ptr(a->frt), t0, t1);
     if (unlikely(a->rc)) {
         gen_set_cr1_from_fpscr(ctx);
     }
@@ -95,21 +93,13 @@ static bool do_helper_ac(DisasContext *ctx, arg_A_tac *a,
 }
 
 static bool do_round_convert(DisasContext *ctx, arg_X_tb_rc *a,
-                             void (*helper)(TCGv_i64, TCGv_env, TCGv_i64),
-                             bool set_fprf)
+                             void (*helper)(TCGv_env, TCGv_ptr, TCGv_i64))
 {
-    TCGv_i64 t0, t1;
+    TCGv_i64 t0;
     REQUIRE_FPU(ctx);
     t0 = tcg_temp_new_i64();
-    t1 = tcg_temp_new_i64();
     get_fpr(t0, a->rb);
-    helper(t1, tcg_env, t0);
-    set_fpr(a->rt, t1);
-    if (set_fprf) {
-        gen_compute_fprf_float64(t1);
-    } else {
-        gen_helper_float_check_status(tcg_env);
-    }
+    helper(tcg_env, gen_fpr_ptr(a->rt), t0);
     if (unlikely(a->rc)) {
         gen_set_cr1_from_fpscr(ctx);
     }
@@ -117,16 +107,13 @@ static bool do_round_convert(DisasContext *ctx, arg_X_tb_rc *a,
 }
 
 static bool do_helper_bs(DisasContext *ctx, arg_A_tb *a,
-                         void (*helper)(TCGv_i64, TCGv_ptr, TCGv_i64))
+                         void (*helper)(TCGv_ptr, TCGv_ptr, TCGv_i64))
 {
-    TCGv_i64 t0, t1;
+    TCGv_i64 t0;
     REQUIRE_FPU(ctx);
     t0 = tcg_temp_new_i64();
-    t1 = tcg_temp_new_i64();
     get_fpr(t0, a->frb);
-    helper(t1, tcg_env, t0);
-    set_fpr(a->frt, t1);
-    gen_compute_fprf_float64(t1);
+    helper(tcg_env, gen_fpr_ptr(a->frt), t0);
     if (unlikely(a->rc)) {
         gen_set_cr1_from_fpscr(ctx);
     }
@@ -157,20 +144,17 @@ static bool trans_FSEL(DisasContext *ctx, arg_A *a)
 }
 
 static bool do_helper_fsqrt(DisasContext *ctx, arg_A_tb *a,
-                            void (*helper)(TCGv_i64, TCGv_ptr, TCGv_i64))
+                            void (*helper)(TCGv_ptr, TCGv_ptr, TCGv_i64))
 {
-    TCGv_i64 t0, t1;
+    TCGv_i64 t0;
 
     REQUIRE_INSNS_FLAGS(ctx, FLOAT_FSQRT);
     REQUIRE_FPU(ctx);
 
     t0 = tcg_temp_new_i64();
-    t1 = tcg_temp_new_i64();
 
     get_fpr(t0, a->frb);
-    helper(t1, tcg_env, t0);
-    set_fpr(a->frt, t1);
-    gen_compute_fprf_float64(t1);
+    helper(tcg_env, gen_fpr_ptr(a->frt), t0);
     if (unlikely(a->rc != 0)) {
         gen_set_cr1_from_fpscr(ctx);
     }
@@ -205,26 +189,26 @@ TRANS(FSQRT, do_helper_fsqrt, gen_helper_FSQRT);
 TRANS(FSQRTS, do_helper_fsqrt, gen_helper_FSQRTS);
 
 /***                     Floating-Point round & convert                    ***/
-TRANS_FLAGS(FLOAT, FRSP, do_round_convert, gen_helper_FRSP, true);
-TRANS_FLAGS(FLOAT_EXT, FRIN, do_round_convert, gen_helper_FRIN, true);
-TRANS_FLAGS(FLOAT_EXT, FRIZ, do_round_convert, gen_helper_FRIZ, true);
-TRANS_FLAGS(FLOAT_EXT, FRIP, do_round_convert, gen_helper_FRIP, true);
-TRANS_FLAGS(FLOAT_EXT, FRIM, do_round_convert, gen_helper_FRIM, true);
+TRANS_FLAGS(FLOAT, FRSP, do_round_convert, gen_helper_FRSP);
+TRANS_FLAGS(FLOAT_EXT, FRIN, do_round_convert, gen_helper_FRIN);
+TRANS_FLAGS(FLOAT_EXT, FRIZ, do_round_convert, gen_helper_FRIZ);
+TRANS_FLAGS(FLOAT_EXT, FRIP, do_round_convert, gen_helper_FRIP);
+TRANS_FLAGS(FLOAT_EXT, FRIM, do_round_convert, gen_helper_FRIM);
 
-TRANS_FLAGS(FLOAT, FCTIW, do_round_convert, gen_helper_FCTIW, false);
-TRANS_FLAGS2(FP_CVT_ISA206, FCTIWU, do_round_convert, gen_helper_FCTIWU, false);
-TRANS_FLAGS(FLOAT, FCTIWZ, do_round_convert, gen_helper_FCTIWZ, false);
-TRANS_FLAGS2(FP_CVT_ISA206, FCTIWUZ, do_round_convert, gen_helper_FCTIWUZ, false);
+TRANS_FLAGS(FLOAT, FCTIW, do_round_convert, gen_helper_FCTIW);
+TRANS_FLAGS2(FP_CVT_ISA206, FCTIWU, do_round_convert, gen_helper_FCTIWU);
+TRANS_FLAGS(FLOAT, FCTIWZ, do_round_convert, gen_helper_FCTIWZ);
+TRANS_FLAGS2(FP_CVT_ISA206, FCTIWUZ, do_round_convert, gen_helper_FCTIWUZ);
 
-TRANS_FLAGS2(FP_CVT_S64, FCTID, do_round_convert, gen_helper_FCTID, false);
-TRANS_FLAGS2(FP_CVT_ISA206, FCTIDU, do_round_convert, gen_helper_FCTIDU, false);
-TRANS_FLAGS2(FP_CVT_S64, FCTIDZ, do_round_convert, gen_helper_FCTIDZ, false);
-TRANS_FLAGS2(FP_CVT_ISA206, FCTIDUZ, do_round_convert, gen_helper_FCTIDUZ, false);
+TRANS_FLAGS2(FP_CVT_S64, FCTID, do_round_convert, gen_helper_FCTID);
+TRANS_FLAGS2(FP_CVT_ISA206, FCTIDU, do_round_convert, gen_helper_FCTIDU);
+TRANS_FLAGS2(FP_CVT_S64, FCTIDZ, do_round_convert, gen_helper_FCTIDZ);
+TRANS_FLAGS2(FP_CVT_ISA206, FCTIDUZ, do_round_convert, gen_helper_FCTIDUZ);
 
-TRANS_FLAGS2(FP_CVT_S64, FCFID, do_round_convert, gen_helper_FCFID, true);
-TRANS_FLAGS2(FP_CVT_ISA206, FCFIDS, do_round_convert, gen_helper_FCFIDS, false);
-TRANS_FLAGS2(FP_CVT_ISA206, FCFIDU, do_round_convert, gen_helper_FCFIDU, false);
-TRANS_FLAGS2(FP_CVT_ISA206, FCFIDUS, do_round_convert, gen_helper_FCFIDUS, false);
+TRANS_FLAGS2(FP_CVT_S64, FCFID, do_round_convert, gen_helper_FCFID);
+TRANS_FLAGS2(FP_CVT_ISA206, FCFIDS, do_round_convert, gen_helper_FCFIDS);
+TRANS_FLAGS2(FP_CVT_ISA206, FCFIDU, do_round_convert, gen_helper_FCFIDU);
+TRANS_FLAGS2(FP_CVT_ISA206, FCFIDUS, do_round_convert, gen_helper_FCFIDUS);
 
 static bool trans_FTDIV(DisasContext *ctx, arg_X_bf *a)
 {
@@ -265,7 +249,6 @@ static bool do_helper_cmp(DisasContext *ctx, arg_X_bf *a,
     get_fpr(t0, a->ra);
     get_fpr(t1, a->rb);
     helper(tcg_env, t0, t1, crf);
-    gen_helper_float_check_status(tcg_env);
     return true;
 }
 
