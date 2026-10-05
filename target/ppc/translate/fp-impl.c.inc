@@ -11,8 +11,7 @@ static inline void gen_reset_fpstatus(void)
 
 static inline void gen_compute_fprf_float64(TCGv_i64 arg)
 {
-    gen_helper_compute_fprf_float64(tcg_env, arg);
-    gen_helper_float_check_status(tcg_env);
+    gen_helper_compute_fprf_check_status_float64(tcg_env, arg);
 }
 
 #if defined(TARGET_PPC64)
@@ -111,9 +110,10 @@ static bool do_round_convert(DisasContext *ctx, arg_X_tb_rc *a,
     helper(t1, tcg_env, t0);
     set_fpr(a->rt, t1);
     if (set_fprf) {
-        gen_helper_compute_fprf_float64(tcg_env, t1);
+        gen_compute_fprf_float64(t1);
+    } else {
+        gen_helper_float_check_status(tcg_env);
     }
-    gen_helper_float_check_status(tcg_env);
     if (unlikely(a->rc)) {
         gen_set_cr1_from_fpscr(ctx);
     }
