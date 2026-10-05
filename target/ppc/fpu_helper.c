@@ -566,6 +566,7 @@ static uint64_t float_invalid_cvt(CPUPPCState *env, int flags,
 #define FPU_FCTI(op, cvt, nanval)                                      \
 uint64_t helper_##op(CPUPPCState *env, float64 arg)                    \
 {                                                                      \
+    helper_reset_fpstatus(env);                                        \
     uint64_t ret = float64_to_##cvt(arg, &env->fp_status);             \
     int flags = get_float_exception_flags(&env->fp_status);            \
     if (unlikely(flags & float_flag_invalid)) {                        \
@@ -588,6 +589,7 @@ uint64_t helper_##op(CPUPPCState *env, uint64_t arg)       \
 {                                                          \
     CPU_DoubleU farg;                                      \
                                                            \
+    helper_reset_fpstatus(env);                            \
     if (is_single) {                                       \
         float32 tmp = cvtr(arg, &env->fp_status);          \
         farg.d = float32_to_float64(tmp, &env->fp_status); \
@@ -627,21 +629,25 @@ static uint64_t do_fri(CPUPPCState *env, uint64_t arg,
 
 uint64_t helper_FRIN(CPUPPCState *env, uint64_t arg)
 {
+    helper_reset_fpstatus(env);
     return do_fri(env, arg, float_round_ties_away);
 }
 
 uint64_t helper_FRIZ(CPUPPCState *env, uint64_t arg)
 {
+    helper_reset_fpstatus(env);
     return do_fri(env, arg, float_round_to_zero);
 }
 
 uint64_t helper_FRIP(CPUPPCState *env, uint64_t arg)
 {
+    helper_reset_fpstatus(env);
     return do_fri(env, arg, float_round_up);
 }
 
 uint64_t helper_FRIM(CPUPPCState *env, uint64_t arg)
 {
+    helper_reset_fpstatus(env);
     return do_fri(env, arg, float_round_down);
 }
 
@@ -682,10 +688,16 @@ static uint64_t do_fmadds(CPUPPCState *env, float64 a, float64 b,
 #define FPU_FMADD(op, madd_flags)                                    \
     uint64_t helper_##op(CPUPPCState *env, uint64_t arg1,            \
                          uint64_t arg2, uint64_t arg3)               \
-    { return do_fmadd(env, arg1, arg2, arg3, madd_flags, GETPC()); } \
+    {                                                                \
+        helper_reset_fpstatus(env);                                  \
+        return do_fmadd(env, arg1, arg2, arg3, madd_flags, GETPC()); \
+    }                                                                \
     uint64_t helper_##op##S(CPUPPCState *env, uint64_t arg1,         \
                          uint64_t arg2, uint64_t arg3)               \
-    { return do_fmadds(env, arg1, arg2, arg3, madd_flags, GETPC()); }
+    {                                                                \
+        helper_reset_fpstatus(env);                                  \
+        return do_fmadds(env, arg1, arg2, arg3, madd_flags, GETPC());\
+    }
 
 #define MADD_FLGS 0
 #define MSUB_FLGS float_muladd_negate_c
@@ -711,6 +723,7 @@ static uint64_t do_frsp(CPUPPCState *env, uint64_t arg, uintptr_t retaddr)
 
 uint64_t helper_FRSP(CPUPPCState *env, uint64_t arg)
 {
+    helper_reset_fpstatus(env);
     return do_frsp(env, arg, GETPC());
 }
 
@@ -727,6 +740,7 @@ static void float_invalid_op_sqrt(CPUPPCState *env, int flags,
 #define FPU_FSQRT(name, op)                                                   \
 float64 helper_##name(CPUPPCState *env, float64 arg)                          \
 {                                                                             \
+    helper_reset_fpstatus(env);                                               \
     float64 ret = op(arg, &env->fp_status);                                   \
     int flags = get_float_exception_flags(&env->fp_status);                   \
                                                                               \
@@ -744,6 +758,7 @@ FPU_FSQRT(FSQRTS, float64r32_sqrt)
 float64 helper_##name(CPUPPCState *env, float64 arg)                          \
 {                                                                             \
     /* "Estimate" the reciprocal with actual division.  */                    \
+    helper_reset_fpstatus(env);                                               \
     float64 ret = op(float64_one, arg, &env->fp_status);                      \
     int flags = get_float_exception_flags(&env->fp_status);                   \
                                                                               \
@@ -763,6 +778,7 @@ float64 helper_##name(CPUPPCState *env, float64 arg)                          \
 float64 helper_##name(CPUPPCState *env, float64 arg)                          \
 {                                                                             \
     /* "Estimate" the reciprocal with actual division.  */                    \
+    helper_reset_fpstatus(env);                                               \
     float64 rets = float64_sqrt(arg, &env->fp_status);                        \
     float64 retd = op(float64_one, rets, &env->fp_status);                    \
     int flags = get_float_exception_flags(&env->fp_status);                   \
@@ -781,6 +797,7 @@ float64 helper_##name(CPUPPCState *env, float64 arg)                          \
 #define FPU_HELPER(name, op, flags_handler)                                   \
 float64 helper_##name(CPUPPCState *env, float64 arg1, float64 arg2)           \
 {                                                                             \
+    helper_reset_fpstatus(env);                                               \
     float64 ret = op(arg1, arg2, &env->fp_status);                            \
     int flags = get_float_exception_flags(&env->fp_status);                   \
     uintptr_t ra = GETPC();                                                   \
@@ -889,6 +906,7 @@ void helper_FCMPU(CPUPPCState *env, uint64_t arg1, uint64_t arg2,
     CPU_DoubleU farg1, farg2;
     uint32_t ret = 0;
 
+    helper_reset_fpstatus(env);
     farg1.ll = arg1;
     farg2.ll = arg2;
 
@@ -920,6 +938,7 @@ void helper_FCMPO(CPUPPCState *env, uint64_t arg1, uint64_t arg2,
     CPU_DoubleU farg1, farg2;
     uint32_t ret = 0;
 
+    helper_reset_fpstatus(env);
     farg1.ll = arg1;
     farg2.ll = arg2;
 

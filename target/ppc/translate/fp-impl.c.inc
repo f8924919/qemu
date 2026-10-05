@@ -40,7 +40,6 @@ static bool do_helper_acb(DisasContext *ctx, arg_A *a,
     t1 = tcg_temp_new_i64();
     t2 = tcg_temp_new_i64();
     t3 = tcg_temp_new_i64();
-    gen_reset_fpstatus();
     get_fpr(t0, a->fra);
     get_fpr(t1, a->frc);
     get_fpr(t2, a->frb);
@@ -63,7 +62,6 @@ static bool do_helper_ab(DisasContext *ctx, arg_A_tab *a,
     t0 = tcg_temp_new_i64();
     t1 = tcg_temp_new_i64();
     t2 = tcg_temp_new_i64();
-    gen_reset_fpstatus();
     get_fpr(t0, a->fra);
     get_fpr(t1, a->frb);
     helper(t2, tcg_env, t0, t1);
@@ -85,7 +83,6 @@ static bool do_helper_ac(DisasContext *ctx, arg_A_tac *a,
     t0 = tcg_temp_new_i64();
     t1 = tcg_temp_new_i64();
     t2 = tcg_temp_new_i64();
-    gen_reset_fpstatus();
     get_fpr(t0, a->fra);
     get_fpr(t1, a->frc);
     helper(t2, tcg_env, t0, t1);
@@ -105,7 +102,6 @@ static bool do_round_convert(DisasContext *ctx, arg_X_tb_rc *a,
     REQUIRE_FPU(ctx);
     t0 = tcg_temp_new_i64();
     t1 = tcg_temp_new_i64();
-    gen_reset_fpstatus();
     get_fpr(t0, a->rb);
     helper(t1, tcg_env, t0);
     set_fpr(a->rt, t1);
@@ -127,7 +123,6 @@ static bool do_helper_bs(DisasContext *ctx, arg_A_tb *a,
     REQUIRE_FPU(ctx);
     t0 = tcg_temp_new_i64();
     t1 = tcg_temp_new_i64();
-    gen_reset_fpstatus();
     get_fpr(t0, a->frb);
     helper(t1, tcg_env, t0);
     set_fpr(a->frt, t1);
@@ -172,7 +167,6 @@ static bool do_helper_fsqrt(DisasContext *ctx, arg_A_tb *a,
     t0 = tcg_temp_new_i64();
     t1 = tcg_temp_new_i64();
 
-    gen_reset_fpstatus();
     get_fpr(t0, a->frb);
     helper(t1, tcg_env, t0);
     set_fpr(a->frt, t1);
@@ -267,7 +261,6 @@ static bool do_helper_cmp(DisasContext *ctx, arg_X_bf *a,
     REQUIRE_FPU(ctx);
     t0 = tcg_temp_new_i64();
     t1 = tcg_temp_new_i64();
-    gen_reset_fpstatus();
     crf = tcg_constant_i32(a->bf);
     get_fpr(t0, a->ra);
     get_fpr(t1, a->rb);
