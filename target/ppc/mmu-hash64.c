@@ -18,6 +18,7 @@
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 #include "qemu/osdep.h"
+#include "exec/g5-fillcnt.h"
 #include "exec/g5-flushcnt.h"
 #include "qemu/units.h"
 #include "cpu.h"
@@ -104,12 +105,25 @@ void dump_slb(PowerPCCPU *cpu)
     }
 }
 
+/* qemu-g5 #373: whole-SLB dump around the first slbia (G5L_SLBDUMP) */
+static void g5l_slb_dump(PowerPCCPU *cpu, bool before)
+{
+    for (int i = 0; i < cpu->hash64_opts->slb_size; i++) {
+        g5l_slbdump_line(CPU(cpu), before, i, cpu->env.slb[i].esid,
+                         cpu->env.slb[i].vsid);
+    }
+}
+
 #ifdef CONFIG_TCG
 void helper_SLBIA(CPUPPCState *env, uint32_t ih)
 {
     PowerPCCPU *cpu = env_archcpu(env);
     int starting_entry;
     int n;
+
+    if (g5l_slbdump_begin(CPU(cpu))) {
+        g5l_slb_dump(cpu, true);
+    }
 
     /*
      * slbia must always flush all TLB (which is equivalent to ERAT in ppc
@@ -141,6 +155,9 @@ void helper_SLBIA(CPUPPCState *env, uint32_t ih)
         switch (ih) {
         case 0x7:
             /* invalidate no SLBs, but all lookaside information */
+            if (g5l_slbdump_end(CPU(cpu))) {
+                g5l_slb_dump(cpu, false);
+            }
             return;
 
         case 0x3:
@@ -175,6 +192,9 @@ void helper_SLBIA(CPUPPCState *env, uint32_t ih)
         }
 
         slb->esid &= ~SLB_ESID_V;
+    }
+    if (g5l_slbdump_end(CPU(cpu))) {
+        g5l_slb_dump(cpu, false);
     }
 }
 
@@ -367,9 +387,14 @@ void helper_SLBMTE(CPUPPCState *env, target_ulong rb, target_ulong rs)
     slot = rb & (cpu->hash64_opts->slb_size - 1);
     esid = rb & (SLB_ESID_ESID | SLB_ESID_V);
 
+    bool g5l_esid0 = slot == 0 && env->slb[0].esid != esid;
+
     if (ppc_store_slb(cpu, slot, esid, rs) < 0) {
         raise_exception_err_ra(env, POWERPC_EXCP_PROGRAM,
                                POWERPC_EXCP_INVAL, GETPC());
+    }
+    if (g5l_esid0) {
+        g5l_slbmte0(CPU(cpu));
     }
 }
 
@@ -791,6 +816,7 @@ static hwaddr ppc_hash64_htab_lookup(PowerPCCPU *cpu,
                 " hash=" HWADDR_FMT_plx "\n", ppc_hash64_hpt_base(cpu),
                 ppc_hash64_hpt_mask(cpu), vsid, ptem, ~hash);
 
+        g5l_sec_hash(CPU(cpu));
         ptex = ppc_hash64_pteg_search(cpu, ~hash, sps, ptem, pte, pshift);
     }
 
@@ -1059,6 +1085,7 @@ bool ppc_hash64_xlate(PowerPCCPU *cpu, vaddr eaddr, MMUAccessType access_type,
                 return false;
             }
 
+            g5l_slb_idx = G5L_SLB_VRMA;
             goto skip_slb_search;
         } else {
             target_ulong limit = rmls_limit(cpu);
@@ -1132,6 +1159,8 @@ bool ppc_hash64_xlate(PowerPCCPU *cpu, vaddr eaddr, MMUAccessType access_type,
         }
         return false;
     }
+
+    g5l_slb_idx = slb - env->slb;
 
  skip_slb_search:
 
