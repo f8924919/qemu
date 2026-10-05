@@ -28,6 +28,7 @@
 #include "cpu-models.h"
 #include "spr_common.h"
 #include "internal.h"
+#include "mmu-books.h"
 
 /* Swap temporary saved registers with GPRs */
 void hreg_swap_gpr_tgpr(CPUPPCState *env)
@@ -383,6 +384,31 @@ void store_40x_sler(CPUPPCState *env, uint32_t val)
                   "Little-endian regions are not supported by now\n");
     }
     env->spr[SPR_405_SLER] = val;
+}
+
+/*
+ * The MMU indexes that translate with HRMOR alone: hypervisor real mode on
+ * a 64-bit Book3S MMU, or any real mode when the CPU has no HV mode.  They
+ * read neither the SLB nor the page tables (see ppc_hash64_xlate() and
+ * ppc_radix64_xlate()).  Only indexes 0 to 7 use the Book3S encoding, and a
+ * virtual hypervisor is left out altogether.
+ */
+MMUIdxMap ppc_hrmor_mmuidx_mask(CPUPPCState *env)
+{
+    MMUIdxMap mask = 0;
+#if defined(TARGET_PPC64)
+    int idx;
+
+    if (!mmu_is_64bit(env->mmu_model) || env_archcpu(env)->vhyp) {
+        return 0;
+    }
+    for (idx = 0; idx < 8; idx++) {
+        if (mmuidx_real(idx) && (mmuidx_hv(idx) || !env->has_hv_mode)) {
+            mask |= 1u << idx;
+        }
+    }
+#endif
+    return mask;
 }
 
 void check_tlb_flush(CPUPPCState *env, bool global)

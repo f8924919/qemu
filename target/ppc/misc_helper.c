@@ -210,6 +210,39 @@ void helper_store_ptcr(CPUPPCState *env, target_ulong val)
     }
 }
 
+/*
+ * HRMOR is all that the hypervisor real mode translation depends on: when
+ * it changes, nothing else is going to drop what the softmmu TLB holds for
+ * that mode.
+ */
+void helper_store_hrmor(CPUPPCState *env, target_ulong val)
+{
+    CPUState *cs = env_cpu(env);
+    MMUIdxMap idxmap = ppc_hrmor_mmuidx_mask(env);
+    CPUState *ccs;
+
+    if (env->spr[SPR_HRMOR] == val) {
+        return;
+    }
+
+    if (ppc_cpu_core_single_threaded(cs)) {
+        env->spr[SPR_HRMOR] = val;
+        if (idxmap) {
+            tlb_flush_by_mmuidx(cs, idxmap);
+        }
+        return;
+    }
+
+    THREAD_SIBLING_FOREACH(cs, ccs) {
+        CPUPPCState *cenv = &POWERPC_CPU(ccs)->env;
+
+        cenv->spr[SPR_HRMOR] = val;
+        if (idxmap) {
+            tlb_flush_by_mmuidx(ccs, idxmap);
+        }
+    }
+}
+
 void helper_store_pcr(CPUPPCState *env, target_ulong value)
 {
     PowerPCCPU *cpu = env_archcpu(env);

@@ -946,6 +946,16 @@ void spr_write_ptcr(DisasContext *ctx, int sprn, int gprn)
     gen_helper_store_ptcr(tcg_env, cpu_gpr[gprn]);
 }
 
+void spr_write_hrmor(DisasContext *ctx, int sprn, int gprn)
+{
+    if (!gen_serialize_core(ctx)) {
+        return;
+    }
+
+    gen_helper_store_hrmor(tcg_env, cpu_gpr[gprn]);
+    spr_store_dump_spr(sprn);
+}
+
 void spr_write_pcr(DisasContext *ctx, int sprn, int gprn)
 {
     gen_helper_store_pcr(tcg_env, cpu_gpr[gprn]);
