@@ -492,6 +492,20 @@ static void hand_checks(void)
     expect("mffs; fdiv. CR1", r.cr_out, 0x0f000000,
            (uint64_t)(FX >> 28) << 24);
     expect("mffs; fdiv. FPSCR", r.fpscr_out, FX | XX | FI, FX | XX | FI);
+
+    /*
+     * mcrfs reads the FPSCR the helper wrote: fdiv 1/3, then copy FPSCR
+     * field 1 (UX ZX XX VXSNAN) to CR7.  CR7 must say XX, and mcrfs clears
+     * the exception bits it copied, so XX is gone while FI stays.
+     */
+    memset(&r, 0, sizeof(r));
+    r.f[2] = ONE;
+    r.f[3] = THREE;
+    set_slot(&r, encode(find("fdiv"), 1, 2, 3, 4, 0),
+             0xfc000080 | 7 << 23 | 1 << 18 /* mcrfs cr7, 1 */);
+    run_slot(&r);
+    expect("fdiv; mcrfs CR7", r.cr_out, 0xf, 0x2);
+    expect("fdiv; mcrfs FPSCR", r.fpscr_out, XX | FI, FI);
 }
 
 /*
