@@ -78,8 +78,9 @@ static void check(const char *name, const char *what, unsigned long got,
 }
 
 /* No struct copies: there is no memset or memcpy to link against. */
-static void run(struct fpx *x, unsigned int insn, unsigned long a,
-                unsigned long b, unsigned long c, unsigned long fpscr_in)
+static void run_msr(struct fpx *x, unsigned int insn, unsigned long a,
+                    unsigned long b, unsigned long c, unsigned long fpscr_in,
+                    unsigned long msr_bits)
 {
     x->insn = insn;
     x->pad = 0;
@@ -89,8 +90,14 @@ static void run(struct fpx *x, unsigned int insn, unsigned long a,
     x->f1_in = MARK;
     /* a class the results below never have, so that a stale FPRF shows */
     x->fpscr_in = fpscr_in | C_NNORM << FPRF_SHIFT;
-    x->msr_bits = MSR_FE0 | MSR_FE1;
+    x->msr_bits = msr_bits;
     fp_exec(x);
+}
+
+static void run(struct fpx *x, unsigned int insn, unsigned long a,
+                unsigned long b, unsigned long c, unsigned long fpscr_in)
+{
+    run_msr(x, insn, a, b, c, fpscr_in, MSR_FE0 | MSR_FE1);
 }
 
 /* The interrupt fired and points at the instruction. */
@@ -170,6 +177,18 @@ int main(void)
     took("fcfid-xe", &x);
     check("fcfid-xe", "f1", x.f1_out, MARK);
     check("fcfid-xe", "FPRF", x.fpscr_out & FPRF, C_NNORM << FPRF_SHIFT);
+
+    /*
+     * With MSR[FE0|FE1] clear the enabled exception does not interrupt: the
+     * target, FPRF, XX and FEX are all written and execution goes on.  The
+     * exception stays pending in QEMU, which the next case relies on too.
+     */
+    run_msr(&x, FDIV, ONE, THREE, 0, XE, 0);
+    check("fdiv-xe-fe0", "vector", x.vector, 0);
+    check("fdiv-xe-fe0", "f1", x.f1_out, 0x3fd5555555555555ull);
+    check("fdiv-xe-fe0", "FPRF", x.fpscr_out & FPRF, C_PNORM << FPRF_SHIFT);
+    check("fdiv-xe-fe0", "flags", x.fpscr_out & (FX | FEX | XX),
+          FX | FEX | XX);
 
     /*
      * An exception left pending while MSR[FE0|FE1] were clear is raised by
