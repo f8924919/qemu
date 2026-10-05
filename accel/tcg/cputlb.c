@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "exec/g5-fillcnt.h"
 #include "exec/g5-flushcnt.h"
 #include "qemu/main-loop.h"
 #include "qemu/target-info.h"
@@ -296,9 +297,11 @@ static void tlb_flush_one_mmuidx_locked(CPUState *cpu, int mmu_idx,
 {
     CPUTLBDesc *desc = &cpu->neg.tlb.d[mmu_idx];
     CPUTLBDescFast *fast = cpu_tlb_fast(cpu, mmu_idx);
+    size_t g5l_n0 = tlb_n_entries(fast);
 
     tlb_mmu_resize_locked(desc, fast, now);
     tlb_mmu_flush_locked(desc, fast);
+    g5l_flush_event(cpu, mmu_idx, tlb_n_entries(fast) != g5l_n0);
 }
 
 static void tlb_mmu_init(CPUTLBDesc *desc, CPUTLBDescFast *fast, int64_t now)
@@ -389,8 +392,11 @@ static void tlb_flush_by_mmuidx_async_work(CPUState *cpu, run_on_cpu_data data)
     all_dirty &= ~to_clean;
     cpu->neg.tlb.c.dirty = all_dirty;
 
+    g5l_flush_trig = g5l_fold_trig(g5f_tag);
+    g5l_flush_wk = to_clean == ALL_MMUIDX_BITS ? 0 : 1;
     for (work = to_clean; work != 0; work &= work - 1) {
         int mmu_idx = ctz32(work);
+        g5l_flush_path = G5L_P_ASYNC;
         tlb_flush_one_mmuidx_locked(cpu, mmu_idx, now);
     }
 
@@ -399,6 +405,11 @@ static void tlb_flush_by_mmuidx_async_work(CPUState *cpu, run_on_cpu_data data)
     tcg_uncheck_jmp_cache(cpu);
 
     g5f_work(cpu->cpu_index, g5f_tag,
+             to_clean == ALL_MMUIDX_BITS ? 0 : to_clean ? 1 : 2,
+             to_clean == ALL_MMUIDX_BITS ? 0 : ctpop16(to_clean),
+             to_clean == ALL_MMUIDX_BITS || to_clean == asked ? 0 :
+             ctpop16(asked & ~to_clean));
+    g5l_work(cpu, g5f_tag,
              to_clean == ALL_MMUIDX_BITS ? 0 : to_clean ? 1 : 2,
              to_clean == ALL_MMUIDX_BITS ? 0 : ctpop16(to_clean),
              to_clean == ALL_MMUIDX_BITS || to_clean == asked ? 0 :
@@ -475,12 +486,27 @@ static inline bool tlb_entry_is_empty(const CPUTLBEntry *te)
     return te->addr_read == -1 && te->addr_write == -1 && te->addr_code == -1;
 }
 
+/* qemu-g5 #373: the page an entry maps, from whichever field is in use */
+static uint64_t g5l_entry_page(const CPUTLBEntry *e)
+{
+    uint64_t a = e->addr_read;
+
+    if (a == -1) {
+        a = e->addr_write;
+    }
+    if (a == -1) {
+        a = e->addr_code;
+    }
+    return a == -1 ? -1 : a & TARGET_PAGE_MASK;
+}
+
 /* Called with tlb_c.lock held */
 static bool tlb_flush_entry_mask_locked(CPUTLBEntry *tlb_entry,
                                         vaddr page,
                                         vaddr mask)
 {
     if (tlb_hit_page_mask_anyprot(tlb_entry, page, mask)) {
+        g5l_kill_page = g5l_entry_page(tlb_entry);
         memset(tlb_entry, -1, sizeof(*tlb_entry));
         return true;
     }
@@ -504,6 +530,7 @@ static void tlb_flush_vtlb_page_mask_locked(CPUState *cpu, int mmu_idx,
     for (k = 0; k < CPU_VTLB_SIZE; k++) {
         if (tlb_flush_entry_mask_locked(&d->vtable[k], page, mask)) {
             tlb_n_used_entries_dec(cpu, mmu_idx);
+            g5l_mark(cpu, mmu_idx, g5l_kill_page, g5l_mark_kind);
         }
     }
 }
@@ -524,12 +551,16 @@ static void tlb_flush_page_locked(CPUState *cpu, int midx, vaddr page)
         tlb_debug("forcing full flush midx %d (%016"
                   VADDR_PRIx "/%016" VADDR_PRIx ")\n",
                   midx, lp_addr, lp_mask);
+        g5l_flush_path = G5L_P_LARGE;
         tlb_flush_one_mmuidx_locked(cpu, midx, get_clock_realtime());
     } else {
+        g5l_mark_kind = G5L_M_PAGE;
         if (tlb_flush_entry_locked(tlb_entry(cpu, midx, page), page)) {
             tlb_n_used_entries_dec(cpu, midx);
+            g5l_mark(cpu, midx, g5l_kill_page, G5L_M_PAGE);
         }
         tlb_flush_vtlb_page_locked(cpu, midx, page);
+        g5l_mark_kind = G5L_M_IGNORE;
     }
 }
 
@@ -697,6 +728,7 @@ static void tlb_flush_range_locked(CPUState *cpu, int midx,
         tlb_debug("forcing full flush midx %d ("
                   "%016" VADDR_PRIx "/%016" VADDR_PRIx "+%016" VADDR_PRIx ")\n",
                   midx, addr, mask, len);
+        g5l_flush_path = G5L_P_RANGE;
         tlb_flush_one_mmuidx_locked(cpu, midx, get_clock_realtime());
         return;
     }
@@ -710,6 +742,7 @@ static void tlb_flush_range_locked(CPUState *cpu, int midx,
         tlb_debug("forcing full flush midx %d ("
                   "%016" VADDR_PRIx "/%016" VADDR_PRIx ")\n",
                   midx, d->large_page_addr, d->large_page_mask);
+        g5l_flush_path = G5L_P_RANGE;
         tlb_flush_one_mmuidx_locked(cpu, midx, get_clock_realtime());
         return;
     }
@@ -720,8 +753,11 @@ static void tlb_flush_range_locked(CPUState *cpu, int midx,
 
         if (tlb_flush_entry_mask_locked(entry, page, mask)) {
             tlb_n_used_entries_dec(cpu, midx);
+            g5l_mark(cpu, midx, g5l_kill_page, G5L_M_RANGE);
         }
+        g5l_mark_kind = G5L_M_RANGE;
         tlb_flush_vtlb_page_mask_locked(cpu, midx, page, mask);
+        g5l_mark_kind = G5L_M_IGNORE;
     }
 }
 
@@ -1136,6 +1172,7 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
     tlb->c.dirty |= 1 << mmu_idx;
 
     /* Make sure there's no cached translation for the new page.  */
+    g5l_mark_kind = G5L_M_IGNORE;
     tlb_flush_vtlb_page_locked(cpu, mmu_idx, addr_page);
 
     /*
@@ -1146,6 +1183,10 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
         unsigned vidx = desc->vindex++ % CPU_VTLB_SIZE;
         CPUTLBEntry *tv = &desc->vtable[vidx];
 
+        if (!tlb_entry_is_empty(tv)) {
+            /* qemu-g5 #373: this victim slot's old entry is dropped */
+            g5l_mark(cpu, mmu_idx, g5l_entry_page(tv), G5L_M_CONFLICT);
+        }
         /* Evict the old entry into the victim tlb.  */
         copy_tlb_helper_locked(tv, te);
         desc->vfulltlb[vidx] = desc->fulltlb[index];
@@ -1196,6 +1237,9 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
     copy_tlb_helper_locked(te, &tn);
     tlb_n_used_entries_inc(cpu, mmu_idx);
     qemu_spin_unlock(&tlb->c.lock);
+
+    g5l_ok(cpu, mmu_idx, addr_page, full->phys_addr, full->prot, &full->attrs,
+           sizeof(full->attrs), full->lg_page_size);
 }
 
 void tlb_set_page_with_attrs(CPUState *cpu, vaddr addr,
@@ -1250,12 +1294,69 @@ static inline bool tlb_hit(uint64_t tlb_addr, vaddr addr)
  * (e.g. CPUTLBEntry pointers) must be discarded and looked up again
  * (e.g. via tlb_entry()).
  */
+/*
+ * qemu-g5 #373: classify from the live TLB (steps 1 and 2) and count the
+ * entry of a refill.  Needs the static TLB helpers of this file.
+ */
+static void g5l_enter_hook(CPUState *cpu, vaddr addr, MMUAccessType type,
+                           int mmu_idx)
+{
+    vaddr page = addr & TARGET_PAGE_MASK;
+    CPUTLBDesc *d = &cpu->neg.tlb.d[mmu_idx];
+    CPUTLBEntry *e = tlb_entry(cpu, mmu_idx, addr);
+    int pre = G5L_PRE_NONE;
+    unsigned vbits = 0;
+
+    if (tlb_hit_page_anyprot(e, page)) {
+        pre = tlb_read_idx(e, type) == -1 ? G5L_CA_UPGRADE :
+              G5L_CA_MAIN_UNCLASS;
+    } else {
+        for (int k = 0; k < CPU_VTLB_SIZE; k++) {
+            CPUTLBEntry *v = &d->vtable[k];
+
+            if (tlb_hit_page_anyprot(v, page)) {
+                uint64_t f = tlb_read_idx(v, type);
+
+                if (f == -1) {
+                    pre = G5L_CA_UPGRADE;
+                } else {
+                    unsigned slow = 0;
+
+                    if (f & TLB_FORCE_SLOW) {
+                        slow = d->vfulltlb[k].slow_flags[type];
+                    }
+                    /* 0-4 slow flags, 5 NOTDIRTY, 6 FORCE_SLOW, 7 INVALID */
+                    vbits = (slow & TLB_SLOW_FLAGS_MASK) |
+                            (f & TLB_NOTDIRTY ? 1u << 5 : 0) |
+                            (f & TLB_FORCE_SLOW ? 1u << 6 : 0) |
+                            (f & TLB_INVALID_MASK ? 1u << 7 : 0);
+                    if (slow & TLB_MMIO) {
+                        pre = G5L_CA_VFLAG_MMIO;
+                    } else if (slow & TLB_DISCARD_WRITE) {
+                        pre = G5L_CA_VFLAG_DISCARD;
+                    } else if (slow & TLB_WATCHPOINT) {
+                        pre = G5L_CA_VFLAG_WATCH;
+                    } else if (f & TLB_NOTDIRTY) {
+                        pre = G5L_CA_VFLAG_NOTDIRTY;
+                    } else {
+                        pre = G5L_CA_VFLAG_OTHER;
+                    }
+                }
+                break;
+            }
+        }
+    }
+    g5l_enter(cpu, page, mmu_idx, type, pre, vbits);
+}
+
 static bool tlb_fill_align(CPUState *cpu, vaddr addr, MMUAccessType type,
                            int mmu_idx, MemOp memop, int size,
                            bool probe, uintptr_t ra)
 {
     const TCGCPUOps *ops = cpu->cc->tcg_ops;
     CPUTLBEntryFull full;
+
+    g5l_enter_hook(cpu, addr, type, mmu_idx);
 
     if (ops->tlb_fill_align) {
         if (ops->tlb_fill_align(cpu, &full, addr, type, mmu_idx,
@@ -1329,6 +1430,7 @@ static bool victim_tlb_hit(CPUState *cpu, size_t mmu_idx, size_t index,
         uint64_t cmp = tlb_read_idx(vtlb, access_type);
 
         if (cmp == page) {
+            g5l_vhit(cpu);
             /* Found entry in victim tlb, swap tlb and iotlb.  */
             CPUTLBEntry tmptlb, *tlb = &cpu_tlb_fast(cpu, mmu_idx)->table[index];
 
@@ -1388,6 +1490,7 @@ static int probe_access_internal(CPUState *cpu, vaddr addr,
 
     if (!tlb_hit_page(tlb_addr, page_addr)) {
         if (!victim_tlb_hit(cpu, mmu_idx, index, access_type, page_addr)) {
+            g5l_caller = G5L_C_PROBE;
             if (!tlb_fill_align(cpu, addr, access_type, mmu_idx,
                                 0, fault_size, nonfault, retaddr)) {
                 /* Non-faulting page table read failed.  */
@@ -1667,6 +1770,7 @@ static bool mmu_lookup1(CPUState *cpu, MMULookupPageData *data, MemOp memop,
     if (!tlb_hit(tlb_addr, addr)) {
         if (!victim_tlb_hit(cpu, mmu_idx, index, access_type,
                             addr & TARGET_PAGE_MASK)) {
+            g5l_caller = G5L_C_LOOKUP1;
             tlb_fill_align(cpu, addr, access_type, mmu_idx,
                            memop, data->size, false, ra);
             maybe_resized = true;
@@ -1836,6 +1940,7 @@ static void *atomic_mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
     if (!tlb_hit(tlb_addr, addr)) {
         if (!victim_tlb_hit(cpu, mmu_idx, index, MMU_DATA_STORE,
                             addr & TARGET_PAGE_MASK)) {
+            g5l_caller = G5L_C_ATOMIC_ST;
             tlb_fill_align(cpu, addr, MMU_DATA_STORE, mmu_idx,
                            mop, size, false, retaddr);
             did_tlb_fill = true;
@@ -1852,6 +1957,7 @@ static void *atomic_mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
      * but addr_read will only be -1 if PAGE_READ was unset.
      */
     if (unlikely(tlbe->addr_read == -1)) {
+        g5l_caller = G5L_C_ATOMIC_LD;
         tlb_fill_align(cpu, addr, MMU_DATA_LOAD, mmu_idx,
                        0, size, false, retaddr);
         /*

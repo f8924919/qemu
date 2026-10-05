@@ -7,6 +7,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "exec/g5-fillcnt.h"
 #include "exec/g5-flushcnt.h"
 #include "qemu/accel.h"
 #include "qemu/qht.h"
@@ -163,6 +164,7 @@ static void tcg_dump_flush_info(GString *buf)
     g_string_append_printf(buf, "TLB elided flushes  %zu\n", flush_elide);
 #ifndef CONFIG_USER_ONLY
     g5f_dump(buf);
+    g5l_dump(buf);
 #endif
 }
 

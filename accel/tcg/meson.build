@@ -29,6 +29,7 @@ user_ss.add(files(
 
 system_ss.add(files(
   'cputlb.c',
+  'g5-fillcnt.c',
   'g5-flushcnt.c',
   'icount-common.c',
   'monitor.c',
