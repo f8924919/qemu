@@ -473,6 +473,18 @@ void helper_float_check_status(CPUPPCState *env)
     do_float_check_status(env, true, GETPC());
 }
 
+/*
+ * FPRF and the deferred exceptions in one call, for the scalar instructions
+ * that set both after writing their target.  GETPC() has to be taken here:
+ * calling helper_float_check_status() instead would make the return address
+ * point into this function.
+ */
+void helper_compute_fprf_check_status_float64(CPUPPCState *env, float64 arg)
+{
+    helper_compute_fprf_float64(env, arg);
+    do_float_check_status(env, true, GETPC());
+}
+
 void helper_reset_fpstatus(CPUPPCState *env)
 {
     set_float_exception_flags(0, &env->fp_status);
