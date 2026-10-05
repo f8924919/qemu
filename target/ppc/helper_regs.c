@@ -411,22 +411,37 @@ MMUIdxMap ppc_hrmor_mmuidx_mask(CPUPPCState *env)
     return mask;
 }
 
+/*
+ * A delayed flush (TLB_NEED_*) stands for a change to the SLB or to the
+ * page tables, so the MMU indexes that read neither are kept.  Whatever
+ * else may change their translation (HRMOR) has to flush them itself.
+ */
 void check_tlb_flush(CPUPPCState *env, bool global)
 {
     CPUState *cs = env_cpu(env);
+    MMUIdxMap keep = ppc_hrmor_mmuidx_mask(env);
+    MMUIdxMap idxmap = MAKE_64BIT_MASK(0, NB_MMU_MODES) & ~keep;
 
     /* Handle global flushes first */
     if (global && (env->tlb_need_flush & TLB_NEED_GLOBAL_FLUSH)) {
         env->tlb_need_flush &= ~TLB_NEED_GLOBAL_FLUSH;
         env->tlb_need_flush &= ~TLB_NEED_LOCAL_FLUSH;
-        tlb_flush_all_cpus_synced(cs);
+        if (keep) {
+            tlb_flush_by_mmuidx_all_cpus_synced(cs, idxmap);
+        } else {
+            tlb_flush_all_cpus_synced(cs);
+        }
         return;
     }
 
     /* Then handle local ones */
     if (env->tlb_need_flush & TLB_NEED_LOCAL_FLUSH) {
         env->tlb_need_flush &= ~TLB_NEED_LOCAL_FLUSH;
-        tlb_flush(cs);
+        if (keep) {
+            tlb_flush_by_mmuidx(cs, idxmap);
+        } else {
+            tlb_flush(cs);
+        }
     }
 }
 #endif /* !CONFIG_USER_ONLY */

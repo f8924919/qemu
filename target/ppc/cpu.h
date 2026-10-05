@@ -1339,7 +1339,12 @@ struct CPUArchState {
     bool tlb_dirty;  /* Set to non-zero when modifying TLB */
     bool kvm_sw_tlb; /* non-zero if KVM SW TLB API is active */
 #endif /* CONFIG_KVM */
-    uint32_t tlb_need_flush; /* Delayed flush needed */
+    /*
+     * Delayed flush needed.  On a 64-bit Book3S MMU it only stands for a
+     * change to the SLB or to the page tables: check_tlb_flush() keeps the
+     * MMU indexes that read neither (ppc_hrmor_mmuidx_mask()).
+     */
+    uint32_t tlb_need_flush;
 #define TLB_NEED_LOCAL_FLUSH   0x1
 #define TLB_NEED_GLOBAL_FLUSH  0x2
 #endif

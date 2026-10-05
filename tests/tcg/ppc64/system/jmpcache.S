@@ -26,20 +26,24 @@
 	.section .text
 
 /*
- * unsigned long jc_run(unsigned long entry, unsigned long ea);
+ * unsigned long jc_run(unsigned long entry, unsigned long ea,
+ *                      unsigned long msr_or);
  *
- * Leaves for entry with instruction relocation on, with ea in r4 (the
- * trampoline page uses it as the bctr target; a direct entry ignores it).
- * Returns what the code that was reached put in r3 before its sc.
+ * Leaves for entry with instruction relocation on and msr_or added to MSR,
+ * with ea in r4 (the trampoline page uses it as the bctr target; a direct
+ * entry ignores it).  Returns what the code that was reached put in r3
+ * before its sc.
  */
 	.globl jc_run
 jc_run:
 	mflr	0
 	LOADSYM	10, jc_save
 	std	0, 0(10)		/* return address */
+	mr	7, 5
 	mfmsr	5
 	std	5, 8(10)		/* MSR to come back with: real mode */
 	ori	6, 5, MSR_IR
+	or	6, 6, 7
 	std	6, 16(10)		/* MSR the tested code runs with */
 	mtspr	SPR_SRR0, 3
 	mtspr	SPR_SRR1, 6

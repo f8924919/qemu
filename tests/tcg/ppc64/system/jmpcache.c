@@ -15,8 +15,11 @@
  *   (ii) rfid to a trampoline page that does "mtctr; bctr" to X: generated
  *        code looks X up (helper_lookup_tb_ptr).  No direct branch, which
  *        TCG would chain instead.
- * Each case runs on both paths, and the two runs of a path are identical:
- * the first one is what puts the code at X into the table.
+ * Way (i) is also taken in problem state (iii), so that the translation of
+ * X lives in a second softmmu MMU index: a flush that forgets one of the
+ * two virtual indexes shows up here.
+ * Each case runs on every path, and the runs of a path are identical: the
+ * first one is what puts the code at X into the table.
  *
  * Instruction relocation is on and data relocation is off, so the test code
  * itself (in ROM, real mode) needs no mapping.  The tested pages are in RAM
@@ -67,6 +70,10 @@
 
 #define VEC_ISI 0x400UL
 #define VEC_SC  0xc00UL
+
+#define MSR_PR 0x4000UL
+
+#define NR_PATHS 3
 
 static int ok = 1;
 
@@ -219,13 +226,32 @@ static void start_case(unsigned long x_slot)
     jc_isi_state[1] = 0;
 }
 
-/* Run X by the path: 0 = rfid to X, 1 = rfid to the trampoline, bctr to X */
+/*
+ * Run X by the path: 0 = rfid to X, 1 = rfid to the trampoline, bctr to X,
+ * 2 = rfid to X in problem state
+ */
 static unsigned long run_x(int path)
 {
-    if (path == 0) {
-        return jc_run(EA_X, 0);
+    switch (path) {
+    case 0:
+        return jc_run(EA_X, 0, 0);
+    case 1:
+        return jc_run(EA_Y, EA_X, 0);
+    default:
+        return jc_run(EA_X, 0, MSR_PR);
     }
-    return jc_run(EA_Y, EA_X);
+}
+
+static const char *path_name(int path)
+{
+    switch (path) {
+    case 0:
+        return "rfid";
+    case 1:
+        return "bctr";
+    default:
+        return "user";
+    }
 }
 
 /* ways to change what X means */
@@ -284,7 +310,7 @@ static void report(const char *name, int path, const char *want,
 {
     int i;
 
-    ml_printf("jmpcache %s %s:", name, path ? "bctr" : "rfid");
+    ml_printf("jmpcache %s %s:", name, path_name(path));
     for (i = 0; i < n; i++) {
         ml_printf(" %c", mark_char(got[i]));
     }
@@ -293,7 +319,7 @@ static void report(const char *name, int path, const char *want,
     for (i = 0; i < n; i++) {
         if (got[i] != (unsigned long)want[i]) {
             ml_printf("FAIL: jmpcache %s %s got %c expected %c (run %d)\n",
-                      name, path ? "bctr" : "rfid", mark_char(got[i]),
+                      name, path_name(path), mark_char(got[i]),
                       want[i], i + 1);
             ok = 0;
         }
@@ -304,11 +330,11 @@ static void check_isi(const char *name, int path, unsigned long want)
 {
     if (jc_isi_state[0] != want) {
         ml_printf("FAIL: jmpcache %s %s isi count %lu expected %lu\n",
-                  name, path ? "bctr" : "rfid", jc_isi_state[0], want);
+                  name, path_name(path), jc_isi_state[0], want);
         ok = 0;
     } else if (want && jc_isi_state[1] != EA_X) {
         ml_printf("FAIL: jmpcache %s %s isi at 0x%lx expected 0x%lx\n",
-                  name, path ? "bctr" : "rfid", jc_isi_state[1], EA_X);
+                  name, path_name(path), jc_isi_state[1], EA_X);
         ok = 0;
     }
 }
@@ -408,7 +434,7 @@ int main(void)
     install_vector(VEC_ISI, jc_isi_stub, jc_isi_stub_end);
     put_code();
 
-    for (path = 0; path < 2; path++) {
+    for (path = 0; path < NR_PATHS; path++) {
         case_switch("1a", 1, SLBIE, path);
         case_switch("1b", 1, SLBIA, path);
         case_switch("1c", 0, SLOT0, path);

@@ -8,10 +8,12 @@
 #define PPC64_JMPCACHE_H
 
 /*
- * Leave for entry with instruction relocation on (r4 = ea) and return what
- * the code that was reached put in r3 before its sc.
+ * Leave for entry with instruction relocation on and the bits of msr_or
+ * added to MSR (r4 = ea), and return what the code that was reached put in
+ * r3 before its sc.
  */
-unsigned long jc_run(unsigned long entry, unsigned long ea);
+unsigned long jc_run(unsigned long entry, unsigned long ea,
+                     unsigned long msr_or);
 
 /*
  * What the 0x400 handler works with: [0] times it ran, [1] SRR0 of the last
