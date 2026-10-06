@@ -146,6 +146,16 @@ executable(
   c_args: fpcflags,
 )
 
+# qemu-g5 #387 (measurement only): check target/ppc/g5-fpelig.c against
+# softfloat's actual hardfloat path.
+executable(
+  'g5-fpelig-oracle',
+  ['g5-fpelig-oracle.c', '../../fpu/softfloat.c',
+   '../../target/ppc/g5-fpelig.c'],
+  dependencies: [qemuutil],
+  c_args: fpcflags + ['-DG5_SF_ORACLE'],
+)
+
 fptestlog2 = executable(
   'fp-test-log2',
   ['fp-test-log2.c', '../../fpu/softfloat.c'],

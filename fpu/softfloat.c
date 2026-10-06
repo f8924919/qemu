@@ -238,6 +238,19 @@ static inline bool can_use_fpu(const float_status *s)
 }
 
 /*
+ * qemu-g5 #387 (measurement only): tests/fp/g5-fpelig-oracle.c builds this
+ * file with G5_SF_ORACLE to see which path an operation took.
+ */
+#ifdef G5_SF_ORACLE
+int g5_sf_path;
+#define G5_SF_MARK(p) (g5_sf_path = (p))
+#else
+#define G5_SF_MARK(p) ((void)0)
+#endif
+#define G5_SF_HARD 1
+#define G5_SF_POST 2
+
+/*
  * Hardfloat generation functions. Each operation can have two flavors:
  * either using softfloat primitives (e.g. float32_is_zero_or_normal) for
  * most condition checks, or native ones (e.g. fpclassify).
@@ -358,8 +371,10 @@ float32_gen2(float32 xa, float32 xb, float_status *s,
     if (unlikely(f32_is_inf(ur))) {
         float_raise(float_flag_overflow, s);
     } else if (unlikely(fabsf(ur.h) <= FLT_MIN) && post(ua, ub)) {
+        G5_SF_MARK(G5_SF_POST);
         goto soft;
     }
+    G5_SF_MARK(G5_SF_HARD);
     return ur.s;
 
  soft:
@@ -389,8 +404,10 @@ float64_gen2(float64 xa, float64 xb, float_status *s,
     if (unlikely(f64_is_inf(ur))) {
         float_raise(float_flag_overflow, s);
     } else if (unlikely(fabs(ur.h) <= DBL_MIN) && post(ua, ub)) {
+        G5_SF_MARK(G5_SF_POST);
         goto soft;
     }
+    G5_SF_MARK(G5_SF_HARD);
     return ur.s;
 
  soft:
@@ -1986,6 +2003,13 @@ float64_muladd_scalbn(float64 a, float64 b, float64 c,
 
 static bool force_soft_fma;
 
+/* qemu-g5 #387 (measurement only) */
+bool g5_sf_force_soft_fma(void);
+bool g5_sf_force_soft_fma(void)
+{
+    return force_soft_fma;
+}
+
 float32 QEMU_FLATTEN
 float32_muladd(float32 xa, float32 xb, float32 xc, int flags, float_status *s)
 {
@@ -2045,9 +2069,11 @@ float32_muladd(float32 xa, float32 xb, float32 xc, int flags, float_status *s)
         } else if (unlikely(fabsf(ur.h) <= FLT_MIN)) {
             ua = ua_orig;
             uc = uc_orig;
+            G5_SF_MARK(G5_SF_POST);
             goto soft;
         }
     }
+    G5_SF_MARK(G5_SF_HARD);
     if (flags & float_muladd_negate_result) {
         return float32_chs(ur.s);
     }
@@ -2113,9 +2139,11 @@ float64_muladd(float64 xa, float64 xb, float64 xc, int flags, float_status *s)
         } else if (unlikely(fabs(ur.h) <= FLT_MIN)) {
             ua = ua_orig;
             uc = uc_orig;
+            G5_SF_MARK(G5_SF_POST);
             goto soft;
         }
     }
+    G5_SF_MARK(G5_SF_HARD);
     if (flags & float_muladd_negate_result) {
         return float64_chs(ur.s);
     }
@@ -3689,6 +3717,7 @@ float32 int64_to_float32_scalbn(int64_t a, int scale, float_status *status)
     if (likely(scale == 0) && can_use_fpu(status)) {
         union_float32 ur;
         ur.h = a;
+        G5_SF_MARK(G5_SF_HARD);
         return ur.s;
     }
 
@@ -3729,6 +3758,7 @@ float64 int64_to_float64_scalbn(int64_t a, int scale, float_status *status)
     if (likely(scale == 0) && can_use_fpu(status)) {
         union_float64 ur;
         ur.h = a;
+        G5_SF_MARK(G5_SF_HARD);
         return ur.s;
     }
 
@@ -3909,6 +3939,7 @@ float32 uint64_to_float32_scalbn(uint64_t a, int scale, float_status *status)
     if (likely(scale == 0) && can_use_fpu(status)) {
         union_float32 ur;
         ur.h = a;
+        G5_SF_MARK(G5_SF_HARD);
         return ur.s;
     }
 
@@ -3949,6 +3980,7 @@ float64 uint64_to_float64_scalbn(uint64_t a, int scale, float_status *status)
     if (likely(scale == 0) && can_use_fpu(status)) {
         union_float64 ur;
         ur.h = a;
+        G5_SF_MARK(G5_SF_HARD);
         return ur.s;
     }
 
@@ -4210,11 +4242,14 @@ float64_hs_compare(float64 xa, float64 xb, float_status *s, bool is_quiet)
 
     if (isgreaterequal(ua.h, ub.h)) {
         if (isgreater(ua.h, ub.h)) {
+            G5_SF_MARK(G5_SF_HARD);
             return float_relation_greater;
         }
+        G5_SF_MARK(G5_SF_HARD);
         return float_relation_equal;
     }
     if (likely(isless(ua.h, ub.h))) {
+        G5_SF_MARK(G5_SF_HARD);
         return float_relation_less;
     }
     /*
@@ -4401,6 +4436,7 @@ float32 QEMU_FLATTEN float32_sqrt(float32 xa, float_status *s)
         goto soft;
     }
     ur.h = sqrtf(ua.h);
+    G5_SF_MARK(G5_SF_HARD);
     return ur.s;
 
  soft:
@@ -4428,6 +4464,7 @@ float64 QEMU_FLATTEN float64_sqrt(float64 xa, float_status *s)
         goto soft;
     }
     ur.h = sqrt(ua.h);
+    G5_SF_MARK(G5_SF_HARD);
     return ur.s;
 
  soft:
