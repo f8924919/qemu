@@ -1376,6 +1376,7 @@ typedef struct G5RRow {
     uint64_t cons[3][5][G5S_NCLS][G5S_NCLS][G5S_NCLS][2];
     uint64_t reset, reset_skip;
     uint64_t dup_esid, inv_violation, inv_scanned, thread;
+    uint64_t lookup_mismatch, spp_empty;
     bool used;
 } QEMU_ALIGNED(64) G5RRow;
 
@@ -1496,6 +1497,32 @@ void g5r_consume(PowerPCCPU *cpu, uint32_t tag)
                                      &r->inv_scanned);
     }
     skip = g5s_consume(&r->st, trig == 0, g5r_lookup, cpu);
+    /*
+     * Cross-check the slb_lookup()-based comparison with a raw scan of the
+     * SLB: an equal valid entry in any slot.  They may differ only when two
+     * valid entries share an ESID (counted as dup_esid).
+     */
+    if (r->st.spp.n == 0) {
+        r->spp_empty++;
+    }
+    for (uint32_t i = 0; i < r->st.spp.n && !r->st.spp.ovf; i++) {
+        const G5SVal *v = &r->st.spp.v[i];
+        G5SVal got;
+        bool lk = g5r_lookup(cpu, v->esid, &got) && got.esid == v->esid &&
+                  got.vsid == v->vsid && got.sps == v->sps;
+        bool raw = false;
+
+        for (int n = 0; n < cpu->hash64_opts->slb_size && !raw; n++) {
+            const ppc_slb_t *o = &cpu->env.slb[n];
+
+            raw = (o->esid & SLB_ESID_V) &&
+                  (o->esid & ~SLB_ESID_V) == v->esid &&
+                  o->vsid == v->vsid && (uintptr_t)o->sps == v->sps;
+        }
+        if (lk != raw) {
+            r->lookup_mismatch++;
+        }
+    }
     r->cons[trig][entry][r->st.cls_spp][r->st.cls_sp][r->st.cls_s][skip]++;
     g5r_cur_valid = true;
     g5r_cur_skip = skip;
@@ -1594,5 +1621,9 @@ static void g5r_dump(void *opaque)
                                PRIu64 "\n", c, r->inv_scanned);
         g_string_append_printf(buf, "G5R chk cpu=%d what=thread n=%" PRIu64
                                "\n", c, r->thread);
+        g_string_append_printf(buf, "G5R chk cpu=%d what=lookup_mismatch n=%"
+                               PRIu64 "\n", c, r->lookup_mismatch);
+        g_string_append_printf(buf, "G5R chk cpu=%d what=spp_empty n=%"
+                               PRIu64 "\n", c, r->spp_empty);
     }
 }
