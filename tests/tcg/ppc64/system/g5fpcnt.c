@@ -239,6 +239,7 @@ int main(void)
     /* single: float32's conditions on exact inputs (x) */
     op("FADDS", A_AB(59, 21), ONE, ONE, 0, 0, "ok", 1);
     op("FADDS", A_AB(59, 21), THIRD, ONE, 0, 0, "na", 0);
+    op("FADDS", A_AB(59, 21), ONE, THIRD, 0, 0, "na", 0);
     op("FADDS", A_AB(59, 21), ONE, ONE, 0, RN_ZERO, "rn", 1);
     op("FSUBS", A_AB(59, 20), THREE, ONE, 0, 0, "ok", 1);
     op("FMULS", A_AC(59, 25), ONE, 0, THREE, 0, "ok", 1);
