@@ -146,6 +146,17 @@ executable(
   c_args: fpcflags,
 )
 
+# target/ppc single-precision hardfloat path against float64r32_*()
+fpppchard32 = executable(
+  'ppc-hard32-test',
+  ['ppc-hard32-test.c', '../../fpu/softfloat.c'],
+  dependencies: [qemuutil],
+  c_args: fpcflags,
+)
+test('ppc-hard32', fpppchard32,
+     timeout: 120,
+     suite: ['softfloat', 'softfloat-ops'])
+
 fptestlog2 = executable(
   'fp-test-log2',
   ['fp-test-log2.c', '../../fpu/softfloat.c'],
