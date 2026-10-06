@@ -621,6 +621,14 @@ static void exc_check(const char *name, uint64_t a, uint64_t b, uint64_t c,
            (unsigned long long)sig_f1, (unsigned long long)sig_fpscr);
 }
 
+/* float32(1/3), exact as a float32; each op below is inexact on it */
+#define THIRD_F 0x3fd5555560000000ull
+
+static const char *const single_ops[] = {
+    "fadds", "fsubs", "fmuls", "fdivs", "fmadds", "fmsubs", "fnmadds",
+    "fnmsubs",
+};
+
 static void exception_checks(void)
 {
     struct sigaction sa;
@@ -652,6 +660,26 @@ static void exception_checks(void)
      * today, and #382 keeps it.
      */
     exc_check("fcfid", 0, 0x0020000000000001ull, 0, XE, 0);
+
+    /*
+     * The single-precision host path (target/ppc/fpu_hard32.h) only takes
+     * float32-exact operands, so the cases above (1/3 as a double) never
+     * reach it.  With float32-exact operands and an inexact result: an
+     * enabled XE interrupts after the target is written, and VE, OE, UE
+     * and ZE enabled do not fire on an inexact result alone.
+     */
+    for (size_t i = 0; i < sizeof(single_ops) / sizeof(single_ops[0]); i++) {
+        exc_check(single_ops[i], THIRD_F, THREE, THREE, XE, 1);
+    }
+    for (size_t i = 0; i < sizeof(single_ops) / sizeof(single_ops[0]); i++) {
+        struct fp_run r = run1(single_ops[i], THIRD_F, THREE, THREE,
+                               VE | OE | UE | ZE);
+
+        expect("single inexact, VE|OE|UE|ZE: XX FI, no FEX", r.fpscr_out,
+               FEX | XX | FI, XX | FI);
+        printf("enabled  %-8s -> f1=%016llx fpscr=%08llx\n", single_ops[i],
+               (unsigned long long)r.f[1], (unsigned long long)r.fpscr_out);
+    }
 }
 
 int main(void)

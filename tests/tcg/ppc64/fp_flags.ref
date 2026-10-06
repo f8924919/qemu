@@ -22,6 +22,22 @@ exc      fctiw    -> f1=7ff7deadbeef0001 fpscr=e0000180
 exc      frin     -> f1=7ff7deadbeef0001 fpscr=e1000080
 exc      fcmpo    -> f1=7ff7deadbeef0001 fpscr=e0091080
 exc      fcfid    -> f1=7ff7deadbeef0001 fpscr=c2020008
+exc      fadds    -> f1=400aaaaaa0000000 fpscr=c2024008
+exc      fsubs    -> f1=c005555560000000 fpscr=c2028008
+exc      fmuls    -> f1=3ff0000000000000 fpscr=c2024008
+exc      fdivs    -> f1=3fbc71c720000000 fpscr=c2024008
+exc      fmadds   -> f1=4010000000000000 fpscr=c2024008
+exc      fmsubs   -> f1=c000000000000000 fpscr=c2028008
+exc      fnmadds  -> f1=c010000000000000 fpscr=c2028008
+exc      fnmsubs  -> f1=4000000000000000 fpscr=c2024008
+enabled  fadds    -> f1=400aaaaaa0000000 fpscr=820240f0
+enabled  fsubs    -> f1=c005555560000000 fpscr=820280f0
+enabled  fmuls    -> f1=3ff0000000000000 fpscr=820240f0
+enabled  fdivs    -> f1=3fbc71c720000000 fpscr=820240f0
+enabled  fmadds   -> f1=4010000000000000 fpscr=820240f0
+enabled  fmsubs   -> f1=c000000000000000 fpscr=820280f0
+enabled  fnmadds  -> f1=c010000000000000 fpscr=820280f0
+enabled  fnmsubs  -> f1=4000000000000000 fpscr=820240f0
 fadd     rn 1.5 1.5 -> 4008000000000000 fpscr=00004000 cr=00000000 lo=0
 fadd     rn 1.5 -3 -> bff8000000000000 fpscr=00008000 cr=00000000 lo=0
 fadd     rn 1.5 +0 -> 3ff8000000000000 fpscr=00004000 cr=00000000 lo=0
