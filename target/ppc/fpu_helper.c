@@ -21,6 +21,7 @@
 #include "exec/helper-proto.h"
 #include "internal.h"
 #include "fpu/softfloat.h"
+#include "fpu_hard32.h"
 
 static inline float128 float128_snan_to_qnan(float128 x)
 {
@@ -718,7 +719,7 @@ static float64 do_fmadd(CPUPPCState *env, float64 a, float64 b,
 static uint64_t do_fmadds(CPUPPCState *env, float64 a, float64 b,
                           float64 c, int madd_flags, uintptr_t retaddr)
 {
-    float64 ret = float64r32_muladd(a, b, c, madd_flags, &env->fp_status);
+    float64 ret = ppc_f64r32_muladd(a, b, c, madd_flags, &env->fp_status);
     int flags = get_float_exception_flags(&env->fp_status);
 
     if (unlikely(flags & float_flag_invalid)) {
@@ -859,13 +860,13 @@ FPU_FRE(FRES, float64r32_div)
 FPU_FRSQRTE(FRSQRTE, float64_div)
 FPU_FRSQRTE(FRSQRTES, float64r32_div)
 FPU_HELPER(FADD, float64_add, addsub_flags_handler)
-FPU_HELPER(FADDS, float64r32_add, addsub_flags_handler)
+FPU_HELPER(FADDS, ppc_f64r32_add, addsub_flags_handler)
 FPU_HELPER(FSUB, float64_sub, addsub_flags_handler)
-FPU_HELPER(FSUBS, float64r32_sub, addsub_flags_handler)
+FPU_HELPER(FSUBS, ppc_f64r32_sub, addsub_flags_handler)
 FPU_HELPER(FMUL, float64_mul, mul_flags_handler)
-FPU_HELPER(FMULS, float64r32_mul, mul_flags_handler)
+FPU_HELPER(FMULS, ppc_f64r32_mul, mul_flags_handler)
 FPU_HELPER(FDIV, float64_div, div_flags_handler)
-FPU_HELPER(FDIVS, float64r32_div, div_flags_handler)
+FPU_HELPER(FDIVS, ppc_f64r32_div, div_flags_handler)
 
 /* fsel - fsel. */
 uint64_t helper_FSEL(uint64_t a, uint64_t b, uint64_t c)
