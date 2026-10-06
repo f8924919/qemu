@@ -63,6 +63,9 @@ static const char *const slb_names[6] = {
 };
 static const char *const res_names[4] = { "same", "prot", "diff", "fail" };
 static const char *const wk_names[2] = { "full", "part" };
+static const char *const g5r_cls_names[7] = {
+    "ok", "miss1", "miss2", "miss3", "miss4", "ovf", "none"
+};
 static const char *const w_names[3] = { "gain", "lose", "none" };
 #endif
 
@@ -96,6 +99,7 @@ typedef struct RingEnt {
     uint8_t trig;       /* 0 slbia, 1 tlbie, 2 other */
     uint8_t resize;
     uint8_t wk;         /* 0 full work, 1 partial work */
+    uint8_t spcls;      /* #385: S' class of the consumption, G5R_SP_NONE */
 } RingEnt;
 #endif
 
@@ -105,6 +109,7 @@ typedef struct G5LRow {
     uint64_t cause[G5L_NCAUSE][4];      /* n same prot diff */
     uint64_t fullk[2][2];
     uint64_t ffull[4][6][4];
+    uint64_t ffullr[4][6][4][2][7];     /* #385: + skip, S' class */
     uint64_t protx[G5L_NCAUSE][3][3][3];
     uint64_t vflag[256];
     uint64_t ev[G5L_NPATH];
@@ -119,6 +124,7 @@ typedef struct G5LRow {
     uint64_t *seen;
     RingEnt *ring[NB_MMU_MODES];
     uint32_t gen[NB_MMU_MODES];
+    uint32_t lastkeep[NB_MMU_MODES];    /* #385: gen of the last unskippable */
 #endif
 } QEMU_ALIGNED(64) G5LRow;
 
@@ -131,7 +137,15 @@ static __thread struct {
     int trig;
     int acc;
     int row;
+    int skip;           /* #385: 1 = no unskippable flush since the fill */
+    int sp;             /* #385: S' class of the first flush after it */
 } st;
+
+__thread bool g5r_cur_valid;
+__thread bool g5r_cur_skip;
+__thread uint8_t g5r_cur_sp;
+void (*g5r_reset_hook)(CPUState *cpu, uint32_t asked);
+void (*g5r_dump_hook)(void *buf);
 
 static GOnce g5l_once = G_ONCE_INIT;
 #ifndef G5L_NO_SHADOW
@@ -245,6 +259,7 @@ void g5l_enter(CPUState *cpu, uint64_t page, int mmu_idx, int acc, int pre,
 
         if (st.cause == G5L_CA_FULL || st.cause == G5L_CA_RING_LOST) {
             pr->ffull[st.trig][SLBC_FAIL][RES_FAIL]++;
+            pr->ffullr[st.trig][SLBC_FAIL][RES_FAIL][st.skip][st.sp]++;
         }
     }
 #endif
@@ -257,7 +272,11 @@ void g5l_enter(CPUState *cpu, uint64_t page, int mmu_idx, int acc, int pre,
         uint64_t key = mkkey(page, mmu_idx);
         Shadow *s = &r->shadow[shadow_slot(key)];
 
+        st.skip = 0;
+        st.sp = G5R_SP_NONE;
         if (s->key == key) {
+            /* #385: no unskippable flush of this mmu_idx since the fill */
+            st.skip = r->lastkeep[mmu_idx] <= s->gen;
             if (s->mark) {
                 cause = s->mark == G5L_M_PAGE ? G5L_CA_PAGE :
                         s->mark == G5L_M_RANGE ? G5L_CA_RANGE_PAGE :
@@ -272,6 +291,7 @@ void g5l_enter(CPUState *cpu, uint64_t page, int mmu_idx, int acc, int pre,
                     case G5L_P_ASYNC:
                         cause = G5L_CA_FULL;
                         trig = e->trig;
+                        st.sp = e->spcls;
                         r->fullk[e->resize][e->wk]++;
                         break;
                     case G5L_P_LARGE:
@@ -366,6 +386,7 @@ void g5l_ok(CPUState *cpu, int mmu_idx, uint64_t page, uint64_t phys,
             }
             if (c == G5L_CA_FULL || c == G5L_CA_RING_LOST) {
                 r->ffull[st.trig][slbc][res]++;
+                r->ffullr[st.trig][slbc][res][st.skip][st.sp]++;
             }
         }
 
@@ -408,6 +429,10 @@ void g5l_flush_event(CPUState *cpu, int mmu_idx, bool resized)
         e->trig = g5l_flush_trig;
         e->resize = resized;
         e->wk = g5l_flush_wk;
+        e->spcls = g5r_cur_valid ? g5r_cur_sp : G5R_SP_NONE;
+        if (!(g5r_cur_valid && g5r_cur_skip)) {
+            r->lastkeep[mmu_idx] = g;
+        }
     }
 #endif
 }
@@ -545,6 +570,18 @@ void g5l_dump(void *opaque)
                         "G5L ffull cpu=%d trig=%s slb=%s res=%s n=%" PRIu64
                         "\n", c, trig_names[t], slb_names[s], res_names[x],
                         r->ffull[t][s][x]);
+                    for (int k = 0; k < 2; k++) {
+                        for (int p = 0; p < 7; p++) {
+                            if (r->ffullr[t][s][x][k][p]) {
+                                g_string_append_printf(buf,
+                                    "G5R ffullr cpu=%d trig=%s slb=%s res=%s"
+                                    " skip=%d sp=%s n=%" PRIu64 "\n", c,
+                                    trig_names[t], slb_names[s], res_names[x],
+                                    k, g5r_cls_names[p],
+                                    r->ffullr[t][s][x][k][p]);
+                            }
+                        }
+                    }
                 }
             }
         }

@@ -25,6 +25,7 @@
 #include "system/kvm.h"
 #include "system/tcg.h"
 #include "helper_regs.h"
+#include "mmu-hash64.h"
 #include "power8-pmu.h"
 #include "cpu-models.h"
 #include "spr_common.h"
@@ -428,12 +429,18 @@ void check_tlb_flush(CPUPPCState *env, bool global)
         env->tlb_need_flush &= ~TLB_NEED_GLOBAL_FLUSH;
         env->tlb_need_flush &= ~TLB_NEED_LOCAL_FLUSH;
         g5f_cur_tag = g5f_take(cs->cpu_index, 1, g5f_cur_entry, 0);
+#ifdef TARGET_PPC64
+        g5r_consume(env_archcpu(env), g5f_cur_tag);
+#endif
         if (keep) {
             tlb_flush_by_mmuidx_all_cpus_synced(cs, idxmap);
         } else {
             tlb_flush_all_cpus_synced(cs);
         }
         g5f_cur_tag = 0;
+#ifdef TARGET_PPC64
+        g5r_after_flush(env_archcpu(env));
+#endif
         return;
     }
 
@@ -441,12 +448,18 @@ void check_tlb_flush(CPUPPCState *env, bool global)
     if (env->tlb_need_flush & TLB_NEED_LOCAL_FLUSH) {
         env->tlb_need_flush &= ~TLB_NEED_LOCAL_FLUSH;
         g5f_cur_tag = g5f_take(cs->cpu_index, 0, g5f_cur_entry, 0);
+#ifdef TARGET_PPC64
+        g5r_consume(env_archcpu(env), g5f_cur_tag);
+#endif
         if (keep) {
             tlb_flush_by_mmuidx(cs, idxmap);
         } else {
             tlb_flush(cs);
         }
         g5f_cur_tag = 0;
+#ifdef TARGET_PPC64
+        g5r_after_flush(env_archcpu(env));
+#endif
     }
 }
 #endif /* !CONFIG_USER_ONLY */

@@ -5,6 +5,11 @@
 
 #ifdef TARGET_PPC64
 void dump_slb(PowerPCCPU *cpu);
+/* qemu-g5 #385: SLB restore counters (NOT FOR UPSTREAM) */
+void g5r_fill(PowerPCCPU *cpu, int slot);
+void g5r_consume(PowerPCCPU *cpu, uint32_t tag);
+void g5r_after_flush(PowerPCCPU *cpu);
+extern __thread int g5r_writer;
 int ppc_store_slb(PowerPCCPU *cpu, target_ulong slot,
                   target_ulong esid, target_ulong vsid);
 bool ppc_hash64_xlate(PowerPCCPU *cpu, vaddr eaddr, MMUAccessType access_type,

@@ -19,6 +19,8 @@
 
 #include "qemu/osdep.h"
 #include "exec/g5-flushcnt.h"
+#include "exec/g5-fillcnt.h"
+#include "exec/g5-slbset.h"
 #include "qemu/units.h"
 #include "cpu.h"
 #include "system/kvm.h"
@@ -362,7 +364,9 @@ void helper_store_sr(CPUPPCState *env, target_ulong srnum, target_ulong value)
         /* flags = flags */
         vsid |= ((value >> 27) & 0xf) << 8;
 
+        g5r_writer = G5S_W_MTSR;
         ppc_store_slb(cpu, srnum, esid, vsid);
+        g5r_writer = G5S_W_OTHER;
     } else
 #endif
     if (env->sr[srnum] != value) {
@@ -1385,6 +1389,11 @@ bool ppc_cpu_tlb_fill(CPUState *cs, vaddr eaddr, int size,
                   &page_size, &prot, mmu_idx, !probe)) {
         tlb_set_page(cs, eaddr & TARGET_PAGE_MASK, raddr & TARGET_PAGE_MASK,
                      prot, mmu_idx, 1UL << page_size);
+#if defined(TARGET_PPC64)
+        if (mmu_is_64bit(cpu->env.mmu_model) && g5l_slb_idx >= 0) {
+            g5r_fill(cpu, g5l_slb_idx);
+        }
+#endif
         return true;
     }
     if (probe) {

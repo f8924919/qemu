@@ -374,6 +374,50 @@ static void flush_all_helper(CPUState *src, run_on_cpu_func fn,
     }
 }
 
+/* qemu-g5 #385: walk the live entries of some mmu_idx (NOT FOR UPSTREAM) */
+static uint64_t g5r_scan_one(CPUTLBEntry *e,
+                             bool (*ok)(void *opaque, uint64_t page),
+                             void *opaque, uint64_t *scanned)
+{
+    uint64_t bad = 0;
+
+    for (int k = 0; k < 3; k++) {
+        uintptr_t a = e->addr_idx[k];
+
+        if (a != (uintptr_t)-1) {
+            (*scanned)++;
+            if (!ok(opaque, a & TARGET_PAGE_MASK)) {
+                bad++;
+            }
+        }
+    }
+    return bad;
+}
+
+uint64_t g5r_scan(CPUState *cpu, uint32_t idxmask,
+                  bool (*ok)(void *opaque, uint64_t page), void *opaque,
+                  uint64_t *scanned)
+{
+    uint64_t bad = 0;
+
+    for (int mmu_idx = 0; mmu_idx < NB_MMU_MODES; mmu_idx++) {
+        CPUTLBDescFast *f = &cpu->neg.tlb.f[mmu_idx];
+        CPUTLBDesc *d = &cpu->neg.tlb.d[mmu_idx];
+        size_t n = tlb_n_entries(f);
+
+        if (!(idxmask & (1u << mmu_idx))) {
+            continue;
+        }
+        for (size_t i = 0; i < n; i++) {
+            bad += g5r_scan_one(&f->table[i], ok, opaque, scanned);
+        }
+        for (int i = 0; i < CPU_VTLB_SIZE; i++) {
+            bad += g5r_scan_one(&d->vtable[i], ok, opaque, scanned);
+        }
+    }
+    return bad;
+}
+
 static void tlb_flush_by_mmuidx_async_work(CPUState *cpu, run_on_cpu_data data)
 {
     MMUIdxMap asked = (MMUIdxMap)(data.host_ulong & 0xffffffffUL);
@@ -414,6 +458,9 @@ static void tlb_flush_by_mmuidx_async_work(CPUState *cpu, run_on_cpu_data data)
              to_clean == ALL_MMUIDX_BITS ? 0 : ctpop16(to_clean),
              to_clean == ALL_MMUIDX_BITS || to_clean == asked ? 0 :
              ctpop16(asked & ~to_clean));
+    if (g5r_reset_hook) {
+        g5r_reset_hook(cpu, asked);
+    }
 
     if (to_clean == ALL_MMUIDX_BITS) {
         qatomic_set(&cpu->neg.tlb.c.full_flush_count,

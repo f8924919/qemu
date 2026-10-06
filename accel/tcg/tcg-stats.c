@@ -165,6 +165,9 @@ static void tcg_dump_flush_info(GString *buf)
 #ifndef CONFIG_USER_ONLY
     g5f_dump(buf);
     g5l_dump(buf);
+    if (g5r_dump_hook) {
+        g5r_dump_hook(buf);
+    }
 #endif
 }
 

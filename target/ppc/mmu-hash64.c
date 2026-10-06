@@ -20,6 +20,7 @@
 #include "qemu/osdep.h"
 #include "exec/g5-fillcnt.h"
 #include "exec/g5-flushcnt.h"
+#include "exec/g5-slbset.h"
 #include "qemu/units.h"
 #include "cpu.h"
 #include "exec/page-protection.h"
@@ -52,6 +53,8 @@
 /*
  * SLB handling
  */
+
+static void g5r_store(PowerPCCPU *cpu, int slot);
 
 static ppc_slb_t *slb_lookup(PowerPCCPU *cpu, target_ulong eaddr)
 {
@@ -305,6 +308,7 @@ int ppc_store_slb(PowerPCCPU *cpu, target_ulong slot,
     slb->esid = esid;
     slb->vsid = vsid;
     slb->sps = sps;
+    g5r_store(cpu, slot);
 
     LOG_SLB("%s: " TARGET_FMT_lu " " TARGET_FMT_lx " - " TARGET_FMT_lx
             " => %016" PRIx64 " %016" PRIx64 "\n", __func__, slot, esid, vsid,
@@ -389,7 +393,10 @@ void helper_SLBMTE(CPUPPCState *env, target_ulong rb, target_ulong rs)
 
     bool g5l_esid0 = slot == 0 && env->slb[0].esid != esid;
 
-    if (ppc_store_slb(cpu, slot, esid, rs) < 0) {
+    g5r_writer = G5S_W_SLBMTE;
+    int g5r_rc = ppc_store_slb(cpu, slot, esid, rs);
+    g5r_writer = G5S_W_OTHER;
+    if (g5r_rc < 0) {
         raise_exception_err_ra(env, POWERPC_EXCP_PROGRAM,
                                POWERPC_EXCP_INVAL, GETPC());
     }
@@ -1354,3 +1361,238 @@ const PPCHash64Options ppc_hash64_opts_POWER7 = {
 };
 
 
+/*
+ * qemu-g5 #385: model "skip the flush of an slbia-only request when every
+ * SLB value the TLB still depends on maps again to the same value", and
+ * count how often it would apply.  NOT FOR UPSTREAM.  Design:
+ * docs/task/385-slb-restore-count.md in the meta repository.
+ */
+#define G5R_MAXCPU   8
+#define G5R_SLB_IDX  0x33u      /* mmu_idx 0,1,4,5: translated via the SLB */
+#define G5R_SCAN_EVERY 64
+
+typedef struct G5RRow {
+    G5SState st;
+    uint64_t cons[3][5][G5S_NCLS][G5S_NCLS][G5S_NCLS][2];
+    uint64_t reset, reset_skip;
+    uint64_t dup_esid, inv_violation, inv_scanned, thread;
+    bool used;
+} QEMU_ALIGNED(64) G5RRow;
+
+static G5RRow g5r_rows[G5R_MAXCPU];
+__thread int g5r_writer = G5S_W_OTHER;
+
+static const char *const g5r_trig_names[3] = { "slbia", "tlbie", "other" };
+static const char *const g5r_entry_names[5] = {
+    "none", "isync", "ptesync", "excp", "rfi"
+};
+static const char *const g5r_cls_names[G5S_NCLS] = {
+    "ok", "miss1", "miss2", "miss3", "miss4", "ovf"
+};
+
+static void g5r_reset(CPUState *cs, uint32_t asked);
+static void g5r_dump(void *opaque);
+
+static G5RRow *g5r_row(CPUState *cs)
+{
+    G5RRow *r = &g5r_rows[cs->cpu_index & (G5R_MAXCPU - 1)];
+
+    if (!r->used) {
+        g5s_init(&r->st);
+        r->used = true;
+        g5r_reset_hook = g5r_reset;
+        g5r_dump_hook = g5r_dump;
+    }
+    if (!qemu_cpu_is_self(cs)) {
+        r->thread++;
+    }
+    return r;
+}
+
+static G5SVal g5r_val(const ppc_slb_t *slb)
+{
+    G5SVal v = {
+        .esid = slb->esid & ~SLB_ESID_V,
+        .vsid = slb->vsid,
+        .sps = (uintptr_t)slb->sps,
+    };
+    return v;
+}
+
+static bool g5r_lookup(void *opaque, uint64_t esid, G5SVal *out)
+{
+    ppc_slb_t *slb = slb_lookup(opaque, esid);
+
+    if (!slb) {
+        return false;
+    }
+    *out = g5r_val(slb);
+    return true;
+}
+
+void g5r_fill(PowerPCCPU *cpu, int slot)
+{
+    G5RRow *r = g5r_row(CPU(cpu));
+    G5SVal v = g5r_val(&cpu->env.slb[slot]);
+
+    g5s_fill(&r->st, slot, &v);
+}
+
+static void g5r_store(PowerPCCPU *cpu, int slot)
+{
+    G5RRow *r = g5r_row(CPU(cpu));
+    ppc_slb_t *slb = &cpu->env.slb[slot];
+    bool valid = slb->esid & SLB_ESID_V;
+    G5SVal v = g5r_val(slb);
+
+    g5s_store(&r->st, slot, &v, valid, g5r_writer);
+    if (valid) {
+        for (int n = 0; n < cpu->hash64_opts->slb_size; n++) {
+            ppc_slb_t *o = &cpu->env.slb[n];
+
+            if (n != slot && o->esid == slb->esid &&
+                (o->vsid & SLB_VSID_B) == (slb->vsid & SLB_VSID_B)) {
+                r->dup_esid++;
+            }
+        }
+    }
+}
+
+/* does @page belong to a segment in S' (the TLB was emptied when S' was) */
+static bool g5r_page_ok(void *opaque, uint64_t page)
+{
+    G5RRow *r = opaque;
+    const G5SSet *sp = &r->st.sp;
+
+    for (uint32_t i = 0; i < sp->n; i++) {
+        bool is1t = (sp->v[i].vsid & SLB_VSID_B) == SLB_VSID_B_1T;
+        uint64_t mask = is1t ? SEGMENT_MASK_1T : SEGMENT_MASK_256M;
+
+        if ((page & mask) == sp->v[i].esid) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void g5r_consume(PowerPCCPU *cpu, uint32_t tag)
+{
+    CPUState *cs = CPU(cpu);
+    G5RRow *r;
+    uint32_t trig = g5l_fold_trig(tag);
+    uint32_t entry = (tag >> 6) & 7;
+    bool skip;
+
+    if (!cpu->hash64_opts) {
+        return;
+    }
+    r = g5r_row(cs);
+
+    if (entry > 4) {
+        entry = 0;      /* direct flushes do not come through here */
+    }
+    if (!r->st.sp.ovf && r->st.ncons % G5R_SCAN_EVERY == 0) {
+        r->inv_violation += g5r_scan(cs, G5R_SLB_IDX, g5r_page_ok, r,
+                                     &r->inv_scanned);
+    }
+    skip = g5s_consume(&r->st, trig == 0, g5r_lookup, cpu);
+    r->cons[trig][entry][r->st.cls_spp][r->st.cls_sp][r->st.cls_s][skip]++;
+    g5r_cur_valid = true;
+    g5r_cur_skip = skip;
+    g5r_cur_sp = r->st.cls_sp;
+}
+
+void g5r_after_flush(PowerPCCPU *cpu)
+{
+    G5RRow *r;
+
+    if (!cpu->hash64_opts) {
+        return;
+    }
+    r = g5r_row(CPU(cpu));
+
+    g5s_after_flush(&r->st);
+    g5r_cur_valid = false;
+}
+
+static void g5r_reset(CPUState *cs, uint32_t asked)
+{
+    PowerPCCPU *cpu = POWERPC_CPU(cs);
+    G5RRow *r;
+    G5SVal valid[64];
+    uint32_t n = 0;
+
+    if (!cpu->hash64_opts) {
+        return;
+    }
+    r = g5r_row(cs);
+
+    if ((asked & G5R_SLB_IDX) != G5R_SLB_IDX) {
+        r->reset_skip++;
+        return;
+    }
+    r->reset++;
+    for (int i = 0; i < cpu->hash64_opts->slb_size && n < 64; i++) {
+        if (cpu->env.slb[i].esid & SLB_ESID_V) {
+            valid[n++] = g5r_val(&cpu->env.slb[i]);
+        }
+    }
+    g5s_reset(&r->st, g5r_cur_valid && g5r_cur_skip, valid, n);
+}
+
+static void g5r_dump(void *opaque)
+{
+    GString *buf = opaque;
+    static const char *const late_names[] = {
+        "slbmte", "mtsr", "other"
+    };
+    static const char *const set_names[] = { "spp", "sp", "s" };
+
+    for (int c = 0; c < G5R_MAXCPU; c++) {
+        G5RRow *r = &g5r_rows[c];
+        const G5SSet *sets[3] = { &r->st.spp, &r->st.sp, &r->st.s };
+
+        if (!r->used) {
+            continue;
+        }
+        for (int t = 0; t < 3; t++)
+        for (int e = 0; e < 5; e++)
+        for (int a = 0; a < G5S_NCLS; a++)
+        for (int b = 0; b < G5S_NCLS; b++)
+        for (int d = 0; d < G5S_NCLS; d++)
+        for (int k = 0; k < 2; k++) {
+            if (r->cons[t][e][a][b][d][k]) {
+                g_string_append_printf(buf,
+                    "G5R cons cpu=%d trig=%s entry=%s spp=%s sp=%s s=%s"
+                    " skip=%d n=%" PRIu64 "\n", c, g5r_trig_names[t],
+                    g5r_entry_names[e], g5r_cls_names[a], g5r_cls_names[b],
+                    g5r_cls_names[d], k, r->cons[t][e][a][b][d][k]);
+            }
+        }
+        for (int w = 0; w < G5S_NWRITER; w++) {
+            g_string_append_printf(buf, "G5R late cpu=%d by=%s n=%" PRIu64
+                                   "\n", c, late_names[w], r->st.late[w]);
+        }
+        g_string_append_printf(buf, "G5R late cpu=%d by=never n=%" PRIu64
+                               "\n", c, r->st.never);
+        g_string_append_printf(buf, "G5R late cpu=%d by=pend_ovf n=%" PRIu64
+                               "\n", c, r->st.pend_ovf);
+        for (int s = 0; s < 3; s++) {
+            g_string_append_printf(buf,
+                "G5R sets cpu=%d set=%s novf=%" PRIu64 " nclr=%" PRIu64 "\n",
+                c, set_names[s], sets[s]->novf, sets[s]->nclr);
+        }
+        g_string_append_printf(buf, "G5R reset cpu=%d kind=reset n=%" PRIu64
+                               "\n", c, r->reset);
+        g_string_append_printf(buf, "G5R reset cpu=%d kind=reset_skip n=%"
+                               PRIu64 "\n", c, r->reset_skip);
+        g_string_append_printf(buf, "G5R chk cpu=%d what=dup_esid n=%" PRIu64
+                               "\n", c, r->dup_esid);
+        g_string_append_printf(buf, "G5R chk cpu=%d what=inv_violation n=%"
+                               PRIu64 "\n", c, r->inv_violation);
+        g_string_append_printf(buf, "G5R chk cpu=%d what=inv_scanned n=%"
+                               PRIu64 "\n", c, r->inv_scanned);
+        g_string_append_printf(buf, "G5R chk cpu=%d what=thread n=%" PRIu64
+                               "\n", c, r->thread);
+    }
+}

@@ -120,4 +120,26 @@ void g5l_slbdump_line(CPUState *cpu, bool before, int idx, uint64_t esid,
 /* Append "G5L ..." lines to @buf (a GString *). */
 void g5l_dump(void *buf);
 
+/*
+ * qemu-g5 #385: classification of the flush being issued on this thread by
+ * check_tlb_flush (set by target/ppc around tlb_flush*; valid = false when
+ * the flush did not come from a classified consumption).
+ */
+#define G5R_SP_NONE 6
+extern __thread bool g5r_cur_valid;
+extern __thread bool g5r_cur_skip;
+extern __thread uint8_t g5r_cur_sp;        /* G5S_C_* of S' */
+/* Called at the end of every flush work with the mmu_idx map it was asked. */
+extern void (*g5r_reset_hook)(CPUState *cpu, uint32_t asked);
+/* Appends the "G5R ..." lines of target/ppc. */
+extern void (*g5r_dump_hook)(void *buf);
+/*
+ * Walks the live entries (main and victim) of the mmu_idx in @idxmask and
+ * calls @ok on each page; returns the pages for which @ok returned false.
+ * *@scanned is increased by the pages visited.
+ */
+uint64_t g5r_scan(CPUState *cpu, uint32_t idxmask,
+                  bool (*ok)(void *opaque, uint64_t page), void *opaque,
+                  uint64_t *scanned);
+
 #endif

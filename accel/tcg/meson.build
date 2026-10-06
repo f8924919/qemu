@@ -31,6 +31,7 @@ system_ss.add(files(
   'cputlb.c',
   'g5-fillcnt.c',
   'g5-flushcnt.c',
+  'g5-slbset.c',
   'icount-common.c',
   'monitor.c',
   'tcg-accel-ops.c',
