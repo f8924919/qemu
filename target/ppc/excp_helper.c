@@ -30,6 +30,7 @@
 #include "qemu/plugin.h"
 
 #include "trace.h"
+#include "g5-fpcnt.h"
 
 /*****************************************************************************/
 /* Exception processing */
@@ -1519,6 +1520,8 @@ static void powerpc_excp_books(PowerPCCPU *cpu, int excp)
     case POWERPC_EXCP_PROGRAM:   /* Program exception                        */
         switch (env->error_code & ~0xF) {
         case POWERPC_EXCP_FP:
+            g5fp_exc(env, env->error_code & 0xf,
+                     FIELD_EX64_FE(env->msr) && FIELD_EX64(env->msr, MSR, FP));
             if (!FIELD_EX64_FE(env->msr) || !FIELD_EX64(env->msr, MSR, FP)) {
                 trace_ppc_excp_fp_ignore();
                 powerpc_reset_excp_state(cpu);

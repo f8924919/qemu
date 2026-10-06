@@ -16,6 +16,7 @@
 #include "tcg/tcg.h"
 #include "internal-common.h"
 #include "tb-context.h"
+#include "exec/g5-fpdump.h"
 #include <math.h>
 
 static void dump_drift_info(GString *buf)
@@ -160,7 +161,13 @@ static void tcg_dump_flush_info(GString *buf)
     g_string_append_printf(buf, "TLB full flushes    %zu\n", flush_full);
     g_string_append_printf(buf, "TLB partial flushes %zu\n", flush_part);
     g_string_append_printf(buf, "TLB elided flushes  %zu\n", flush_elide);
+    if (g5fp_dump_hook) {
+        g5fp_dump_hook(buf);
+    }
 }
+
+/* qemu-g5 #387 (measurement only) */
+void (*g5fp_dump_hook)(GString *buf);
 
 static void dump_exec_info(GString *buf)
 {

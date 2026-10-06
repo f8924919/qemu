@@ -21,6 +21,7 @@
 #include "exec/helper-proto.h"
 #include "internal.h"
 #include "fpu/softfloat.h"
+#include "g5-fpcnt.h"
 
 static inline float128 float128_snan_to_qnan(float128 x)
 {
@@ -184,6 +185,7 @@ static void finish_invalid_op_excp(CPUPPCState *env, int op, uintptr_t retaddr)
     if (env->fpscr & FP_VE) {
         /* Update the floating-point enabled exception summary */
         env->fpscr |= FP_FEX;
+        g5fp_excreq(env, op, fp_exceptions_enabled(env));
         if (fp_exceptions_enabled(env)) {
             raise_exception_err_ra(env, POWERPC_EXCP_PROGRAM,
                                    POWERPC_EXCP_FP | op, retaddr);
@@ -270,6 +272,7 @@ static void float_invalid_op_vxvc(CPUPPCState *env, bool set_fpcc,
 
         cs->exception_index = POWERPC_EXCP_PROGRAM;
         env->error_code = POWERPC_EXCP_FP | POWERPC_EXCP_FP_VXVC;
+        g5fp_excreq(env, POWERPC_EXCP_FP_VXVC, fp_exceptions_enabled(env));
         /* Update the floating-point enabled exception summary */
         env->fpscr |= FP_FEX;
         /* Exception is deferred */
@@ -300,6 +303,7 @@ static inline void float_zero_divide_excp(CPUPPCState *env, uintptr_t raddr)
     if (env->fpscr & FP_ZE) {
         /* Update the floating-point enabled exception summary */
         env->fpscr |= FP_FEX;
+        g5fp_excreq(env, POWERPC_EXCP_FP_ZX, fp_exceptions_enabled(env));
         if (fp_exceptions_enabled(env)) {
             raise_exception_err_ra(env, POWERPC_EXCP_PROGRAM,
                                    POWERPC_EXCP_FP | POWERPC_EXCP_FP_ZX,
@@ -323,6 +327,7 @@ static inline int float_overflow_excp(CPUPPCState *env)
         /* We must update the target FPR before raising the exception */
         cs->exception_index = POWERPC_EXCP_PROGRAM;
         env->error_code = POWERPC_EXCP_FP | POWERPC_EXCP_FP_OX;
+        g5fp_excreq(env, POWERPC_EXCP_FP_OX, fp_exceptions_enabled(env));
     }
 
     return overflow_enabled ? 0 : float_flag_inexact;
@@ -341,6 +346,7 @@ static inline void float_underflow_excp(CPUPPCState *env)
         /* We must update the target FPR before raising the exception */
         cs->exception_index = POWERPC_EXCP_PROGRAM;
         env->error_code = POWERPC_EXCP_FP | POWERPC_EXCP_FP_UX;
+        g5fp_excreq(env, POWERPC_EXCP_FP_UX, fp_exceptions_enabled(env));
     }
 }
 
@@ -357,6 +363,7 @@ static inline void float_inexact_excp(CPUPPCState *env)
         /* We must update the target FPR before raising the exception */
         cs->exception_index = POWERPC_EXCP_PROGRAM;
         env->error_code = POWERPC_EXCP_FP | POWERPC_EXCP_FP_XX;
+        g5fp_excreq(env, POWERPC_EXCP_FP_XX, fp_exceptions_enabled(env));
     }
 }
 
@@ -433,6 +440,7 @@ static void do_fpscr_check_status(CPUPPCState *env, uintptr_t raddr)
     cs->exception_index = POWERPC_EXCP_PROGRAM;
     env->error_code = error | POWERPC_EXCP_FP;
     env->fpscr |= FP_FEX;
+    g5fp_excreq(env, error, fp_exceptions_enabled(env));
     /* Deferred floating-point exception after target FPSCR update */
     if (fp_exceptions_enabled(env)) {
         raise_exception_err_ra(env, cs->exception_index,
@@ -484,6 +492,7 @@ static void do_float_check_status(CPUPPCState *env, bool change_fi,
 static inline void ppc_fp_reset(CPUPPCState *env)
 {
     set_float_exception_flags(0, &env->fp_status);
+    g5fp_entry(env);
 }
 
 static inline QEMU_ALWAYS_INLINE
@@ -596,6 +605,7 @@ void helper_##op(CPUPPCState *env, ppc_vsr_t *t, float64 arg)          \
 {                                                                      \
     ppc_fp_reset(env);                                                 \
     uint64_t ret = float64_to_##cvt(arg, &env->fp_status);             \
+    g5fp_op(env, G5FP_##op, arg, 0, 0, ret, 0);                        \
     int flags = get_float_exception_flags(&env->fp_status);            \
     if (unlikely(flags & float_flag_invalid)) {                        \
         ret = float_invalid_cvt(env, flags, ret, nanval, 1, GETPC());  \
@@ -629,6 +639,7 @@ void helper_##op(CPUPPCState *env, ppc_vsr_t *t, uint64_t arg) \
     } else {                                               \
         farg.d = cvtr(arg, &env->fp_status);               \
     }                                                      \
+    g5fp_op(env, G5FP_##op, arg, 0, 0, farg.ll, 0);        \
     do_float_check_status(env, true, GETPC());             \
     ppc_fp_finish(env, t, farg.ll, set_fprf, GETPC());     \
 }
@@ -639,14 +650,16 @@ FPU_FCFI(FCFIDU, uint64_to_float64, 0, false)
 FPU_FCFI(FCFIDUS, uint64_to_float32, 1, false)
 
 static uint64_t do_fri(CPUPPCState *env, uint64_t arg,
-                       FloatRoundMode rounding_mode, uintptr_t ra)
+                       FloatRoundMode rounding_mode, uintptr_t ra, int g5h)
 {
     FloatRoundMode old_rounding_mode = get_float_rounding_mode(&env->fp_status);
     int flags;
+    uint64_t in = arg;
 
     set_float_rounding_mode(rounding_mode, &env->fp_status);
     arg = float64_round_to_int(arg, &env->fp_status);
     set_float_rounding_mode(old_rounding_mode, &env->fp_status);
+    g5fp_op(env, g5h, in, 0, 0, arg, 0);
 
     flags = get_float_exception_flags(&env->fp_status);
     if (flags & float_flag_invalid_snan) {
@@ -665,7 +678,7 @@ void helper_FRIN(CPUPPCState *env, ppc_vsr_t *t, uint64_t arg)
     uintptr_t ra = GETPC();
 
     ppc_fp_reset(env);
-    ppc_fp_finish(env, t, do_fri(env, arg, float_round_ties_away, ra), true,
+    ppc_fp_finish(env, t, do_fri(env, arg, float_round_ties_away, ra, G5FP_FRIN), true,
                   ra);
 }
 
@@ -674,7 +687,7 @@ void helper_FRIZ(CPUPPCState *env, ppc_vsr_t *t, uint64_t arg)
     uintptr_t ra = GETPC();
 
     ppc_fp_reset(env);
-    ppc_fp_finish(env, t, do_fri(env, arg, float_round_to_zero, ra), true, ra);
+    ppc_fp_finish(env, t, do_fri(env, arg, float_round_to_zero, ra, G5FP_FRIZ), true, ra);
 }
 
 void helper_FRIP(CPUPPCState *env, ppc_vsr_t *t, uint64_t arg)
@@ -682,7 +695,7 @@ void helper_FRIP(CPUPPCState *env, ppc_vsr_t *t, uint64_t arg)
     uintptr_t ra = GETPC();
 
     ppc_fp_reset(env);
-    ppc_fp_finish(env, t, do_fri(env, arg, float_round_up, ra), true, ra);
+    ppc_fp_finish(env, t, do_fri(env, arg, float_round_up, ra, G5FP_FRIP), true, ra);
 }
 
 void helper_FRIM(CPUPPCState *env, ppc_vsr_t *t, uint64_t arg)
@@ -690,7 +703,7 @@ void helper_FRIM(CPUPPCState *env, ppc_vsr_t *t, uint64_t arg)
     uintptr_t ra = GETPC();
 
     ppc_fp_reset(env);
-    ppc_fp_finish(env, t, do_fri(env, arg, float_round_down, ra), true, ra);
+    ppc_fp_finish(env, t, do_fri(env, arg, float_round_down, ra, G5FP_FRIM), true, ra);
 }
 
 static void float_invalid_op_madd(CPUPPCState *env, int flags,
@@ -704,9 +717,10 @@ static void float_invalid_op_madd(CPUPPCState *env, int flags,
 }
 
 static float64 do_fmadd(CPUPPCState *env, float64 a, float64 b,
-                         float64 c, int madd_flags, uintptr_t retaddr)
+                         float64 c, int madd_flags, uintptr_t retaddr, int g5h)
 {
     float64 ret = float64_muladd(a, b, c, madd_flags, &env->fp_status);
+    g5fp_op(env, g5h, a, b, c, ret, 0);
     int flags = get_float_exception_flags(&env->fp_status);
 
     if (unlikely(flags & float_flag_invalid)) {
@@ -716,9 +730,10 @@ static float64 do_fmadd(CPUPPCState *env, float64 a, float64 b,
 }
 
 static uint64_t do_fmadds(CPUPPCState *env, float64 a, float64 b,
-                          float64 c, int madd_flags, uintptr_t retaddr)
+                          float64 c, int madd_flags, uintptr_t retaddr, int g5h)
 {
     float64 ret = float64r32_muladd(a, b, c, madd_flags, &env->fp_status);
+    g5fp_op(env, g5h, a, b, c, ret, 0);
     int flags = get_float_exception_flags(&env->fp_status);
 
     if (unlikely(flags & float_flag_invalid)) {
@@ -734,7 +749,7 @@ static uint64_t do_fmadds(CPUPPCState *env, float64 a, float64 b,
         uintptr_t ra = GETPC();                                      \
         ppc_fp_reset(env);                                           \
         ppc_fp_finish(env, t,                                        \
-                      do_fmadd(env, arg1, arg2, arg3, madd_flags, ra), \
+                      do_fmadd(env, arg1, arg2, arg3, madd_flags, ra, G5FP_##op), \
                       true, ra);                                     \
     }                                                                \
     void helper_##op##S(CPUPPCState *env, ppc_vsr_t *t, uint64_t arg1, \
@@ -743,7 +758,7 @@ static uint64_t do_fmadds(CPUPPCState *env, float64 a, float64 b,
         uintptr_t ra = GETPC();                                      \
         ppc_fp_reset(env);                                           \
         ppc_fp_finish(env, t,                                        \
-                      do_fmadds(env, arg1, arg2, arg3, madd_flags, ra), \
+                      do_fmadds(env, arg1, arg2, arg3, madd_flags, ra, G5FP_##op##S), \
                       true, ra);                                     \
     }
 
@@ -763,6 +778,7 @@ static uint64_t do_frsp(CPUPPCState *env, uint64_t arg, uintptr_t retaddr)
     float32 f32 = float64_to_float32(arg, &env->fp_status);
     int flags = get_float_exception_flags(&env->fp_status);
 
+    g5fp_op(env, G5FP_FRSP, arg, 0, 0, 0, 0);
     if (unlikely(flags & float_flag_invalid_snan)) {
         float_invalid_op_vxsnan(env, retaddr);
     }
@@ -790,6 +806,7 @@ void helper_##name(CPUPPCState *env, ppc_vsr_t *t, float64 arg)               \
 {                                                                             \
     ppc_fp_reset(env);                                                        \
     float64 ret = op(arg, &env->fp_status);                                   \
+    g5fp_op(env, G5FP_##name, arg, 0, 0, ret, 0);                             \
     int flags = get_float_exception_flags(&env->fp_status);                   \
                                                                               \
     if (unlikely(flags & float_flag_invalid)) {                               \
@@ -808,6 +825,7 @@ void helper_##name(CPUPPCState *env, ppc_vsr_t *t, float64 arg)               \
     /* "Estimate" the reciprocal with actual division.  */                    \
     ppc_fp_reset(env);                                                        \
     float64 ret = op(float64_one, arg, &env->fp_status);                      \
+    g5fp_op(env, G5FP_##name, float64_one, arg, 0, ret, 0);                   \
     int flags = get_float_exception_flags(&env->fp_status);                   \
                                                                               \
     if (unlikely(flags & float_flag_invalid_snan)) {                          \
@@ -829,6 +847,7 @@ void helper_##name(CPUPPCState *env, ppc_vsr_t *t, float64 arg)               \
     ppc_fp_reset(env);                                                        \
     float64 rets = float64_sqrt(arg, &env->fp_status);                        \
     float64 retd = op(float64_one, rets, &env->fp_status);                    \
+    g5fp_op(env, G5FP_##name, arg, 0, 0, retd, rets);                         \
     int flags = get_float_exception_flags(&env->fp_status);                   \
                                                                               \
     if (unlikely(flags & float_flag_invalid)) {                               \
@@ -848,6 +867,7 @@ void helper_##name(CPUPPCState *env, ppc_vsr_t *t, float64 arg1,              \
 {                                                                             \
     ppc_fp_reset(env);                                                        \
     float64 ret = op(arg1, arg2, &env->fp_status);                            \
+    g5fp_op(env, G5FP_##name, arg1, arg2, 0, ret, 0);                         \
     int flags = get_float_exception_flags(&env->fp_status);                   \
     uintptr_t ra = GETPC();                                                   \
     flags_handler(env, flags, ra);                                            \
@@ -970,6 +990,7 @@ void helper_FCMPU(CPUPPCState *env, uint64_t arg1, uint64_t arg2,
         ret = 0x02UL;
     }
 
+    g5fp_op(env, G5FP_FCMPU, arg1, arg2, 0, 0, 0);
     env->fpscr &= ~FP_FPCC;
     env->fpscr |= ret << FPSCR_FPCC;
     env->crf[crfD] = ret;
@@ -1003,6 +1024,7 @@ void helper_FCMPO(CPUPPCState *env, uint64_t arg1, uint64_t arg2,
         ret = 0x02UL;
     }
 
+    g5fp_op(env, G5FP_FCMPO, arg1, arg2, 0, 0, 0);
     env->fpscr &= ~FP_FPCC;
     env->fpscr |= ret << FPSCR_FPCC;
     env->crf[crfD] = (uint32_t) ret;

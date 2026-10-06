@@ -21,16 +21,25 @@ static TCGv_ptr gen_fpr_ptr(int reg)
     return r;
 }
 
+/* qemu-g5 #387 (measurement only) */
+static void gen_g5fp_tr(DisasContext *ctx, int kind, int arg)
+{
+    gen_helper_g5fp_tr(tcg_env,
+                       tcg_constant_i32(G5FP_TR_CODE(kind, arg, ctx->pr)));
+}
+
 #if defined(TARGET_PPC64)
 static void gen_set_cr1_from_fpscr(DisasContext *ctx)
 {
     TCGv_i32 tmp = tcg_temp_new_i32();
+    gen_g5fp_tr(ctx, G5FP_TR_CR1, 0);
     tcg_gen_trunc_tl_i32(tmp, cpu_fpscr);
     tcg_gen_shri_i32(cpu_crf[1], tmp, 28);
 }
 #else
 static void gen_set_cr1_from_fpscr(DisasContext *ctx)
 {
+    gen_g5fp_tr(ctx, G5FP_TR_CR1, 0);
     tcg_gen_shri_tl(cpu_crf[1], cpu_fpscr, 28);
 }
 #endif
@@ -363,6 +372,7 @@ static void gen_mcrfs(DisasContext *ctx)
         return;
     }
     bfa = crfS(ctx->opcode);
+    gen_g5fp_tr(ctx, G5FP_TR_MCRFS, bfa);
     nibble = 7 - bfa;
     shift = 4 * nibble;
     tcg_gen_shri_tl(tmp, cpu_fpscr, shift);
@@ -422,6 +432,7 @@ static bool trans_MFFS(DisasContext *ctx, arg_X_t_rc *a)
     REQUIRE_FPU(ctx);
 
     gen_reset_fpstatus();
+    gen_g5fp_tr(ctx, G5FP_TR_MFFS, 0);
     place_from_fpscr(a->rt, UINT64_MAX);
     if (a->rc) {
         gen_set_cr1_from_fpscr(ctx);
@@ -436,6 +447,7 @@ static bool trans_MFFSCE(DisasContext *ctx, arg_X_t *a)
     REQUIRE_FPU(ctx);
 
     gen_reset_fpstatus();
+    gen_g5fp_tr(ctx, G5FP_TR_MFFSCE, 0);
     fpscr = place_from_fpscr(a->rt, UINT64_MAX);
     store_fpscr_masked(fpscr, FP_ENABLES, tcg_constant_i64(0), 0x0003);
     return true;
@@ -452,6 +464,7 @@ static bool trans_MFFSCRN(DisasContext *ctx, arg_X_tb *a)
     tcg_gen_andi_i64(t1, t1, FP_RN);
 
     gen_reset_fpstatus();
+    gen_g5fp_tr(ctx, G5FP_TR_MFFSCRN, 0);
     fpscr = place_from_fpscr(a->rt, FP_DRN | FP_ENABLES | FP_NI | FP_RN);
     store_fpscr_masked(fpscr, FP_RN, t1, 0x0001);
     return true;
@@ -468,6 +481,7 @@ static bool trans_MFFSCDRN(DisasContext *ctx, arg_X_tb *a)
     tcg_gen_andi_i64(t1, t1, FP_DRN);
 
     gen_reset_fpstatus();
+    gen_g5fp_tr(ctx, G5FP_TR_MFFSCDRN, 0);
     fpscr = place_from_fpscr(a->rt, FP_DRN | FP_ENABLES | FP_NI | FP_RN);
     store_fpscr_masked(fpscr, FP_DRN, t1, 0x0100);
     return true;
@@ -483,6 +497,7 @@ static bool trans_MFFSCRNI(DisasContext *ctx, arg_X_imm2 *a)
     tcg_gen_movi_i64(t1, a->imm);
 
     gen_reset_fpstatus();
+    gen_g5fp_tr(ctx, G5FP_TR_MFFSCRNI, 0);
     fpscr = place_from_fpscr(a->rt, FP_DRN | FP_ENABLES | FP_NI | FP_RN);
     store_fpscr_masked(fpscr, FP_RN, t1, 0x0001);
     return true;
@@ -498,6 +513,7 @@ static bool trans_MFFSCDRNI(DisasContext *ctx, arg_X_imm3 *a)
     tcg_gen_movi_i64(t1, (uint64_t)a->imm << FPSCR_DRN0);
 
     gen_reset_fpstatus();
+    gen_g5fp_tr(ctx, G5FP_TR_MFFSCDRNI, 0);
     fpscr = place_from_fpscr(a->rt, FP_DRN | FP_ENABLES | FP_NI | FP_RN);
     store_fpscr_masked(fpscr, FP_DRN, t1, 0x0100);
     return true;
@@ -508,6 +524,7 @@ static bool trans_MFFSL(DisasContext *ctx, arg_X_t *a)
     REQUIRE_FPU(ctx);
 
     gen_reset_fpstatus();
+    gen_g5fp_tr(ctx, G5FP_TR_MFFSL, 0);
     place_from_fpscr(a->rt, FP_DRN | FP_STATUS | FP_ENABLES | FP_NI | FP_RN);
     return true;
 }
@@ -522,11 +539,13 @@ static void gen_mtfsb0(DisasContext *ctx)
         return;
     }
     crb = 31 - crbD(ctx->opcode);
+    gen_g5fp_tr(ctx, G5FP_TR_MTFSB0, crb);
     gen_reset_fpstatus();
     if (likely(crb != FPSCR_FEX && crb != FPSCR_VX)) {
         gen_helper_fpscr_clrbit(tcg_env, tcg_constant_i32(crb));
     }
     if (unlikely(Rc(ctx->opcode) != 0)) {
+        gen_g5fp_tr(ctx, G5FP_TR_CR1MTFS, G5FP_TR_MTFSB0);
         tcg_gen_trunc_tl_i32(cpu_crf[1], cpu_fpscr);
         tcg_gen_shri_i32(cpu_crf[1], cpu_crf[1], FPSCR_OX);
     }
@@ -542,11 +561,13 @@ static void gen_mtfsb1(DisasContext *ctx)
         return;
     }
     crb = 31 - crbD(ctx->opcode);
+    gen_g5fp_tr(ctx, G5FP_TR_MTFSB1, crb);
     /* XXX: we pretend we can only do IEEE floating-point computations */
     if (likely(crb != FPSCR_FEX && crb != FPSCR_VX && crb != FPSCR_NI)) {
         gen_helper_fpscr_setbit(tcg_env, tcg_constant_i32(crb));
     }
     if (unlikely(Rc(ctx->opcode) != 0)) {
+        gen_g5fp_tr(ctx, G5FP_TR_CR1MTFS, G5FP_TR_MTFSB1);
         tcg_gen_trunc_tl_i32(cpu_crf[1], cpu_fpscr);
         tcg_gen_shri_i32(cpu_crf[1], cpu_crf[1], FPSCR_OX);
     }
@@ -568,6 +589,7 @@ static void gen_mtfsf(DisasContext *ctx)
     flm = FPFLM(ctx->opcode);
     l = FPL(ctx->opcode);
     w = FPW(ctx->opcode);
+    gen_g5fp_tr(ctx, G5FP_TR_MTFSF, flm | (l << 8));
     if (unlikely(w & !(ctx->insns_flags2 & PPC2_ISA205))) {
         gen_inval_exception(ctx, POWERPC_EXCP_INVAL_INVAL);
         return;
@@ -583,6 +605,7 @@ static void gen_mtfsf(DisasContext *ctx)
     get_fpr(t1, rB(ctx->opcode));
     gen_helper_store_fpscr(tcg_env, t1, t0);
     if (unlikely(Rc(ctx->opcode) != 0)) {
+        gen_g5fp_tr(ctx, G5FP_TR_CR1MTFS, G5FP_TR_MTFSF);
         tcg_gen_trunc_tl_i32(cpu_crf[1], cpu_fpscr);
         tcg_gen_shri_i32(cpu_crf[1], cpu_crf[1], FPSCR_OX);
     }
@@ -603,6 +626,7 @@ static void gen_mtfsfi(DisasContext *ctx)
     }
     w = FPW(ctx->opcode);
     bf = FPBF(ctx->opcode);
+    gen_g5fp_tr(ctx, G5FP_TR_MTFSFI, bf | (w << 3));
     if (unlikely(w & !(ctx->insns_flags2 & PPC2_ISA205))) {
         gen_inval_exception(ctx, POWERPC_EXCP_INVAL_INVAL);
         return;
@@ -612,6 +636,7 @@ static void gen_mtfsfi(DisasContext *ctx)
     t1 = tcg_constant_i32(1 << sh);
     gen_helper_store_fpscr(tcg_env, t0, t1);
     if (unlikely(Rc(ctx->opcode) != 0)) {
+        gen_g5fp_tr(ctx, G5FP_TR_CR1MTFS, G5FP_TR_MTFSFI);
         tcg_gen_trunc_tl_i32(cpu_crf[1], cpu_fpscr);
         tcg_gen_shri_i32(cpu_crf[1], cpu_crf[1], FPSCR_OX);
     }

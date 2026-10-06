@@ -32,6 +32,7 @@
 #include "exec/translator.h"
 #include "exec/translation-block.h"
 #include "exec/log.h"
+#include "g5-fpcnt.h"
 #include "qemu/atomic128.h"
 #include "spr_common.h"
 #include "power8-pmu.h"

@@ -11,6 +11,8 @@ ppc_ss.add(files(
 ppc_ss.add(when: 'CONFIG_TCG', if_true: files(
   'dfp_helper.c',
   'fpu_helper.c',
+  'g5-fpcnt.c',
+  'g5-fpelig.c',
   'int_helper.c',
   'mem_helper.c',
   'misc_helper.c',

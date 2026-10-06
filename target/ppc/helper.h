@@ -89,6 +89,8 @@ DEF_HELPER_FLAGS_2(brinc, TCG_CALL_NO_RWG_SE, tl, tl, tl)
 
 DEF_HELPER_1(fpscr_check_status, void, env)
 DEF_HELPER_1(reset_fpstatus, void, env)
+/* qemu-g5 #387 (measurement only): reads env->fpscr */
+DEF_HELPER_FLAGS_2(g5fp_tr, TCG_CALL_NO_WG, void, env, i32)
 DEF_HELPER_2(compute_fprf_float64, void, env, i64)
 DEF_HELPER_3(store_fpscr, void, env, i64, i32)
 DEF_HELPER_2(fpscr_clrbit, void, env, i32)
