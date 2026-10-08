@@ -50,6 +50,7 @@
 #define PCI_STATUS_CAP_LIST  0x10
 #define PCI_CFG_CAP_PTR      0x34
 #define PCI_CAP_ID_AGP       0x02
+#define U3_AGP_CAP_OFFSET    0x80    /* where the U3 bridge puts it */
 
 /* fw_cfg lives at ISA port 0x510 of the AGP domain */
 #define FW_CFG_CTL        (U3_AGP_BASE + 0x510)
@@ -375,6 +376,77 @@ static uint32_t agp_find_capability(QTestState *qts, int dev, uint8_t id)
     return 0;
 }
 
+static void agp_cfg_writel(QTestState *qts, int dev, uint32_t off,
+                           uint32_t val)
+{
+    qtest_writel(qts, U3_AGP_CFG_ADDR, bswap32(U3_AGP_CFA(dev, off & 0xf8)));
+    qtest_writel(qts, U3_AGP_CFG_DATA + (off & 4), bswap32(val));
+}
+
+/*
+ * Registers of the U3 AGP bridge past the AGP capability: the GART
+ * (0x8c-0x94, 0xa4) and the internal status (0x98).  A card that is an
+ * AGP master is what makes them come alive; see check_agp_bridge_idle().
+ */
+#define U3_AGP_GART_BASE        0x8c
+#define U3_AGP_AGP_BASE         0x90
+#define U3_AGP_GART_CTRL        0x94
+#define U3_AGP_INTERNAL_STATUS  0x98
+#define U3_AGP_DUMMY_PAGE       0xa4
+#define U3_AGP_GART_CTRL_INV    0x00000001
+#define U3_AGP_GART_CTRL_EN     0x00000100
+
+static const uint32_t u3_agp_gart_regs[] = {
+    U3_AGP_GART_BASE, U3_AGP_AGP_BASE, U3_AGP_GART_CTRL,
+    U3_AGP_INTERNAL_STATUS, U3_AGP_DUMMY_PAGE,
+};
+
+/*
+ * With no AGP master below it, the U3 AGP bridge has to look exactly the
+ * way it always has: an AGP 2.0 capability that supports no rate and
+ * cannot be enabled, and nothing behind the GART registers.  That is the
+ * honest description of a bridge whose only clients are a VGA adapter
+ * and a USB controller, neither of which does AGP transfers.
+ */
+static void check_agp_bridge_idle(QTestState *qts)
+{
+    uint32_t status = agp_cfg_readl(qts, 11, PCI_CFG_STATUS) >> 16;
+    uint32_t cap;
+    int i;
+
+    g_assert_cmphex(status & PCI_STATUS_CAP_LIST, ==, PCI_STATUS_CAP_LIST);
+
+    cap = agp_find_capability(qts, 11, PCI_CAP_ID_AGP);
+    g_assert_cmphex(cap, ==, U3_AGP_CAP_OFFSET);
+
+    /* AGP 2.0: the highest revision that claims nothing more */
+    g_assert_cmphex((agp_cfg_readl(qts, 11, cap) >> 16) & 0xff, ==, 0x20);
+    g_assert_cmphex(agp_cfg_readl(qts, 11, cap + 4), ==, 0);
+    g_assert_cmphex(agp_cfg_readl(qts, 11, cap + 8), ==, 0);
+
+    /* The command register cannot turn AGP on */
+    agp_cfg_writel(qts, 11, cap + 8, 0xffffffff);
+    g_assert_cmphex(agp_cfg_readl(qts, 11, cap + 8), ==, 0);
+
+    /*
+     * Nothing is behind the GART registers: they read as zero and, like
+     * the rest of the device-specific config space, merely hold what is
+     * written - in particular an invalidate does not complete and the
+     * internal status never reports idle.
+     */
+    for (i = 0; i < ARRAY_SIZE(u3_agp_gart_regs); i++) {
+        uint32_t off = u3_agp_gart_regs[i];
+
+        g_assert_cmphex(agp_cfg_readl(qts, 11, off), ==, 0);
+        agp_cfg_writel(qts, 11, off, 0x5a5a0101);
+        g_assert_cmphex(agp_cfg_readl(qts, 11, off), ==, 0x5a5a0101);
+        agp_cfg_writel(qts, 11, off, 0);
+    }
+
+    /* kMacRISCPCIAddressSelect still names the 0x80000000 region only */
+    g_assert_cmphex(agp_cfg_readl(qts, 11, 0x48), ==, 0x01000000);
+}
+
 /*
  * The U3 AGP host bridge must advertise an AGP capability.  Without it
  * AppleMacRiscAGP::configure() bails out and Mac OS X never brings up the
@@ -383,20 +455,108 @@ static uint32_t agp_find_capability(QTestState *qts, int dev, uint8_t id)
 static void test_agp_capability(void)
 {
     QTestState *qts = qtest_init("-machine powermac7_3");
-    uint32_t status = agp_cfg_readl(qts, 11, PCI_CFG_STATUS) >> 16;
-    uint32_t cap;
 
-    g_assert_cmphex(status & PCI_STATUS_CAP_LIST, ==, PCI_STATUS_CAP_LIST);
+    check_agp_bridge_idle(qts);
+    qtest_quit(qts);
+}
+
+/* mac99 + 970fx shares the U3 AGP bridge and must not change either */
+static void test_mac99_970_agp_capability(void)
+{
+    QTestState *qts = qtest_init("-machine mac99 -cpu 970fx");
+
+    check_agp_bridge_idle(qts);
+    qtest_quit(qts);
+}
+
+/* The AGP slot of the U3, where an AGP card goes */
+#define U3_AGP_SLOT             0x10
+
+/*
+ * An AGP 2.0 card (the R350's own capability says 2.0) in the AGP slot
+ * makes the bridge describe the port it now drives: AGP 3.0 on the U3,
+ * with the rate bits read in AGP 2.0 mode (1x/2x/4x), and a GART the
+ * guest can program.
+ */
+static void test_agp_master_r350(void)
+{
+    QTestState *qts;
+    uint32_t cap;
+    int i;
+
+    if (!qtest_has_device("ati-radeon9800")) {
+        g_test_skip("ati-radeon9800 not available");
+        return;
+    }
+    qts = qtest_init("-machine powermac7_3 -vga none "
+                     "-device ati-radeon9800,bus=pci.1,addr=0x10");
+
+    /* The card itself is where the test put it, on the AGP bus */
+    g_assert_cmphex(agp_cfg_readl(qts, U3_AGP_SLOT, 0), ==,
+                    (0x4e48 << 16) | 0x1002);
 
     cap = agp_find_capability(qts, 11, PCI_CAP_ID_AGP);
-    g_assert_cmphex(cap, !=, 0);
+    g_assert_cmphex(cap, ==, U3_AGP_CAP_OFFSET);
+    g_assert_cmphex((agp_cfg_readl(qts, 11, cap) >> 16) & 0xff, ==, 0x30);
+    /* RQ 32, sideband, 4x/2x/1x */
+    g_assert_cmphex(agp_cfg_readl(qts, 11, cap + 4), ==, 0x1f000207);
+
+    /* The command register takes the bits a driver enables AGP with */
+    agp_cfg_writel(qts, 11, cap + 8, 0xffffffff);
+    g_assert_cmphex(agp_cfg_readl(qts, 11, cap + 8), ==, 0xff000317);
+
+    /* The GART registers hold what is written ... */
+    agp_cfg_writel(qts, 11, U3_AGP_GART_BASE, 0x12345004);
+    agp_cfg_writel(qts, 11, U3_AGP_AGP_BASE, 0x80000001);
+    agp_cfg_writel(qts, 11, U3_AGP_DUMMY_PAGE, 0x00012345);
+    g_assert_cmphex(agp_cfg_readl(qts, 11, U3_AGP_GART_BASE), ==, 0x12345004);
+    g_assert_cmphex(agp_cfg_readl(qts, 11, U3_AGP_AGP_BASE), ==, 0x80000001);
+    g_assert_cmphex(agp_cfg_readl(qts, 11, U3_AGP_DUMMY_PAGE), ==, 0x00012345);
+
+    /* ... an invalidate completes at once, the enable bit stays */
+    agp_cfg_writel(qts, 11, U3_AGP_GART_CTRL,
+                   U3_AGP_GART_CTRL_EN | U3_AGP_GART_CTRL_INV);
+    g_assert_cmphex(agp_cfg_readl(qts, 11, U3_AGP_GART_CTRL), ==,
+                    U3_AGP_GART_CTRL_EN);
+
+    /* ... and the engine always reports idle */
+    g_assert_cmphex(agp_cfg_readl(qts, 11, U3_AGP_INTERNAL_STATUS), ==, 1);
 
     /*
-     * Mac OS X only checks that the capability exists, but leaving the
-     * revision at zero would advertise a nonexistent AGP revision.
+     * A reset from inside the guest has to take the GART down with it;
+     * the generic PCI reset does not touch these offsets.
      */
-    g_assert_cmphex((agp_cfg_readl(qts, 11, cap) >> 20) & 0xf, !=, 0);
+    qtest_qmp_assert_success(qts, "{ 'execute': 'system_reset' }");
+    qtest_qmp_eventwait(qts, "RESET");
+    g_assert_cmphex(agp_cfg_readl(qts, 11, cap + 8), ==, 0);
+    for (i = 0; i < ARRAY_SIZE(u3_agp_gart_regs); i++) {
+        uint32_t off = u3_agp_gart_regs[i];
 
+        g_assert_cmphex(agp_cfg_readl(qts, 11, off), ==,
+                        off == U3_AGP_INTERNAL_STATUS ? 1 : 0);
+    }
+    /* ... but the bridge still describes the card it drives */
+    g_assert_cmphex((agp_cfg_readl(qts, 11, cap) >> 16) & 0xff, ==, 0x30);
+
+    qtest_quit(qts);
+}
+
+/*
+ * The same card on the HyperTransport side (pci.0 on powermac7_3) is
+ * nothing to the AGP bridge, which stays as it was.
+ */
+static void test_agp_master_on_ht(void)
+{
+    QTestState *qts;
+
+    if (!qtest_has_device("ati-radeon9800")) {
+        g_test_skip("ati-radeon9800 not available");
+        return;
+    }
+    qts = qtest_init("-machine powermac7_3 -vga none "
+                     "-device ati-radeon9800,bus=pci.0,addr=0x5");
+
+    check_agp_bridge_idle(qts);
     qtest_quit(qts);
 }
 
@@ -498,6 +658,10 @@ int main(int argc, char **argv)
     qtest_add_func("/u3-ht/agp-io-mapped", test_agp_io_mapped);
     qtest_add_func("/u3-ht/agp-config", test_agp_config);
     qtest_add_func("/u3-ht/agp-capability", test_agp_capability);
+    qtest_add_func("/u3-ht/mac99-970-agp-capability",
+                   test_mac99_970_agp_capability);
+    qtest_add_func("/u3-ht/agp-master-r350", test_agp_master_r350);
+    qtest_add_func("/u3-ht/agp-master-on-ht", test_agp_master_on_ht);
     qtest_add_func("/u3-ht/mac99-g4-no-agp-capability",
                    test_mac99_g4_no_agp_capability);
     qtest_add_func("/u3-ht/fw-cfg-not-shadowed", test_fw_cfg_not_shadowed);
