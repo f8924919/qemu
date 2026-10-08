@@ -31,11 +31,107 @@
 #include "hw/pci/pci_bridge.h"
 #include "hw/pci/pci_bus.h"
 #include "hw/pci-host/uninorth.h"
+#include "migration/blocker.h"
+#include "qapi/error.h"
+#include "qemu/error-report.h"
+#include "qemu/units.h"
+#include "system/address-spaces.h"
+#include "system/system.h"
 #include "trace.h"
+
+/*
+ * U3 AGP GART, in the AGP host bridge's config space.  GART_BASE holds the
+ * table's physical address with the aperture size in 4 MB units in its low
+ * bits; AGP_BASE holds the aperture's 256 MB index on the bus in its top
+ * nibble and bits 35:32 of the table address in its low bits.  Entries are
+ * big-endian: bit 31 valid, the page number below.  Only AGP transactions
+ * are translated; everything else goes straight to system memory, as there
+ * is no DART behind the bridge.
+ *
+ * The registers only come alive when an AGP master sits on the bus (see
+ * u3_agp_machine_done()); otherwise the bridge looks as it always has.
+ */
+#define TYPE_U3_AGP_IOMMU_MEMORY_REGION "u3-agp-iommu-memory-region"
+
+#define U3_CFG_AGP_COMMAND      (U3_AGP_CAP_OFFSET + PCI_AGP_COMMAND)
+#define U3_CFG_GART_BASE        0x8c
+#define U3_CFG_AGP_BASE         0x90
+#define U3_CFG_GART_CTRL        0x94
+#define U3_CFG_INTERNAL_STATUS  0x98
+#define U3_CFG_DUMMY_PAGE       0xa4
+
+#define U3_GART_CTRL_INV        0x00000001
+#define U3_GART_CTRL_EN         0x00000100
+
+#define U3_INTERNAL_STATUS_IDLE 0x00000001
+
+#define U3_GART_ENTRY_VALID     0x80000000
+#define U3_GART_PAGE_SHIFT      12
+#define U3_GART_PAGE_MASK       ((1ULL << U3_GART_PAGE_SHIFT) - 1)
+#define U3_GART_BYTES_PER_UNIT  (4 * MiB)
+
+/*
+ * Where the AGP capability sits in the U3 bridge's config space.  Anything
+ * past the Apple-specific registers at 0x48-0x4b will do; 0x80 is the offset
+ * the UniNorth bridge below was going to use.
+ */
+#define U3_AGP_CAP_OFFSET  0x80
+
+static IOMMUTLBEntry u3_agp_translate(IOMMUMemoryRegion *iommu, hwaddr addr,
+                                      IOMMUAccessFlags flag, int iommu_idx)
+{
+    UNINHostState *s = container_of(iommu, UNINHostState, agp_iommu);
+    const uint8_t *cfg = s->agp_bridge->config;
+    uint32_t gart_base = pci_get_long(cfg + U3_CFG_GART_BASE);
+    uint32_t agp_base = pci_get_long(cfg + U3_CFG_AGP_BASE);
+    uint32_t dummy = pci_get_long(cfg + U3_CFG_DUMMY_PAGE);
+    uint64_t size = (uint64_t)(gart_base & U3_GART_PAGE_MASK) *
+                    U3_GART_BYTES_PER_UNIT;
+    uint64_t base = agp_base & 0xf0000000;
+    uint64_t table, page;
+    uint32_t entry;
+    IOMMUTLBEntry ret = {
+        .target_as = &address_space_memory,
+        .iova = addr & ~U3_GART_PAGE_MASK,
+        .translated_addr = addr & ~U3_GART_PAGE_MASK,
+        .addr_mask = U3_GART_PAGE_MASK,
+        .perm = IOMMU_RW,
+    };
+
+    if (!s->agp_master ||
+        !(pci_get_long(cfg + U3_CFG_GART_CTRL) & U3_GART_CTRL_EN) ||
+        addr < base || addr - base >= size) {
+        return ret;
+    }
+
+    table = (gart_base & ~U3_GART_PAGE_MASK) |
+            ((uint64_t)(agp_base & 0xf) << 32);
+    page = (addr - base) >> U3_GART_PAGE_SHIFT;
+    entry = ldl_be_phys(&address_space_memory, table + page * 4);
+    trace_u3_agp_gart_translate(addr, entry);
+    if (entry & U3_GART_ENTRY_VALID) {
+        ret.translated_addr = (uint64_t)(entry & ~U3_GART_ENTRY_VALID)
+                              << U3_GART_PAGE_SHIFT;
+    } else if (dummy) {
+        ret.translated_addr = (uint64_t)dummy << U3_GART_PAGE_SHIFT;
+    } else {
+        ret.perm = IOMMU_NONE;
+    }
+    return ret;
+}
 
 static int pci_unin_map_irq(PCIDevice *pci_dev, int irq_num)
 {
     return (irq_num + (pci_dev->devfn >> 3)) & 3;
+}
+
+/* The U3 AGP slot has an interrupt line of its own (powermac7_3) */
+static int pci_u3_agp_map_irq(PCIDevice *pci_dev, int irq_num)
+{
+    if (PCI_SLOT(pci_dev->devfn) == U3_AGP_SLOT) {
+        return U3_AGP_SLOT_IRQ_LINE;
+    }
+    return pci_unin_map_irq(pci_dev, irq_num);
 }
 
 static void pci_unin_set_irq(void *opaque, int irq_num, int level)
@@ -166,19 +262,94 @@ static void pci_unin_main_init(Object *obj)
     qdev_init_gpio_out(DEVICE(obj), s->irqs, ARRAY_SIZE(s->irqs));
 }
 
+static void u3_agp_find_master(PCIBus *bus, PCIDevice *dev, void *opaque)
+{
+    PCIDevice **master = opaque;
+
+    if (dev->devfn != PCI_DEVFN(11, 0) && !*master &&
+        pci_find_capability(dev, PCI_CAP_ID_AGP)) {
+        *master = dev;
+    }
+}
+
+/*
+ * Without an AGP master the bridge keeps the capability it always had: AGP
+ * 2.0, no rate, AGP disabled, which is all a VGA adapter and a USB
+ * controller need (Mac OS X only checks that the capability exists).  A
+ * card that does AGP transfers gets the port it can drive: AGP 3.0, as the
+ * U3 reports, with the rate bits read in AGP 2.0 mode (1x/2x/4x) when the
+ * card itself is an AGP 2.0 one, and a GART the guest can program.  Cards
+ * are realized before machine init is done and the AGP bus cannot be
+ * hotplugged, so the answer does not change afterwards.
+ */
+static void u3_agp_machine_done(Notifier *notifier, void *data)
+{
+    UNINHostState *s = container_of(notifier, UNINHostState, machine_done);
+    PCIBus *bus = PCI_HOST_BRIDGE(s)->bus;
+    PCIDevice *d = s->agp_bridge;
+    PCIDevice *master = NULL;
+    uint8_t cap = U3_AGP_CAP_OFFSET;
+    uint8_t card_cap;
+    uint32_t status;
+
+    pci_for_each_device(bus, pci_bus_num(bus), u3_agp_find_master, &master);
+    if (!master) {
+        return;
+    }
+
+    card_cap = pci_find_capability(master, PCI_CAP_ID_AGP);
+    status = 0x1f000000 | PCI_AGP_STATUS_SBA;
+    if (pci_get_long(master->config + card_cap + PCI_AGP_STATUS) & (1 << 3)) {
+        /* AGP 3.0 mode: RATE1/RATE2 mean 4x/8x */
+        status |= (1 << 3) | PCI_AGP_STATUS_RATE2 | PCI_AGP_STATUS_RATE1;
+    } else {
+        status |= PCI_AGP_STATUS_RATE4 | PCI_AGP_STATUS_RATE2 |
+                  PCI_AGP_STATUS_RATE1;
+    }
+
+    d->config[cap + PCI_AGP_VERSION] = 0x30;
+    pci_set_long(d->config + cap + PCI_AGP_STATUS, status);
+    pci_set_long(d->wmask + cap + PCI_AGP_COMMAND,
+                 0xff000000 | PCI_AGP_COMMAND_SBA | PCI_AGP_COMMAND_AGP |
+                 PCI_AGP_COMMAND_FW | PCI_AGP_COMMAND_RATE4 |
+                 PCI_AGP_COMMAND_RATE2 | PCI_AGP_COMMAND_RATE1);
+    pci_set_long(d->config + U3_CFG_INTERNAL_STATUS, U3_INTERNAL_STATUS_IDLE);
+    pci_set_long(d->wmask + U3_CFG_INTERNAL_STATUS, 0);
+    s->agp_master = true;
+    trace_u3_agp_master(master->devfn, status);
+
+    /* Nothing carries the GART across a migration */
+    error_setg(&s->migration_blocker,
+               "U3 AGP GART state is not migratable (AGP card present)");
+    if (migrate_add_blocker(&s->migration_blocker, NULL) < 0) {
+        error_report("u3-agp: cannot block migration with an AGP card");
+    }
+}
+
 static void pci_u3_agp_realize(DeviceState *dev, Error **errp)
 {
     UNINHostState *s = U3_AGP_HOST_BRIDGE(dev);
     PCIHostState *h = PCI_HOST_BRIDGE(dev);
 
     h->bus = pci_register_root_bus(dev, NULL,
-                                   pci_unin_set_irq, pci_unin_map_irq,
+                                   pci_unin_set_irq,
+                                   s->agp_slot_irq ? pci_u3_agp_map_irq
+                                                   : pci_unin_map_irq,
                                    s,
                                    &s->pci_mmio,
                                    &s->pci_io,
-                                   PCI_DEVFN(11, 0), 4, TYPE_PCI_BUS);
+                                   PCI_DEVFN(11, 0),
+                                   s->agp_slot_irq ? 5 : 4, TYPE_PCI_BUS);
 
-    pci_create_simple(h->bus, PCI_DEVFN(11, 0), "u3-agp");
+    /* AGP transactions; a card finds this as its host's "agp-gart" */
+    memory_region_init_iommu(&s->agp_iommu, sizeof(s->agp_iommu),
+                             TYPE_U3_AGP_IOMMU_MEMORY_REGION, OBJECT(s),
+                             "agp-gart", UINT64_MAX);
+
+    s->agp_bridge = pci_create_simple(h->bus, PCI_DEVFN(11, 0), "u3-agp");
+
+    s->machine_done.notify = u3_agp_machine_done;
+    qemu_add_machine_init_done_notifier(&s->machine_done);
 }
 
 static void pci_u3_agp_init(Object *obj)
@@ -449,13 +620,6 @@ static void unin_main_pci_host_realize(PCIDevice *d, Error **errp)
     d->config[0x4b] = 0x1;
 }
 
-/*
- * Where the AGP capability sits in the U3 bridge's config space.  Anything
- * past the Apple-specific registers at 0x48-0x4b will do; 0x80 is the offset
- * the UniNorth bridge below was going to use.
- */
-#define U3_AGP_CAP_OFFSET  0x80
-
 static void unin_agp_pci_host_realize(PCIDevice *d, Error **errp)
 {
     d->config[PCI_CACHE_LINE_SIZE] = 0x08;
@@ -507,6 +671,48 @@ static void u3_agp_pci_host_realize(PCIDevice *d, Error **errp)
      * emulated at all.
      */
     d->config[U3_AGP_CAP_OFFSET + PCI_AGP_VERSION] = 0x20;
+}
+
+static UNINHostState *u3_agp_host(PCIDevice *d)
+{
+    return U3_AGP_HOST_BRIDGE(pci_get_bus(d)->qbus.parent);
+}
+
+static void u3_agp_pci_host_config_write(PCIDevice *d, uint32_t addr,
+                                         uint32_t val, int len)
+{
+    UNINHostState *s = u3_agp_host(d);
+
+    pci_default_write_config(d, addr, val, len);
+    if (!s->agp_master ||
+        !ranges_overlap(addr, len, U3_CFG_GART_BASE,
+                        U3_CFG_DUMMY_PAGE + 4 - U3_CFG_GART_BASE)) {
+        return;
+    }
+    trace_u3_agp_gart_cfg(pci_get_long(d->config + U3_CFG_GART_BASE),
+                          pci_get_long(d->config + U3_CFG_AGP_BASE),
+                          pci_get_long(d->config + U3_CFG_GART_CTRL),
+                          pci_get_long(d->config + U3_CFG_DUMMY_PAGE));
+    /* Nothing caches translations, so an invalidate completes at once */
+    d->config[U3_CFG_GART_CTRL] &= ~U3_GART_CTRL_INV;
+}
+
+/*
+ * The generic PCI reset leaves the device-specific config space alone, so
+ * with an AGP card the GART would survive a reboot of the guest.  Without
+ * one these offsets are plain storage and are left as they always were.
+ */
+static void u3_agp_pci_host_reset(DeviceState *dev)
+{
+    PCIDevice *d = PCI_DEVICE(dev);
+
+    if (!u3_agp_host(d)->agp_master) {
+        return;
+    }
+    pci_set_long(d->config + U3_CFG_AGP_COMMAND, 0);
+    memset(d->config + U3_CFG_GART_BASE, 0,
+           U3_CFG_INTERNAL_STATUS - U3_CFG_GART_BASE);
+    pci_set_long(d->config + U3_CFG_DUMMY_PAGE, 0);
 }
 
 static void u3_ht_pci_host_realize(PCIDevice *d, Error **errp)
@@ -568,8 +774,10 @@ static void u3_agp_pci_host_class_init(ObjectClass *klass, const void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     k->realize   = u3_agp_pci_host_realize;
+    k->config_write = u3_agp_pci_host_config_write;
     k->vendor_id = PCI_VENDOR_ID_APPLE;
     k->device_id = PCI_DEVICE_ID_APPLE_U3_AGP;
+    device_class_set_legacy_reset(dc, u3_agp_pci_host_reset);
     k->revision  = 0x00;
     k->class_id  = PCI_CLASS_BRIDGE_HOST;
     /*
@@ -735,12 +943,31 @@ static const TypeInfo pci_unin_main_info = {
     .class_init    = pci_unin_main_class_init,
 };
 
+static const Property pci_u3_agp_properties[] = {
+    DEFINE_PROP_BOOL("agp-slot-irq", UNINHostState, agp_slot_irq, false),
+};
+
 static void pci_u3_agp_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = pci_u3_agp_realize;
+    device_class_set_props(dc, pci_u3_agp_properties);
 }
+
+static void u3_agp_iommu_memory_region_class_init(ObjectClass *klass,
+                                                  const void *data)
+{
+    IOMMUMemoryRegionClass *imrc = IOMMU_MEMORY_REGION_CLASS(klass);
+
+    imrc->translate = u3_agp_translate;
+}
+
+static const TypeInfo u3_agp_iommu_memory_region_info = {
+    .parent = TYPE_IOMMU_MEMORY_REGION,
+    .name = TYPE_U3_AGP_IOMMU_MEMORY_REGION,
+    .class_init = u3_agp_iommu_memory_region_class_init,
+};
 
 static const TypeInfo pci_u3_agp_info = {
     .name          = TYPE_U3_AGP_HOST_BRIDGE,
@@ -872,6 +1099,7 @@ static void unin_register_types(void)
 
     type_register_static(&pci_unin_main_info);
     type_register_static(&pci_u3_agp_info);
+    type_register_static(&u3_agp_iommu_memory_region_info);
     type_register_static(&pci_u3_ht_info);
     type_register_static(&pci_unin_agp_info);
     type_register_static(&pci_unin_internal_info);

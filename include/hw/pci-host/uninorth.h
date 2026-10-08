@@ -56,14 +56,31 @@ DECLARE_INSTANCE_CHECKER(UNINHostState, UNI_NORTH_INTERNAL_PCI_HOST_BRIDGE,
 DECLARE_INSTANCE_CHECKER(UNINHostState, U3_AGP_HOST_BRIDGE,
                          TYPE_U3_AGP_HOST_BRIDGE)
 
+/*
+ * The AGP slot of the U3 (device 0x10) has an interrupt line of its own,
+ * the fifth output of the AGP host bridge; powermac7_3 wires it to mpic
+ * input 0x30 and asks for it with the "agp-slot-irq" property.
+ */
+#define U3_AGP_SLOT             0x10
+#define U3_AGP_SLOT_IRQ_LINE    4
+#define U3_AGP_SLOT_IRQ         0x30
+
 struct UNINHostState {
     PCIHostState parent_obj;
 
     uint32_t ofw_addr;
-    qemu_irq irqs[4];
+    qemu_irq irqs[5];
     MemoryRegion pci_mmio;
     MemoryRegion pci_hole;
     MemoryRegion pci_io;
+
+    /* U3 AGP only */
+    bool agp_slot_irq;
+    PCIDevice *agp_bridge;
+    bool agp_master;
+    IOMMUMemoryRegion agp_iommu;
+    Notifier machine_done;
+    Error *migration_blocker;
 };
 
 /*

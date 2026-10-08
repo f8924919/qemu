@@ -474,6 +474,10 @@ static void ppc_core99_init(MachineState *machine)
         }
         /* Uninorth AGP bus */
         uninorth_pci_dev = qdev_new(TYPE_U3_AGP_HOST_BRIDGE);
+        if (core99_machine->has_u3_ht) {
+            /* The AGP slot's own interrupt line, mpic 0x30 (below) */
+            qdev_prop_set_bit(uninorth_pci_dev, "agp-slot-irq", true);
+        }
         s = SYS_BUS_DEVICE(uninorth_pci_dev);
         sysbus_realize_and_unref(s, &error_fatal);
         sysbus_mmio_map(s, 0, 0xf0800000);
@@ -605,6 +609,11 @@ static void ppc_core99_init(MachineState *machine)
     for (i = 0; i < 4; i++) {
         qdev_connect_gpio_out(uninorth_pci_dev, i,
                               qdev_get_gpio_in(pic_dev, 0x1b + i));
+    }
+    if (core99_machine->has_u3_ht) {
+        /* Must match the AGP slot entry of the firmware's interrupt-map */
+        qdev_connect_gpio_out(uninorth_pci_dev, U3_AGP_SLOT_IRQ_LINE,
+                              qdev_get_gpio_in(pic_dev, U3_AGP_SLOT_IRQ));
     }
     if (u3_ht_dev) {
         /*
