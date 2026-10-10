@@ -727,7 +727,14 @@ static void usb_hid_initfn(USBDevice *dev, int kind,
 
 static void usb_tablet_realize(USBDevice *dev, Error **errp)
 {
+    USBHIDState *us = USB_HID(dev);
 
+    /* 100 collapses the surviving band to a single value, more inverts it */
+    if (us->hid.abs_trim_pct >= 100) {
+        error_setg(errp, "abs-trim-percent must be below 100 (got %u)",
+                   us->hid.abs_trim_pct);
+        return;
+    }
     usb_hid_initfn(dev, HID_TABLET, &desc_tablet, &desc_tablet2, errp);
 }
 
@@ -797,6 +804,7 @@ static const Property usb_tablet_properties[] = {
         DEFINE_PROP_UINT32("usb_version", USBHIDState, usb_version, 2),
         DEFINE_PROP_STRING("display", USBHIDState, display),
         DEFINE_PROP_UINT32("head", USBHIDState, head, 0),
+        DEFINE_PROP_UINT8("abs-trim-percent", USBHIDState, hid.abs_trim_pct, 0),
 };
 
 static void usb_tablet_class_initfn(ObjectClass *klass, const void *data)

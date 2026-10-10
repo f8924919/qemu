@@ -45,6 +45,7 @@ ps2_mouse_reset(void *opaque) "%p"
 # hid.c
 hid_kbd_queue_full(void) "queue full"
 hid_kbd_queue_empty(void) "queue empty"
+hid_pointer_abs(int axis, int in, int out) "axis %d in %d out %d"
 
 # virtio-input.c
 virtio_input_queue_full(void) "queue full"

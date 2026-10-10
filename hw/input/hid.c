@@ -108,6 +108,36 @@ void hid_set_next_idle(HIDState *hs)
     }
 }
 
+/*
+ * Some guests do not map the tablet's logical range edge to edge: the
+ * IOHIDEventDriver of Mac OS X 10.4.11 (IOHIDFamily 1.4.13) drops
+ * (max - min) * 15 / 200 from each end of an absolute axis and stretches
+ * what is left over the screen, with no property to turn it off (10.5
+ * defaults to the same 15% but lets AbsoluteAxisBoundsRemovalPercentage
+ * override it).  The pointer then lands up to 1/0.85 times further from
+ * the centre than where it was sent.  With abs-trim-percent set to the
+ * percentage such a guest removes, squeeze the value into the band that
+ * survives the trim, using the guest's own integer arithmetic, so the
+ * two cancel out.  0 (the default) passes the value through untouched.
+ */
+static int hid_abs_trim(HIDState *hs, InputAxis axis, int value)
+{
+    int64_t lo, hi, a;
+    int out;
+
+    if (!hs->abs_trim_pct) {
+        out = value;
+    } else {
+        a = MAX(INPUT_EVENT_ABS_MIN, MIN(INPUT_EVENT_ABS_MAX, value));
+        lo = (int64_t)INPUT_EVENT_ABS_MAX * hs->abs_trim_pct / 200;
+        hi = INPUT_EVENT_ABS_MAX - lo;
+        out = lo + (a * (hi - lo) + INPUT_EVENT_ABS_MAX / 2) /
+              INPUT_EVENT_ABS_MAX;
+    }
+    trace_hid_pointer_abs(axis, value, out);
+    return out;
+}
+
 static void hid_pointer_event(DeviceState *dev, QemuConsole *src,
                               QemuInputEvent *evt)
 {
@@ -135,9 +165,9 @@ static void hid_pointer_event(DeviceState *dev, QemuConsole *src,
 
     case INPUT_EVENT_KIND_ABS:
         if (evt->abs.axis == INPUT_AXIS_X) {
-            e->xdx = evt->abs.value;
+            e->xdx = hid_abs_trim(hs, evt->abs.axis, evt->abs.value);
         } else if (evt->abs.axis == INPUT_AXIS_Y) {
-            e->ydy = evt->abs.value;
+            e->ydy = hid_abs_trim(hs, evt->abs.axis, evt->abs.value);
         }
         break;
 

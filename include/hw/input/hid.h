@@ -43,6 +43,8 @@ struct HIDState {
     int32_t protocol;
     uint8_t idle;
     bool idle_pending;
+    /* config, not state: percent of an absolute axis to compress into */
+    uint8_t abs_trim_pct;
     QEMUTimer *idle_timer;
     HIDEventFunc event;
     QemuInputHandlerState *s;
