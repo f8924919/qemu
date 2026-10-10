@@ -197,6 +197,7 @@ qtests_ppc64 = \
   (config_all_devices.has_key('CONFIG_USB_UHCI') ? ['usb-hcd-uhci-test'] : []) +             \
   (config_all_devices.has_key('CONFIG_USB_XHCI_NEC') ? ['usb-hcd-xhci-test'] : []) +         \
   (config_all_devices.has_key('CONFIG_MAC_NEWWORLD') and config_all_devices.has_key('CONFIG_PCI_TESTDEV') ? ['u3-ht-test'] : []) + \
+  (config_all_devices.has_key('CONFIG_ATI_R350') and config_all_devices.has_key('CONFIG_PSERIES') ? ['ati-r350-test'] : []) + \
   (config_all_devices.has_key('CONFIG_MAC_NEWWORLD') ? ['powermac7_3-smp-test'] : []) + \
   (config_all_devices.has_key('CONFIG_MAC_NEWWORLD') ? ['keywest-i2c-test'] : []) + \
   (config_all_devices.has_key('CONFIG_MAC_NEWWORLD') ? ['macio-nvram-test'] : []) + \

@@ -3296,6 +3296,109 @@ static void ati_r350_pm4_run_ring(ATIR350State *s)
 }
 
 /*
+ * The SETUP_BODY of a 2D packet3 (Radeon R5xx Acceleration guide,
+ * rev 1.5, 6.2.2 -- the R5xx carries the R3xx 2D packets over): after
+ * the GUI_CONTROL dword come, each only when GUI_CONTROL asks for it
+ * and in this order, SRC_PITCH_OFFSET, DST_PITCH_OFFSET,
+ * SRC_SC_BOT_RITE, SC_TOP_LEFT + SC_BOT_RITE, the brush packet its
+ * BRUSH_TYPE calls for, and BRUSH_Y_X. Mac OS X 10.5's Quartz Composer
+ * "Shell" sends BITBLT_MULTI with DST_CLIPPING set, its scissor
+ * exactly bounding the one rectangle that follows; the CNTL_SCALING
+ * layout below has the scissor in the same place.
+ *
+ * Brush types the guide gives no packet size for (the reserved ones,
+ * and the 8x8 colour pattern, whose size the guide ties to the pixel
+ * size of a DST_TYPE it also calls unused by the microcode) leave
+ * everything after the scissor unlocated: -1.
+ */
+static int ati_r350_brush_packet_dwords(uint32_t gmc)
+{
+    switch ((gmc >> 4) & 0xf) {
+    case R350_BRUSH_8X8_MONO_FG_BG:
+        return 4;
+    case R350_BRUSH_8X8_MONO_FG_LA:
+    case R350_BRUSH_32X1_MONO_FG_BG:
+        return 3;
+    case R350_BRUSH_32X1_MONO_FG_LA:
+        return 2;
+    case R350_BRUSH_SOLID_COLOR:
+    case R350_BRUSH_SOLID_COLOR_14:
+        return 1;
+    case R350_BRUSH_NONE:
+        return 0;
+    default:
+        return -1;
+    }
+}
+
+static int ati_r350_setup_body_dwords(uint32_t gmc)
+{
+    int brush = ati_r350_brush_packet_dwords(gmc);
+
+    if (brush < 0) {
+        return -1;
+    }
+    return !!(gmc & R350_GMC_SRC_PITCH_OFFSET_CNTL) +
+           !!(gmc & R350_GMC_DST_PITCH_OFFSET_CNTL) +
+           !!(gmc & R350_GMC_SRC_CLIPPING) +
+           2 * !!(gmc & R350_GMC_DST_CLIPPING) +
+           brush + !!(gmc & R350_GMC_LD_BRUSH_Y_X);
+}
+
+/* The register SETUP_BODY dword idx loads, 0 when it cannot be located */
+static uint32_t ati_r350_setup_body_reg(uint32_t gmc, unsigned idx)
+{
+    static const uint32_t brush_regs[16][4] = {
+        [R350_BRUSH_8X8_MONO_FG_BG] = {
+            R350_DP_BRUSH_BKGD_CLR, R350_DP_BRUSH_FRGD_CLR,
+            R350_BRUSH_DATA0, R350_BRUSH_DATA0 + 4 },
+        [R350_BRUSH_8X8_MONO_FG_LA] = {
+            R350_DP_BRUSH_FRGD_CLR, R350_BRUSH_DATA0, R350_BRUSH_DATA0 + 4 },
+        [R350_BRUSH_32X1_MONO_FG_BG] = {
+            R350_DP_BRUSH_BKGD_CLR, R350_DP_BRUSH_FRGD_CLR, R350_BRUSH_DATA0 },
+        [R350_BRUSH_32X1_MONO_FG_LA] = {
+            R350_DP_BRUSH_FRGD_CLR, R350_BRUSH_DATA0 },
+        [R350_BRUSH_SOLID_COLOR] = { R350_DP_BRUSH_FRGD_CLR },
+        [R350_BRUSH_SOLID_COLOR_14] = { R350_DP_BRUSH_FRGD_CLR },
+    };
+    int brush;
+
+    if (gmc & R350_GMC_SRC_PITCH_OFFSET_CNTL) {
+        if (idx-- == 0) {
+            return R350_SRC_PITCH_OFFSET;
+        }
+    }
+    if (gmc & R350_GMC_DST_PITCH_OFFSET_CNTL) {
+        if (idx-- == 0) {
+            return R350_DST_PITCH_OFFSET;
+        }
+    }
+    if (gmc & R350_GMC_SRC_CLIPPING) {
+        if (idx-- == 0) {
+            return R350_SRC_SC_BOTTOM_RIGHT;
+        }
+    }
+    if (gmc & R350_GMC_DST_CLIPPING) {
+        if (idx < 2) {
+            return idx ? R350_SC_BOTTOM_RIGHT : R350_SC_TOP_LEFT;
+        }
+        idx -= 2;
+    }
+    brush = ati_r350_brush_packet_dwords(gmc);
+    if (brush < 0) {
+        return 0;
+    }
+    if (idx < brush) {
+        return brush_regs[(gmc >> 4) & 0xf][idx];
+    }
+    idx -= brush;
+    if ((gmc & R350_GMC_LD_BRUSH_Y_X) && idx == 0) {
+        return R350_BRUSH_Y_X;
+    }
+    return 0;
+}
+
+/*
  * PIO alternative to the ring above: the real driver actually pushes
  * its command stream straight through PM4_FIFO_DATA_EVEN/ODD (see the
  * comment on those in ati_r350_regs.h), one dword per write. Same
@@ -3505,45 +3608,46 @@ static void ati_r350_pm4_parse(ATIR350State *s,
             break;
         case R350_PM4_OPCODE_BITBLT_MULTI:
             /*
-             * The save-under half of a window drag: a context dword,
-             * the pitch/offset dwords the context itself announces
-             * (its SRC/DST_PITCH_OFFSET_CNTL bits, in SRC-then-DST
-             * order, as Linux's r128 DRM builds its swap packet), and
-             * then a RUN of three-dword rectangles -- the MULTI is
-             * not decoration: iTunes tiles a rounded-corner window
-             * with nine rectangles in one 29-dword packet, and
-             * stopping after the first copied a 1-pixel strip and
-             * dropped the 600x390 body. Mac OS X 10.4 sets both
-             * pitch/offset bits for its 16x16 pointer save/restore;
-             * reading that as one dword plus a rectangle turned the
-             * restore into "corruption growing from the top-left
-             * towards the mouse".
+             * The GUI_CONTROL dword, its SETUP_BODY (see
+             * ati_r350_setup_body_dwords()) and then a RUN of
+             * three-dword rectangles -- the MULTI is not decoration:
+             * iTunes tiles a rounded-corner window with nine rectangles
+             * in one 29-dword packet, and stopping after the first
+             * copied a 1-pixel strip and dropped the 600x390 body.
+             * Counting only the pitch/offset dwords of the SETUP_BODY
+             * took Shell's scissor for a rectangle and copied its
+             * 1024x768 frame as 0x0.
              *
              * The rectangle run is longer than p3_params, so each
              * three-dword rectangle is gathered in place and issued as
              * soon as it completes rather than buffering the packet.
-             * p3_params[3] counts the pitch/offset dwords the context
-             * announced, so the rectangle run is known to start at
-             * index 1 + that count.
+             * p3_params[3] holds the SETUP_BODY length (UINT32_MAX when
+             * the brush type leaves it unknown, and no rectangle is
+             * drawn), p3_params[4] the GUI_CONTROL dword.
              */
             if (p->p3_param_idx == 0) {
-                ati_r350_reg_write32(s, R350_DP_GUI_MASTER_CNTL, val);
-                p->p3_params[3] = 0;
-                if (val & R350_GMC_SRC_PITCH_OFFSET_CNTL) {
-                    p->p3_params[3]++;
-                }
-                if (val & R350_GMC_DST_PITCH_OFFSET_CNTL) {
-                    p->p3_params[3]++;
-                }
-                p->p3_params[4] = val;
-            } else if (p->p3_param_idx <= p->p3_params[3]) {
-                bool src_first = p->p3_params[4] &
-                                 R350_GMC_SRC_PITCH_OFFSET_CNTL;
+                int body = ati_r350_setup_body_dwords(val);
 
-                if (p->p3_param_idx == 1 && src_first) {
-                    ati_r350_reg_write32(s, R350_SRC_PITCH_OFFSET, val);
+                ati_r350_reg_write32(s, R350_DP_GUI_MASTER_CNTL, val);
+                p->p3_params[4] = val;
+                if (body < 0) {
+                    p->p3_params[3] = UINT32_MAX;
+                    trace_ati_r350_p3_bitblt_multi_skip(val, p->p3_total,
+                                                        "brush size unknown");
                 } else {
-                    ati_r350_reg_write32(s, R350_DST_PITCH_OFFSET, val);
+                    p->p3_params[3] = body;
+                    if (p->p3_total < 1 + body ||
+                        (p->p3_total - 1 - body) % 3) {
+                        trace_ati_r350_p3_bitblt_multi_skip(val, p->p3_total,
+                            "length not SETUP_BODY plus rectangles");
+                    }
+                }
+            } else if (p->p3_param_idx <= p->p3_params[3]) {
+                uint32_t reg = ati_r350_setup_body_reg(p->p3_params[4],
+                                                       p->p3_param_idx - 1);
+
+                if (reg) {
+                    ati_r350_reg_write32(s, reg, val);
                 }
             } else {
                 unsigned slot = (p->p3_param_idx - 1 - p->p3_params[3]) % 3;

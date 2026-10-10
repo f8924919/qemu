@@ -259,38 +259,37 @@
 #define R350_PM4_OPCODE_PAINT_MULTI   0x9a
 #define R350_PM4_OPCODE_BITBLT        0x92
 /*
- * CNTL_BITBLT_MULTI: BITBLT carrying its own destination pitch/offset, so
- * a run of copies can share one context dword. Mac OS X issues exactly one
- * of these per frame of a window drag -- while it went unimplemented the
- * copy simply never happened, and every later blit out of the driver's
- * offscreen surface propagated whatever stale content was left there.
- * That was the garbled window contents on this card.
+ * CNTL_BITBLT_MULTI: a run of copies sharing one GUI_CONTROL dword. Mac
+ * OS X issues exactly one of these per frame of a window drag -- while it
+ * went unimplemented the copy simply never happened, and every later
+ * blit out of the driver's offscreen surface propagated whatever stale
+ * content was left there. That was the garbled window contents on this
+ * card.
  *
- * Two header dwords and then a RUN of rectangles, three dwords each -- the
- * MULTI is not decoration:
- *   [0]      GMC (DP_GUI_MASTER_CNTL)
- *   [1]      SRC_PITCH_OFFSET (observed 0x10000400 = offset 0x8000, pitch
- *            128 -- the screen; see the ring parser for why this is the
- *            source and not the destination)
- *   [2+3k]   SRC_X_Y
- *   [3+3k]   DST_X_Y
- *   [4+3k]   DST_WIDTH_HEIGHT
+ * GUI_CONTROL, its SETUP_BODY (pitch/offsets, scissors, brush -- see
+ * ati_r350_setup_body_dwords()), and then a RUN of rectangles, three
+ * dwords each (Radeon R5xx Acceleration guide, 6.2.2.9) -- the MULTI is
+ * not decoration:
+ *   SRC_X_Y, DST_X_Y, DST_WIDTH_HEIGHT
  * X/WIDTH live in the HIGH half and Y/HEIGHT in the low half, the same way
  * round as PAINT_MULTI and plain BITBLT on this driver.
  *
- * Captured live, iTunes sends 29 dwords = 2 + NINE rectangles, and they
- * tile one window exactly: 590x1, 594x1, 596x1, 598x2, then 600x390, then
- * 598x2, 596x1, 594x1, 590x1, with the destination Y running 10, 11, 12,
- * 13, 15, 405, 407, 408, 409 -- contiguous, narrow at top and bottom and
- * wide in between. That is a rounded-corner window, the same shape the
- * BITBLT and PAINT_MULTI comments describe. Handling only the first
- * rectangle copied a single 1-pixel-high strip and threw away the 600x390
- * body, which is why window CHROME came out right while the CONTENTS were
- * garbage.
+ * Captured live, iTunes sends 29 dwords = GUI_CONTROL, SRC_PITCH_OFFSET
+ * and NINE rectangles, and they tile one window exactly: 590x1, 594x1,
+ * 596x1, 598x2, then 600x390, then 598x2, 596x1, 594x1, 590x1, with the
+ * destination Y running 10, 11, 12, 13, 15, 405, 407, 408, 409 --
+ * contiguous, narrow at top and bottom and wide in between. That is a
+ * rounded-corner window, the same shape the BITBLT and PAINT_MULTI
+ * comments describe. Handling only the first rectangle copied a single
+ * 1-pixel-high strip and threw away the 600x390 body, which is why window
+ * CHROME came out right while the CONTENTS were garbage.
+ *
+ * Mac OS X 10.5's Quartz Composer "Shell" sets DST_CLIPPING too:
+ *   52cc36fb 50003b40 50004740 00000000 03000400 00000000 00000000 04000300
+ * is SRC/DST_PITCH_OFFSET, SC_TOP_LEFT (0,0), SC_BOT_RITE (1024,768) and
+ * one 1024x768 rectangle.
  */
 #define R350_PM4_OPCODE_BITBLT_MULTI  0x9b
-/* header dwords plus at least one 3-dword rectangle */
-#define R350_BITBLT_MULTI_MIN_DWORDS  5
 /*
  * Rectangle-only blit continuation (not in any public register guide;
  * established from live OS X 10.4 window-drag captures). Three dwords
@@ -508,6 +507,8 @@
 #define R350_BRUSH_8X8_COLOR         10
 #define R350_BRUSH_1X8_COLOR         12
 #define R350_BRUSH_SOLID_COLOR       13
+/* the R5xx accel guide describes 14 exactly as 13: one colour dword */
+#define R350_BRUSH_SOLID_COLOR_14    14
 #define R350_BRUSH_NONE              15
 #define R350_DP_SRC_DATATYPE         0x00030000
 #define R350_DP_ROP3                 0x00ff0000
