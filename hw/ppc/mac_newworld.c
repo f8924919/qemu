@@ -568,6 +568,10 @@ static void ppc_core99_init(MachineState *machine)
          * describes the same registers from both places.
          */
         qdev_prop_set_bit(dev, "pic-in-bar", false);
+        /* The K2 carries the I2S-a sound cell; -M powermac7_3,audiodev= */
+        if (machine->audiodev) {
+            qdev_prop_set_string(dev, "audiodev", machine->audiodev);
+        }
     }
 
     dev = DEVICE(object_resolve_path_component(macio, "escc"));
@@ -997,6 +1001,7 @@ static void powermac7_3_machine_class_init(ObjectClass *oc, const void *data)
      * mac99 and the G4 machines uniprocessor.
      */
     mc->max_cpus = 2;
+    machine_add_audiodev_property(mc);
 }
 
 static void powermac7_3_instance_init(Object *obj)

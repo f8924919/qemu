@@ -32,6 +32,9 @@
 #include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "hw/char/escc.h"
+#include "hw/i2c/i2c.h"
+#include "hw/misc/macio/cs8420.h"
+#include "hw/misc/macio/tas3004.h"
 #include "hw/misc/macio/macio.h"
 #include "hw/intc/heathrow_pic.h"
 #include "trace.h"
@@ -502,20 +505,89 @@ static const TypeInfo macio_newworld_type_info = {
 };
 
 /*
- * The K2 KeyLargo differs from the plain KeyLargo only in the id it
- * reports.  Everything else - the child devices, the properties, the
- * migration state - comes from the parent type.
+ * On top of the plain KeyLargo, the K2 reports its own id and carries the
+ * sound: the I2S-a cell with the feature control registers, and a second
+ * Keywest i2c (the "deq" bus) with the TAS3004 and the CS8420 behind it.
+ * The migration state of the macio itself stays the parent's, so mac99
+ * streams are unaffected; the sound cell migrates as its own device.
  */
+static void macio_k2_realize(PCIDevice *d, Error **errp)
+{
+    K2MacIOState *ks = K2_MACIO(d);
+    NewWorldMacIOState *ns = NEWWORLD_MACIO(d);
+    MacIOState *s = MACIO(d);
+    PCIDeviceClass *pdc = PCI_DEVICE_GET_CLASS(d);
+    PCIDeviceClass *parent_pdc =
+        PCI_DEVICE_CLASS(object_class_get_parent(OBJECT_CLASS(pdc)));
+    DeviceState *pic_dev = DEVICE(&ns->pic);
+    DeviceState *i2c_dev;
+    SysBusDevice *sbd;
+    I2CBus *bus;
+    I2CSlave *codec;
+    Error *local_err = NULL;
+
+    parent_pdc->realize(d, &local_err);
+    if (local_err) {
+        error_propagate(errp, local_err);
+        return;
+    }
+
+    /* The deq bus: one channel, registers 16 bytes apart */
+    i2c_dev = qdev_new("keywest-i2c");
+    qdev_prop_set_uint8(i2c_dev, "reg-shift", 4);
+    qdev_prop_set_uint8(i2c_dev, "num-channels", 1);
+    object_property_add_child(OBJECT(d), "i2c", OBJECT(i2c_dev));
+    sbd = SYS_BUS_DEVICE(i2c_dev);
+    if (!sysbus_realize_and_unref(sbd, errp)) {
+        return;
+    }
+    memory_region_add_subregion(&s->bar, K2_I2C_BASE,
+                                sysbus_mmio_get_region(sbd, 0));
+    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(pic_dev, K2_I2C_IRQ));
+
+    bus = I2C_BUS(qdev_get_child_bus(i2c_dev, "i2c0"));
+    codec = i2c_slave_create_simple(bus, TYPE_TAS3004, TAS3004_I2C_ADDR);
+    i2c_slave_create_simple(bus, TYPE_CS8420, CS8420_I2C_ADDR);
+
+    /* I2S-a and the feature control registers */
+    object_property_set_link(OBJECT(&ks->i2s), "codec", OBJECT(codec),
+                             &error_abort);
+    object_property_set_link(OBJECT(&ks->i2s), "dbdma", OBJECT(&s->dbdma),
+                             &error_abort);
+    if (!qdev_realize(DEVICE(&ks->i2s), BUS(&s->macio_bus), errp)) {
+        return;
+    }
+    sbd = SYS_BUS_DEVICE(&ks->i2s);
+    memory_region_add_subregion(&s->bar, K2_FCR_BASE,
+                                sysbus_mmio_get_region(sbd, 0));
+    memory_region_add_subregion(&s->bar, K2_I2S_BASE,
+                                sysbus_mmio_get_region(sbd, 1));
+    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(pic_dev, K2_I2S_TX_DMA_IRQ));
+    sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(pic_dev, K2_I2S_RX_DMA_IRQ));
+}
+
+static void macio_k2_init(Object *obj)
+{
+    K2MacIOState *ks = K2_MACIO(obj);
+
+    object_initialize_child(obj, "i2s", &ks->i2s, TYPE_K2_I2S);
+    /* The board hands its -M ...,audiodev= down through this alias */
+    object_property_add_alias(obj, "audiodev", OBJECT(&ks->i2s), "audiodev");
+}
+
 static void macio_k2_class_init(ObjectClass *oc, const void *data)
 {
     PCIDeviceClass *pdc = PCI_DEVICE_CLASS(oc);
 
+    pdc->realize = macio_k2_realize;
     pdc->device_id = PCI_DEVICE_ID_APPLE_K2_KEYL;
 }
 
 static const TypeInfo macio_k2_type_info = {
     .name          = TYPE_K2_MACIO,
     .parent        = TYPE_NEWWORLD_MACIO,
+    .instance_size = sizeof(K2MacIOState),
+    .instance_init = macio_k2_init,
     .class_init    = macio_k2_class_init,
 };
 

@@ -9,3 +9,8 @@ config MAC_DBDMA
 
 config MACIO_GPIO
     bool
+
+config MAC_K2_SOUND
+    bool
+    select I2C
+    select MAC_DBDMA

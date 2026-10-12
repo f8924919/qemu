@@ -149,6 +149,7 @@ config MAC_NEWWORLD
     select FW_CFG_PPC
     select KEYWEST_I2C
     select MAC_HWCLOCK
+    select MAC_K2_SOUND
 
 config E500
     bool

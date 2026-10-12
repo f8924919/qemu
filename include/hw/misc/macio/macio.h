@@ -32,6 +32,7 @@
 #include "hw/intc/heathrow_pic.h"
 #include "hw/misc/macio/cuda.h"
 #include "hw/misc/macio/gpio.h"
+#include "hw/misc/macio/k2_sound.h"
 #include "hw/misc/macio/pmu.h"
 #include "hw/nvram/mac_nvram.h"
 #include "hw/ppc/mac_dbdma.h"
@@ -132,13 +133,6 @@ struct OldWorldMacIOState {
 #define TYPE_NEWWORLD_MACIO "macio-newworld"
 OBJECT_DECLARE_SIMPLE_TYPE(NewWorldMacIOState, NEWWORLD_MACIO)
 
-/*
- * The K2 KeyLargo of a PowerMac7,3: a macio-newworld that reports the id
- * of the real chip.  OpenBIOS keys the device tree node off that id, so
- * this is what makes the node come out as "K2-Keylargo".
- */
-#define TYPE_K2_MACIO "macio-k2"
-
 struct NewWorldMacIOState {
     /*< private >*/
     MacIOState parent_obj;
@@ -152,6 +146,24 @@ struct NewWorldMacIOState {
     MemoryRegion pic_alias;
     MACIOIDEState ide[2];
     MacIOGPIOState gpio;
+};
+
+/*
+ * The K2 KeyLargo of a PowerMac7,3: a macio-newworld that reports the id
+ * of the real chip (OpenBIOS keys the device tree node off that id, so this
+ * is what makes the node come out as "K2-Keylargo") and carries the I2S-a
+ * sound cell, its feature control registers and a second Keywest i2c with
+ * the codecs.
+ */
+#define TYPE_K2_MACIO "macio-k2"
+OBJECT_DECLARE_SIMPLE_TYPE(K2MacIOState, K2_MACIO)
+
+struct K2MacIOState {
+    /*< private >*/
+    NewWorldMacIOState parent_obj;
+    /*< public >*/
+
+    K2I2SState i2s;
 };
 
 #endif /* MACIO_H */
