@@ -105,10 +105,8 @@ static void cfg_writew(QTestState *qts, uint64_t addr, uint16_t val)
  * Firmware does not run under qtest: bring up the K2 bridge window and
  * place the macio BAR by hand (same steps as u3-ht-test).
  */
-static QTestState *k2_init(const char *extra)
+static void k2_bring_up(QTestState *qts)
 {
-    QTestState *qts = qtest_initf("-machine powermac7_3 %s", extra);
-
     qtest_writeb(qts, U3_HT_CFG_BASE + CFA0(K2_DEVFN, 0x18), 0);
     qtest_writeb(qts, U3_HT_CFG_BASE + CFA0(K2_DEVFN, 0x19), 1);
     qtest_writeb(qts, U3_HT_CFG_BASE + CFA0(K2_DEVFN, 0x1a), 1);
@@ -120,6 +118,13 @@ static QTestState *k2_init(const char *extra)
               (uint32_t)MACIO_BAR);
     cfg_writew(qts, U3_HT_CFG_BASE + CFA1(1, MACIO_DEVFN, PCI_COMMAND),
                PCI_COMMAND_MEMORY);
+}
+
+static QTestState *k2_init(const char *extra)
+{
+    QTestState *qts = qtest_initf("-machine powermac7_3 %s", extra);
+
+    k2_bring_up(qts);
     return qts;
 }
 
@@ -302,6 +307,33 @@ static void dma_retires(int ch, uint16_t cmd, int irq)
     qtest_quit(qts);
 }
 
+/*
+ * A reset while a descriptor is still pending must leave the channel usable.
+ * The pending descriptor is dropped (completing it would write back through
+ * a command pointer that the reset has cleared), so the channel has to be
+ * told that it is no longer busy -- otherwise the next boot's first RUN is
+ * ignored and the guest never hears anything again.
+ */
+static void test_dma_usable_after_reset(void)
+{
+    QTestState *qts = k2_init("");
+
+    le_writel(qts, K2_FCR1, K2_FCR1_I2S0_BITS);
+    dma_program(qts, 0, OUTPUT_LAST);
+    /* Mid-descriptor: 1024 frames at 72 kHz take about 14 ms */
+    qtest_clock_step(qts, 1 * 1000 * 1000);
+    g_assert_cmphex(dma_xfer_status(qts) & DBDMA_RUN, ==, 0);
+
+    qtest_system_reset(qts);
+    k2_bring_up(qts);
+    le_writel(qts, K2_FCR1, K2_FCR1_I2S0_BITS);
+    dma_program(qts, 0, OUTPUT_LAST);
+    qtest_clock_step(qts, 100 * 1000 * 1000);
+    g_assert_cmphex(dma_xfer_status(qts) & DBDMA_RUN, ==, DBDMA_RUN);
+
+    qtest_quit(qts);
+}
+
 static void test_dma_out_retires(void)
 {
     dma_retires(0, OUTPUT_LAST, IRQ_I2S_TX);
@@ -329,6 +361,8 @@ int main(int argc, char **argv)
     qtest_add_func("/k2-sound/fcr-reads-back", test_fcr_reads_back);
     qtest_add_func("/k2-sound/dma-out-retires", test_dma_out_retires);
     qtest_add_func("/k2-sound/dma-in-retires", test_dma_in_retires);
+    qtest_add_func("/k2-sound/dma-usable-after-reset",
+                   test_dma_usable_after_reset);
 
     return g_test_run();
 }

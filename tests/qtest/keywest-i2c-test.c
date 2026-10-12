@@ -505,13 +505,6 @@ static void test_stop_ends_the_bus_transfer(void)
 }
 
 /*
- * The controller belongs to U3, so it must not appear on mac99.
- *
- * Reading the region is not enough to tell: unassigned memory reads back as
- * zero here, and the mode register also resets to zero.  Writing first and
- * checking that nothing stuck is what actually distinguishes the two.
- */
-/*
  * Darwin's PPCI2CInterface (AppleI2C.kext) never writes the control
  * register outright: it reads it and ORs in AAK or STOP.  XADDR, written
  * to start the transfer, therefore has to read back clear once the start
@@ -611,6 +604,13 @@ static void test_darwin_multi_byte_read(void)
     qtest_quit(qts);
 }
 
+/*
+ * The controller belongs to U3, so it must not appear on mac99.
+ *
+ * Reading the region is not enough to tell: unassigned memory reads back as
+ * zero here, and the mode register also resets to zero.  Writing first and
+ * checking that nothing stuck is what actually distinguishes the two.
+ */
 static void test_mac99_has_no_i2c(void)
 {
     QTestState *qts = qtest_init("-machine mac99");

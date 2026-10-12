@@ -386,6 +386,24 @@ static void k2_i2s_dir_complete(K2I2SState *s, int dir)
     }
 }
 
+/*
+ * Forget a pending descriptor without completing it, and tell the channel
+ * it is no longer busy.  Completing it is not an option after a reset or a
+ * load: dma_end writes the descriptor back through the channel's command
+ * pointer, which the reset has cleared (or which the load restored without
+ * the callback).  The channel only runs again once processing is clear, so
+ * leaving it set would silence the guest for good.
+ */
+static void k2_i2s_dir_drop(K2I2SState *s, int dir)
+{
+    timer_del(s->dir[dir].timer);
+    s->dir[dir].pending = false;
+    s->dir[dir].deadline_ns = 0;
+    if (s->dbdma) {
+        k2_i2s_dir_io(s, dir)->processing = false;
+    }
+}
+
 static void k2_i2s_out_timer(void *opaque)
 {
     k2_i2s_dir_complete(opaque, 0);
@@ -464,9 +482,7 @@ static void k2_i2s_reset_hold(Object *obj, ResetType type)
     s->walk_frames = 0;
     s->frame_count_bias = 0;
     for (i = 0; i < 2; i++) {
-        timer_del(s->dir[i].timer);
-        s->dir[i].pending = false;
-        s->dir[i].deadline_ns = 0;
+        k2_i2s_dir_drop(s, i);
     }
     if (s->voice) {
         audio_be_set_active_out(s->audio_be, s->voice, false);
@@ -477,6 +493,12 @@ static void k2_i2s_reset_hold(Object *obj, ResetType type)
     k2_i2s_update_clocks(s);
 }
 
+/*
+ * The audiodev is optional and audio_be_check() is deliberately not called:
+ * falling back to the default backend fails the whole machine under
+ * -nodefaults when no -audio is given, which is how most of the test
+ * harnesses start it.  Without a backend the cell is silent.
+ */
 static void k2_i2s_realize(DeviceState *dev, Error **errp)
 {
     K2I2SState *s = K2_I2S(dev);
@@ -486,11 +508,6 @@ static void k2_i2s_realize(DeviceState *dev, Error **errp)
         error_setg(errp, "k2-i2s: 'dbdma' link not set");
         return;
     }
-    /*
-     * Only open a backend that was asked for.  Falling back to the default
-     * one (audio_be_check) fails the whole machine under -nodefaults when
-     * no -audio is given, which is how most of the test harnesses start it.
-     */
     for (i = 0; i < 2; i++) {
         DBDMA_register_channel(s->dbdma, k2_i2s_dma_chan[i], s->dma_irq[i],
                                k2_i2s_dma_rw, k2_i2s_dma_flush, s);
@@ -519,30 +536,24 @@ static void k2_i2s_init(Object *obj)
 }
 
 /*
- * The host voice is reopened on the next descriptor (voice_rate is reset),
- * so the FIFO starts empty after a load.
+ * The pending descriptors are not migrated: the DBDMA does not migrate the
+ * callback that would complete them.  Drop them; the guest's sound driver
+ * restarts the stream.  The host voice is reopened on the next descriptor
+ * (voice_rate is reset), so the FIFO starts empty after a load.
  */
 static int k2_i2s_post_load(void *opaque, int version_id)
 {
     K2I2SState *s = opaque;
+    int i;
 
+    for (i = 0; i < 2; i++) {
+        k2_i2s_dir_drop(s, i);
+    }
     s->voice_rate = 0;
     s->fifo_rptr = s->fifo_wptr = s->fifo_count = 0;
     s->prebuffering = true;
     return 0;
 }
-
-static const VMStateDescription vmstate_k2_i2s_dir = {
-    .name = "k2-i2s/dir",
-    .version_id = 1,
-    .minimum_version_id = 1,
-    .fields = (const VMStateField[]) {
-        VMSTATE_TIMER_PTR(timer, K2I2SDir),
-        VMSTATE_BOOL(pending, K2I2SDir),
-        VMSTATE_INT64(deadline_ns, K2I2SDir),
-        VMSTATE_END_OF_LIST()
-    }
-};
 
 static const VMStateDescription vmstate_k2_i2s = {
     .name = TYPE_K2_I2S,
@@ -556,8 +567,6 @@ static const VMStateDescription vmstate_k2_i2s = {
         VMSTATE_UINT32(data_word_sizes, K2I2SState),
         VMSTATE_UINT64(walk_frames, K2I2SState),
         VMSTATE_UINT32(frame_count_bias, K2I2SState),
-        VMSTATE_STRUCT_ARRAY(dir, K2I2SState, 2, 1, vmstate_k2_i2s_dir,
-                             K2I2SDir),
         VMSTATE_END_OF_LIST()
     }
 };
