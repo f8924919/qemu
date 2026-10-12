@@ -54,3 +54,7 @@ k2_fcr_write(uint32_t addr, uint32_t val) "0x%02x <- 0x%08x"
 k2_i2s_read(uint64_t addr, uint32_t val) "0x%02"PRIx64" -> 0x%08x"
 k2_i2s_write(uint64_t addr, uint32_t val) "0x%02"PRIx64" <- 0x%08x"
 k2_i2s_dma(int out, uint64_t addr, int len, int rate) "out=%d addr=0x%"PRIx64" len=%d rate=%d"
+k2_i2s_dma_sched(int out, uint64_t addr, int64_t lead_ns) "out=%d addr=0x%"PRIx64" lead_ns=%"PRId64
+k2_i2s_dma_retire(uint64_t addr, int zero_bytes) "addr=0x%"PRIx64" zero=%d"
+k2_i2s_tap_out(uint64_t addr, int len, int zero_bytes, uint32_t fifo_count) "addr=0x%"PRIx64" len=%d zero=%d fifo=%u"
+k2_i2s_audio_cb(int avail, uint32_t fifo_count, uint32_t held, int prebuffering, int pushing, uint32_t popped) "avail=%d fifo=%u held=%u prebuf=%d pushing=%d popped=%u"

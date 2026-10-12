@@ -289,8 +289,13 @@ static void k2_i2s_audio_cb(void *opaque, int avail)
     uint32_t want = (uint64_t)s->voice_rate * fb * K2_I2S_PREBUF_NS /
                     NANOSECONDS_PER_SECOND;
     bool pushing = now - s->last_push_ns < K2_I2S_PREBUF_GIVEUP_NS;
+    uint32_t fifo_in = s->fifo_count;
+    uint32_t held = s->backend_size > avail ? s->backend_size - avail : 0;
+    int asked = avail;
 
     if (k2_i2s_prebuffer(s, avail, want, pushing)) {
+        trace_k2_i2s_audio_cb(asked, fifo_in, held, s->prebuffering, pushing,
+                              0);
         return;
     }
 
@@ -318,6 +323,8 @@ static void k2_i2s_audio_cb(void *opaque, int avail)
             break;
         }
     }
+    trace_k2_i2s_audio_cb(asked, fifo_in, held, s->prebuffering, pushing,
+                          fifo_in - s->fifo_count);
 }
 
 /*
@@ -330,6 +337,7 @@ static void k2_i2s_tap_out(K2I2SState *s, DBDMA_io *io, int rate)
     uint8_t buf[4096];
     hwaddr addr = io->addr;
     int remaining = io->len;
+    int zero_bytes = 0;
 
     if (!s->audio_be) {
         return;
@@ -360,6 +368,7 @@ static void k2_i2s_tap_out(K2I2SState *s, DBDMA_io *io, int rate)
         dma_memory_read(&address_space_memory, addr, buf, len,
                         MEMTXATTRS_UNSPECIFIED);
         for (i = 0; i < len && s->fifo_count < sizeof(s->out_fifo); i++) {
+            zero_bytes += !buf[i];
             s->out_fifo[s->fifo_wptr] = buf[i];
             s->fifo_wptr = (s->fifo_wptr + 1) % sizeof(s->out_fifo);
             s->fifo_count++;
@@ -367,6 +376,23 @@ static void k2_i2s_tap_out(K2I2SState *s, DBDMA_io *io, int rate)
         addr += len;
         remaining -= len;
     }
+    trace_k2_i2s_tap_out(io->addr, io->len, zero_bytes, s->fifo_count);
+}
+
+/* What the guest has left in an output descriptor's buffer by now */
+static int k2_i2s_zero_bytes(DBDMA_io *io)
+{
+    uint8_t buf[4096];
+    int len = MIN(io->len, (int)sizeof(buf));
+    int zero_bytes = 0;
+    int i;
+
+    dma_memory_read(&address_space_memory, io->addr, buf, len,
+                    MEMTXATTRS_UNSPECIFIED);
+    for (i = 0; i < len; i++) {
+        zero_bytes += !buf[i];
+    }
+    return zero_bytes;
 }
 
 static DBDMA_io *k2_i2s_dir_io(K2I2SState *s, int dir)
@@ -381,6 +407,10 @@ static void k2_i2s_dir_complete(K2I2SState *s, int dir)
     if (d->pending) {
         DBDMA_io *io = k2_i2s_dir_io(s, dir);
 
+        if (io->is_dma_out &&
+            trace_event_get_state_backends(TRACE_K2_I2S_DMA_RETIRE)) {
+            trace_k2_i2s_dma_retire(io->addr, k2_i2s_zero_bytes(io));
+        }
         d->pending = false;
         io->dma_end(io);
     }
@@ -438,6 +468,7 @@ static void k2_i2s_dma_rw(DBDMA_io *io)
         d->deadline_ns = now - K2_I2S_MAX_DEBT_NS;
     }
     d->deadline_ns += (int64_t)frames * NANOSECONDS_PER_SECOND / rate;
+    trace_k2_i2s_dma_sched(io->is_dma_out, io->addr, d->deadline_ns - now);
     if (d->deadline_ns <= now) {
         io->dma_end(io);
         return;
