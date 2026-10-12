@@ -261,11 +261,12 @@ static void test_fcr_reads_back(void)
 }
 
 /* One descriptor followed by STOP; returns once the program is in place */
-static void dma_program(QTestState *qts, int ch, uint16_t cmd)
+static void dma_program_len(QTestState *qts, int ch, uint16_t cmd,
+                            uint16_t len)
 {
     uint8_t desc[32] = { 0 };
 
-    stw_le_p(desc + 0, BUF_LEN);
+    stw_le_p(desc + 0, len);
     stw_le_p(desc + 2, cmd | INTR_ALWAYS);
     stl_le_p(desc + 4, BUF_ADDR);
     stw_le_p(desc + 16 + 2, DBDMA_STOP);
@@ -274,6 +275,11 @@ static void dma_program(QTestState *qts, int ch, uint16_t cmd)
     le_writel(qts, DBDMA_CH(ch) + DBDMA_CMDPTR_LO, DESC_ADDR);
     le_writel(qts, DBDMA_CH(ch) + DBDMA_CONTROL,
               (DBDMA_RUN << 16) | DBDMA_RUN);
+}
+
+static void dma_program(QTestState *qts, int ch, uint16_t cmd)
+{
+    dma_program_len(qts, ch, cmd, BUF_LEN);
 }
 
 /* xfer_status is written back with the channel status once it retires */
@@ -334,6 +340,30 @@ static void test_dma_usable_after_reset(void)
     qtest_quit(qts);
 }
 
+/*
+ * A stream starts on time: its first descriptor retires one descriptor's
+ * playing time after it was taken, not at once.  Retiring the start of a
+ * stream early runs the cell ahead of the guest, which then has not yet
+ * written the buffers the cell reads.
+ */
+static void test_dma_out_starts_on_time(void)
+{
+    QTestState *qts = k2_init("");
+
+    le_writel(qts, K2_FCR1, K2_FCR1_I2S0_BITS);
+    /* Well past boot, so that a start "in the past" would not be clamped */
+    qtest_clock_step(qts, 100 * 1000 * 1000);
+    /* 128 bytes are 32 frames: about 0.44 ms at 72 kHz */
+    dma_program_len(qts, 0, OUTPUT_LAST, 128);
+    qtest_clock_step(qts, 100 * 1000);
+    g_assert_cmphex(dma_xfer_status(qts) & DBDMA_RUN, ==, 0);
+
+    qtest_clock_step(qts, 1 * 1000 * 1000);
+    g_assert_cmphex(dma_xfer_status(qts) & DBDMA_RUN, ==, DBDMA_RUN);
+
+    qtest_quit(qts);
+}
+
 static void test_dma_out_retires(void)
 {
     dma_retires(0, OUTPUT_LAST, IRQ_I2S_TX);
@@ -361,6 +391,8 @@ int main(int argc, char **argv)
     qtest_add_func("/k2-sound/fcr-reads-back", test_fcr_reads_back);
     qtest_add_func("/k2-sound/dma-out-retires", test_dma_out_retires);
     qtest_add_func("/k2-sound/dma-in-retires", test_dma_in_retires);
+    qtest_add_func("/k2-sound/dma-out-starts-on-time",
+                   test_dma_out_starts_on_time);
     qtest_add_func("/k2-sound/dma-usable-after-reset",
                    test_dma_usable_after_reset);
 

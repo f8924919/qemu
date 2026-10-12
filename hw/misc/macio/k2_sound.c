@@ -464,7 +464,14 @@ static void k2_i2s_dma_rw(DBDMA_io *io)
                        MEMTXATTRS_UNSPECIFIED);
     }
 
-    if (d->deadline_ns < now - K2_I2S_MAX_DEBT_NS) {
+    /*
+     * A stream starts now.  Starting it in the past would retire its first
+     * descriptors at once and run the cell ahead of the guest, which has
+     * then not yet filled the buffers the cell goes on to read.
+     */
+    if (!d->deadline_ns) {
+        d->deadline_ns = now;
+    } else if (d->deadline_ns < now - K2_I2S_MAX_DEBT_NS) {
         d->deadline_ns = now - K2_I2S_MAX_DEBT_NS;
     }
     d->deadline_ns += (int64_t)frames * NANOSECONDS_PER_SECOND / rate;
