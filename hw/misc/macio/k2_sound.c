@@ -575,9 +575,14 @@ static void k2_i2s_init(Object *obj)
 
 /*
  * The pending descriptors are not migrated: the DBDMA does not migrate the
- * callback that would complete them.  Drop them; the guest's sound driver
- * restarts the stream.  The host voice is reopened on the next descriptor
- * (voice_rate is reset), so the FIFO starts empty after a load.
+ * callback that would complete them.  Drop them, and tell both channels
+ * they are free again, as on reset.  Nothing here restarts a channel: the
+ * DBDMA has no post_load and only runs its channels from DBDMA_kick, so a
+ * channel left in RUN|ACTIVE resumes the next time any channel of the same
+ * DBDMA is kicked (an IDE transfer, or the guest writing a channel's
+ * control).  Whether the guest's sound driver also restarts the stream
+ * after a load has not been checked.  The host voice is reopened on the
+ * next descriptor (voice_rate is reset), so the FIFO starts empty.
  */
 static int k2_i2s_post_load(void *opaque, int version_id)
 {
