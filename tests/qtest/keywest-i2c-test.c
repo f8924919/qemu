@@ -511,6 +511,106 @@ static void test_stop_ends_the_bus_transfer(void)
  * zero here, and the mode register also resets to zero.  Writing first and
  * checking that nothing stuck is what actually distinguishes the two.
  */
+/*
+ * Darwin's PPCI2CInterface (AppleI2C.kext) never writes the control
+ * register outright: it reads it and ORs in AAK or STOP.  XADDR, written
+ * to start the transfer, therefore has to read back clear once the start
+ * has happened -- otherwise the STOP that ends a write comes back with
+ * XADDR still set and restarts the transfer instead of finishing it.
+ */
+static void test_control_start_bit_self_clears(void)
+{
+    QTestState *qts = qtest_init("-machine powermac7_3");
+
+    qtest_writeb(qts, KW_STATUS, 0);
+    qtest_writeb(qts, KW_MODE, KW_I2C_MODE_STANDARDSUB);
+    qtest_writeb(qts, KW_ADDR, HWCLOCK_ADDR8 & ~1);
+    qtest_writeb(qts, KW_SUBADDR, HWCLOCK_REG);
+    qtest_writeb(qts, KW_CONTROL,
+                 qtest_readb(qts, KW_CONTROL) | KW_I2C_CTL_XADDR);
+    i2c_wait_isr(qts, KW_I2C_IRQ_ADDR);
+    g_assert_cmphex(qtest_readb(qts, KW_CONTROL) & KW_I2C_CTL_XADDR, ==, 0);
+
+    qtest_quit(qts);
+}
+
+/* A one-byte write the way Darwin ends it: STOP read-modify-written */
+static void test_darwin_write_stop_rmw(void)
+{
+    QTestState *qts = qtest_init("-machine powermac7_3");
+
+    qtest_writeb(qts, KW_STATUS, 0);
+    qtest_writeb(qts, KW_MODE, KW_I2C_MODE_STANDARDSUB);
+    qtest_writeb(qts, KW_ADDR, HWCLOCK_ADDR8 & ~1);
+    qtest_writeb(qts, KW_SUBADDR, HWCLOCK_REG);
+    qtest_writeb(qts, KW_ISR, 0x0f);
+    qtest_writeb(qts, KW_CONTROL,
+                 qtest_readb(qts, KW_CONTROL) | KW_I2C_CTL_XADDR);
+    i2c_wait_isr(qts, KW_I2C_IRQ_ADDR);
+
+    /* ADDR: first byte into DATA, then one ack */
+    qtest_writeb(qts, KW_DATA, 0x3c);
+    qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_ADDR);
+    i2c_wait_isr(qts, KW_I2C_IRQ_DATA);
+
+    /* DATA, nothing left: STOP by read-modify-write, then one ack */
+    qtest_writeb(qts, KW_CONTROL,
+                 qtest_readb(qts, KW_CONTROL) | KW_I2C_CTL_STOP);
+    qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_DATA);
+    i2c_wait_isr(qts, KW_I2C_IRQ_STOP);
+    qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_STOP);
+
+    g_assert_cmphex(i2c_read_sub(qts, HWCLOCK_ADDR8, HWCLOCK_REG), ==, 0x3c);
+
+    qtest_quit(qts);
+}
+
+/*
+ * A two-byte read in Darwin's order: AAK is settled *before* the single
+ * ack of each byte.  Dropping AAK while the first byte is acked means "the
+ * next byte is the last", not "stop now" -- a controller that stops there
+ * loses the second byte.
+ */
+static void test_darwin_multi_byte_read(void)
+{
+    QTestState *qts = qtest_init("-machine powermac7_3");
+    uint8_t first, second;
+
+    i2c_write_sub(qts, HWCLOCK_ADDR8, HWCLOCK_REG, 0x5a);
+    i2c_write_sub(qts, HWCLOCK_ADDR8, HWCLOCK_REG + 1, 0xa5);
+
+    qtest_writeb(qts, KW_STATUS, 0);
+    qtest_writeb(qts, KW_MODE, KW_I2C_MODE_COMBINED);
+    qtest_writeb(qts, KW_ADDR, HWCLOCK_ADDR8 | 1);
+    qtest_writeb(qts, KW_SUBADDR, HWCLOCK_REG);
+    qtest_writeb(qts, KW_ISR, 0x0f);
+    qtest_writeb(qts, KW_CONTROL,
+                 qtest_readb(qts, KW_CONTROL) | KW_I2C_CTL_XADDR);
+    i2c_wait_isr(qts, KW_I2C_IRQ_ADDR);
+
+    /* ADDR: two bytes wanted, AAK armed, one ack */
+    qtest_writeb(qts, KW_CONTROL,
+                 qtest_readb(qts, KW_CONTROL) | KW_I2C_CTL_AAK);
+    qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_ADDR);
+
+    /* DATA: read, one byte left so AAK is dropped, then one ack */
+    i2c_wait_isr(qts, KW_I2C_IRQ_DATA);
+    first = qtest_readb(qts, KW_DATA);
+    qtest_writeb(qts, KW_CONTROL, 0);
+    qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_DATA);
+
+    /* DATA: the last byte, then one ack ends the transfer */
+    i2c_wait_isr(qts, KW_I2C_IRQ_DATA);
+    second = qtest_readb(qts, KW_DATA);
+    qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_DATA);
+    i2c_wait_isr(qts, KW_I2C_IRQ_STOP);
+
+    g_assert_cmphex(first, ==, 0x5a);
+    g_assert_cmphex(second, ==, 0xa5);
+
+    qtest_quit(qts);
+}
+
 static void test_mac99_has_no_i2c(void)
 {
     QTestState *qts = qtest_init("-machine mac99");
@@ -548,6 +648,12 @@ int main(int argc, char **argv)
                    test_status_write_is_accepted);
     qtest_add_func("/keywest-i2c/stop-ends-the-bus-transfer",
                    test_stop_ends_the_bus_transfer);
+    qtest_add_func("/keywest-i2c/control-start-bit-self-clears",
+                   test_control_start_bit_self_clears);
+    qtest_add_func("/keywest-i2c/darwin-write-stop-rmw",
+                   test_darwin_write_stop_rmw);
+    qtest_add_func("/keywest-i2c/darwin-multi-byte-read",
+                   test_darwin_multi_byte_read);
     qtest_add_func("/keywest-i2c/mac99-has-no-i2c", test_mac99_has_no_i2c);
 
     return g_test_run();

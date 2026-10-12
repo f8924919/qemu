@@ -118,6 +118,15 @@ struct KeywestI2CState {
      */
     bool data_ready;        /* a received byte is waiting to be read */
     bool write_done;        /* the byte last written has gone out */
+    /*
+     * Whether the byte received last is the final one.  AAK says whether
+     * the controller acknowledges the byte it receives, and the two guests
+     * settle it at different times: Darwin drops AAK *before* its single
+     * acknowledge of a byte, low_i2c.c between its two acknowledges.  So
+     * it is taken when a byte is fetched and refreshed on every acknowledge
+     * that arrives while that byte is still unread.
+     */
+    bool last_byte;
 };
 
 static void keywest_i2c_stop(KeywestI2CState *s);
@@ -259,6 +268,7 @@ static void keywest_i2c_recv_byte(KeywestI2CState *s)
     }
     s->data = i2c_recv(bus);
     s->data_ready = true;
+    s->last_byte = !(s->control & KW_CTL_AAK);
     keywest_i2c_raise(s, KW_IRQ_DATA);
 }
 
@@ -335,7 +345,13 @@ static void keywest_i2c_write(void *opaque, hwaddr addr, uint64_t val64,
         break;
 
     case KW_REG_CONTROL:
-        s->control = val;
+        /*
+         * XADDR and STOP are commands and read back clear; only AAK is
+         * held.  Darwin's PPCI2CInterface sets AAK and STOP by reading the
+         * register and ORing the bit in, so a stored XADDR would restart
+         * the transfer every time it does that.
+         */
+        s->control = val & ~(KW_CTL_XADDR | KW_CTL_STOP);
         if (val & KW_CTL_XADDR) {
             keywest_i2c_start(s);
         } else if (val & KW_CTL_STOP) {
@@ -364,21 +380,22 @@ static void keywest_i2c_write(void *opaque, hwaddr addr, uint64_t val64,
             keywest_i2c_recv_byte(s);
         }
         /*
-         * Acking a data byte is what asks for the next one.  AAK says
-         * whether the guest wants another: with it set the byte that
-         * follows is fetched, and without it this was the last one, so the
-         * transfer ends here.  low_i2c.c never writes STOP for reads -- it
-         * moves to state_stop and waits for the interrupt.
+         * Acking a data byte is what asks for the next one, unless the
+         * byte was the last (last_byte); then the transfer ends here.
+         * Neither guest writes STOP for reads -- they wait for the stop
+         * interrupt.
          */
         if ((val & KW_IRQ_DATA) && s->xfer_active) {
             if (s->xfer_recv) {
                 if (s->data_ready) {
                     /*
                      * Not consumed yet -- the second acknowledge of the
-                     * same interrupt must not swallow it
+                     * same interrupt (low_i2c.c) must not swallow it, but
+                     * the AAK change made just before it counts
                      */
+                    s->last_byte = !(s->control & KW_CTL_AAK);
                     keywest_i2c_raise(s, KW_IRQ_DATA);
-                } else if (s->control & KW_CTL_AAK) {
+                } else if (!s->last_byte) {
                     keywest_i2c_recv_byte(s);
                 } else {
                     keywest_i2c_stop(s);
@@ -450,6 +467,7 @@ static void keywest_i2c_reset_hold(Object *obj, ResetType type)
     s->xfer_recv = false;
     s->data_ready = false;
     s->write_done = false;
+    s->last_byte = false;
     keywest_i2c_update_irq(s);
 }
 
@@ -478,7 +496,7 @@ static void keywest_i2c_realize(DeviceState *dev, Error **errp)
 
 static const VMStateDescription vmstate_keywest_i2c = {
     .name = "keywest-i2c",
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT8(mode, KeywestI2CState),
@@ -493,6 +511,7 @@ static const VMStateDescription vmstate_keywest_i2c = {
         VMSTATE_BOOL(xfer_recv, KeywestI2CState),
         VMSTATE_BOOL(data_ready, KeywestI2CState),
         VMSTATE_BOOL(write_done, KeywestI2CState),
+        VMSTATE_BOOL_V(last_byte, KeywestI2CState, 2),
         VMSTATE_END_OF_LIST()
     }
 };
