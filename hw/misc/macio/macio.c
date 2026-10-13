@@ -101,6 +101,12 @@ static bool macio_common_realize(PCIDevice *d, Error **errp)
     if (!qdev_realize(DEVICE(&s->dbdma), BUS(&s->macio_bus), errp)) {
         return false;
     }
+    /*
+     * The DBDMA masters the bus on behalf of everything behind it (IDE,
+     * the K2 sound).  Behind an IOMMU that is the IOMMU's address space,
+     * otherwise system memory, so the other machines see no change.
+     */
+    DBDMA_set_address_space(&s->dbdma, pci_device_iommu_address_space(d));
     sbd = SYS_BUS_DEVICE(&s->dbdma);
     memory_region_add_subregion(&s->bar, 0x08000,
                                 sysbus_mmio_get_region(sbd, 0));
