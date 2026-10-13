@@ -57,6 +57,7 @@
 #include "hw/core/boards.h"
 #include "hw/pci/pci_bridge.h"
 #include "hw/pci-host/uninorth.h"
+#include "hw/pci-host/u3_dart.h"
 #include "hw/i2c/i2c.h"
 #include "hw/input/adb.h"
 #include "hw/ppc/mac_dbdma.h"
@@ -114,6 +115,10 @@ struct Core99MachineState {
     Core99ViaConfig via_config;
     /* PowerMac7,3 also gets the U3 HyperTransport PCI domain */
     bool has_u3_ht;
+    /* PowerMac7,3: allow RAM beyond 2 GiB, placed from 4 GiB up */
+    bool highmem;
+    /* PowerMac7,3: whether the U3 gets a DART (x-dart) */
+    OnOffAuto dart;
 };
 
 static void fw_cfg_boot_set(void *opaque, const char *boot_device,
@@ -196,6 +201,8 @@ static void ppc_core99_init(MachineState *machine)
     PCIBus *pci_bus;
     DeviceState *u3_ht_dev = NULL;
     PCIBus *ht_bus = NULL, *k2_bus = NULL;
+    DeviceState *dart_dev = NULL;
+    ram_addr_t low_ram_size = machine->ram_size;
     bool has_pmu, has_adb;
     Object *macio;
     MACIOIDEState *macio_ide;
@@ -259,12 +266,44 @@ static void ppc_core99_init(MachineState *machine)
             }
         }
     }
-    /* allocate RAM */
+    /*
+     * allocate RAM
+     *
+     * The PCI hole starts at 2 GiB.  On a PowerMac7,3 the RAM beyond that
+     * continues at 4 GiB, as two aliases of the one RAM block.  A 32-bit
+     * DMA engine cannot reach that RAM, so the machine gets a DART (see
+     * x-dart below) to remap the DMA of the mac-io and of the AGP slot.
+     * It is opt-in all the same, to leave the default machine as it was.
+     */
     if (machine->ram_size > 2 * GiB) {
-        error_report("RAM size more than 2 GiB is not supported");
-        exit(1);
+        MemoryRegion *low, *high;
+
+        if (!core99_machine->has_u3_ht ||
+            PPC_INPUT(env) != PPC_FLAGS_INPUT_970) {
+            error_report("RAM size more than 2 GiB is not supported");
+            exit(1);
+        }
+        if (!core99_machine->highmem) {
+            error_report("RAM size more than 2 GiB requires highmem=on");
+            exit(1);
+        }
+        if (machine->ram_size > 8 * GiB) {
+            error_report("RAM size more than 8 GiB is not supported");
+            exit(1);
+        }
+        low_ram_size = 2 * GiB;
+        low = g_new(MemoryRegion, 1);
+        high = g_new(MemoryRegion, 1);
+        memory_region_init_alias(low, OBJECT(machine), "ram-low", machine->ram,
+                                 0, low_ram_size);
+        memory_region_init_alias(high, OBJECT(machine), "ram-high",
+                                 machine->ram, low_ram_size,
+                                 machine->ram_size - low_ram_size);
+        memory_region_add_subregion(get_system_memory(), 0, low);
+        memory_region_add_subregion(get_system_memory(), 4 * GiB, high);
+    } else {
+        memory_region_add_subregion(get_system_memory(), 0, machine->ram);
     }
-    memory_region_add_subregion(get_system_memory(), 0, machine->ram);
 
     /* allocate and load firmware ROM */
     memory_region_init_rom(bios, NULL, "ppc_core99.bios", PROM_SIZE,
@@ -297,13 +336,13 @@ static void ppc_core99_init(MachineState *machine)
                                NULL, NULL, ELFDATA2MSB, PPC_ELF_MACHINE, 0, 0);
         if (kernel_size < 0) {
             kernel_size = load_aout(machine->kernel_filename, kernel_base,
-                                    machine->ram_size - kernel_base,
+                                    low_ram_size - kernel_base,
                                     true, TARGET_PAGE_SIZE);
         }
         if (kernel_size < 0) {
             kernel_size = load_image_targphys(machine->kernel_filename,
                                               kernel_base,
-                                              machine->ram_size - kernel_base,
+                                              low_ram_size - kernel_base,
                                               &error_fatal);
         }
         /* load initrd */
@@ -311,7 +350,7 @@ static void ppc_core99_init(MachineState *machine)
             initrd_base = TARGET_PAGE_ALIGN(kernel_base + kernel_size + KERNEL_GAP);
             initrd_size = load_image_targphys(machine->initrd_filename,
                                               initrd_base,
-                                              machine->ram_size - initrd_base,
+                                              low_ram_size - initrd_base,
                                               &error_fatal);
             cmdline_base = TARGET_PAGE_ALIGN(initrd_base + initrd_size);
         } else {
@@ -541,6 +580,29 @@ static void ppc_core99_init(MachineState *machine)
         PCIDevice *br;
 
         ht_bus = PCI_HOST_BRIDGE(u3_ht_dev)->bus;
+
+        /*
+         * The DART sits in front of the HT bus and the AGP bus.  It has
+         * to be attached before the K2 bridge and the mac-io below are
+         * realized: the mac-io picks its DMA address space when it is.
+         */
+        if (core99_machine->dart == ON_OFF_AUTO_ON ||
+            (core99_machine->dart == ON_OFF_AUTO_AUTO &&
+             machine->ram_size > 2 * GiB)) {
+            dart_dev = qdev_new(TYPE_U3_DART);
+            s = SYS_BUS_DEVICE(dart_dev);
+            sysbus_realize_and_unref(s, &error_fatal);
+            sysbus_mmio_map(s, 0, U3_DART_BASE);
+            u3_dart_attach(U3_DART(dart_dev), ht_bus);
+            u3_dart_attach(U3_DART(dart_dev), pci_bus);
+            /*
+             * AGP accesses that the GART leaves alone are bus addresses
+             * like any other, so they go through the DART as well.
+             */
+            u3_agp_set_gart_exit_as(U3_AGP_HOST_BRIDGE(uninorth_pci_dev),
+                                    &U3_DART(dart_dev)->as);
+        }
+
         /*
          * K2 HT-PCI bridge at dev 3, carrying the MacIO on its
          * secondary bus at dev 7 (both devfns match the real 7,3:
@@ -754,7 +816,17 @@ static void ppc_core99_init(MachineState *machine)
 
     fw_cfg_add_i16(fw_cfg, FW_CFG_NB_CPUS, (uint16_t)machine->smp.cpus);
     fw_cfg_add_i16(fw_cfg, FW_CFG_MAX_CPUS, (uint16_t)machine->smp.max_cpus);
-    fw_cfg_add_i64(fw_cfg, FW_CFG_RAM_SIZE, (uint64_t)machine->ram_size);
+    /*
+     * Only the RAM below the PCI hole: the firmware lays itself out from
+     * the top of it.  powermac7_3 passes the rest separately.
+     */
+    fw_cfg_add_i64(fw_cfg, FW_CFG_RAM_SIZE, (uint64_t)low_ram_size);
+    if (core99_machine->has_u3_ht) {
+        fw_cfg_add_i64(fw_cfg, FW_CFG_PPC_HIGH_RAM_SIZE,
+                       (uint64_t)(machine->ram_size - low_ram_size));
+        /* The firmware describes the DART to the guest only if there is one */
+        fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_DART, dart_dev ? 1 : 0);
+    }
     fw_cfg_add_i16(fw_cfg, FW_CFG_MACHINE_ID, machine_arch);
     fw_cfg_add_i32(fw_cfg, FW_CFG_KERNEL_ADDR, kernel_base);
     fw_cfg_add_i32(fw_cfg, FW_CFG_KERNEL_SIZE, kernel_size);
@@ -1004,6 +1076,37 @@ static void powermac7_3_machine_class_init(ObjectClass *oc, const void *data)
     machine_add_audiodev_property(mc);
 }
 
+static bool powermac7_3_get_highmem(Object *obj, Error **errp)
+{
+    return CORE99_MACHINE(obj)->highmem;
+}
+
+static void powermac7_3_set_highmem(Object *obj, bool value, Error **errp)
+{
+    CORE99_MACHINE(obj)->highmem = value;
+}
+
+static char *powermac7_3_get_dart(Object *obj, Error **errp)
+{
+    return g_strdup(OnOffAuto_str(CORE99_MACHINE(obj)->dart));
+}
+
+static void powermac7_3_set_dart(Object *obj, const char *value, Error **errp)
+{
+    Core99MachineState *cms = CORE99_MACHINE(obj);
+
+    if (!strcmp(value, "auto")) {
+        cms->dart = ON_OFF_AUTO_AUTO;
+    } else if (!strcmp(value, "on")) {
+        cms->dart = ON_OFF_AUTO_ON;
+    } else if (!strcmp(value, "off")) {
+        cms->dart = ON_OFF_AUTO_OFF;
+    } else {
+        error_setg(errp, "Invalid x-dart value");
+        error_append_hint(errp, "Valid values are auto, on, off.\n");
+    }
+}
+
 static void powermac7_3_instance_init(Object *obj)
 {
     Core99MachineState *cms = CORE99_MACHINE(obj);
@@ -1012,6 +1115,27 @@ static void powermac7_3_instance_init(Object *obj)
     object_property_del(obj, "via");
     cms->via_config = CORE99_VIA_CONFIG_PMU;
     cms->has_u3_ht = true;
+
+    /* Off by default, so that the machine stays as it was measured */
+    cms->highmem = false;
+    object_property_add_bool(obj, "highmem", powermac7_3_get_highmem,
+                             powermac7_3_set_highmem);
+    object_property_set_description(obj, "highmem",
+                                    "Allow more than 2 GiB of RAM (up to "
+                                    "8 GiB), the excess placed from 4 GiB. "
+                                    "The machine then gets a DART, see "
+                                    "x-dart");
+
+    /* auto: a DART only when the RAM goes beyond 2 GiB */
+    cms->dart = ON_OFF_AUTO_AUTO;
+    object_property_add_str(obj, "x-dart", powermac7_3_get_dart,
+                            powermac7_3_set_dart);
+    object_property_set_description(obj, "x-dart",
+                                    "Give the U3 a DART, the IOMMU in front "
+                                    "of its PCI buses: auto (the default; "
+                                    "only with more than 2 GiB of RAM), on "
+                                    "or off. An experimental knob for "
+                                    "telling DART effects apart");
 }
 
 static const TypeInfo powermac7_3_machine_info = {

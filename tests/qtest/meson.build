@@ -201,6 +201,7 @@ qtests_ppc64 = \
   (config_all_devices.has_key('CONFIG_MAC_NEWWORLD') ? ['powermac7_3-smp-test'] : []) + \
   (config_all_devices.has_key('CONFIG_MAC_NEWWORLD') ? ['keywest-i2c-test'] : []) + \
   (config_all_devices.has_key('CONFIG_MAC_NEWWORLD') ? ['k2-sound-test'] : []) + \
+  (config_all_devices.has_key('CONFIG_MAC_NEWWORLD') ? ['u3-dart-test'] : []) + \
   (config_all_devices.has_key('CONFIG_MAC_NEWWORLD') ? ['macio-nvram-test'] : []) + \
   qtests_pci + ['migration-test', 'cpu-plug-test', 'drive_del-test']
 

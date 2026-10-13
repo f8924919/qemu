@@ -66,6 +66,29 @@ one on a destination started with ``-S`` is only brought up to date by
 ``cont``.  The size of the part is not part of what is migrated, so both
 ends have to be the same machine.
 
+Memory
+------
+
+The PowerMac machines take at most 2 GiB of RAM: the PCI hole starts at
+2 GiB.  ``powermac7_3`` can be given up to 8 GiB with
+``-M powermac7_3,highmem=on``; the RAM beyond 2 GiB is then placed from
+4 GiB up and described to the guest in the ``/memory`` node.
+
+A 32-bit DMA engine, like the mac-io IDE controllers, cannot reach RAM
+above 4 GiB.  So when ``powermac7_3`` has more than 2 GiB of RAM it also
+gets a DART, the G5's IOMMU, in front of the HyperTransport and AGP PCI
+buses; the guest maps the high pages into the 32-bit bus addresses that
+its devices use.  The firmware describes the DART in the device tree only
+when there is one.  ``-M powermac7_3,x-dart=on`` or ``x-dart=off`` forces
+it on or off whatever the RAM size (the default is ``auto``); it is for
+telling DART effects apart, not something to rely on.
+
+The DART's registers follow what Linux and Apple's driver do with them.
+There is no data sheet, so what they do not touch (the exception register,
+the offsets they do not use) is a guess.  ``highmem`` is off by default so
+that the default machine, and what has been measured on it, stays as it
+was.
+
 Firmware
 --------
 
