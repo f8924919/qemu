@@ -79,6 +79,8 @@ struct UNINHostState {
     PCIDevice *agp_bridge;
     bool agp_master;
     IOMMUMemoryRegion agp_iommu;
+    /* Where AGP accesses outside a live aperture go; NULL: system memory */
+    AddressSpace *agp_exit_as;
     Notifier machine_done;
     Error *migration_blocker;
 };
@@ -102,6 +104,12 @@ struct U3HTHostState {
 typedef struct U3HTHostState U3HTHostState;
 DECLARE_INSTANCE_CHECKER(U3HTHostState, U3_HT_HOST_BRIDGE,
                          TYPE_U3_HT_HOST_BRIDGE)
+
+/*
+ * Send what the U3 AGP bridge's GART does not translate (accesses outside
+ * a live aperture, or while it is disabled) to @as instead of system memory.
+ */
+void u3_agp_set_gart_exit_as(UNINHostState *s, AddressSpace *as);
 
 /* K2 HT-PCI bridge: the P2P bridge carrying the MacIO on a real 7,3 */
 #define TYPE_U3_HT_PCI_BRIDGE "u3-ht-pci-bridge"

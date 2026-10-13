@@ -55,6 +55,11 @@ u3_agp_gart_cfg(uint32_t gart_base, uint32_t agp_base, uint32_t ctrl, uint32_t d
 u3_agp_gart_translate(uint64_t addr, uint32_t entry) "bus 0x%"PRIx64" entry 0x%08x"
 unin_read(uint64_t addr, uint64_t value) "addr=0x%" PRIx64 " val=0x%"PRIx64
 
+# u3_dart.c
+u3_dart_write(uint32_t reg, uint32_t val) "reg 0x%02x val 0x%08x"
+u3_dart_xlate_high(uint64_t iova, uint64_t phys) "bus 0x%"PRIx64" -> phys 0x%"PRIx64
+u3_dart_fault(uint64_t iova) "no mapping for bus 0x%"PRIx64
+
 # ppc4xx_pci.c
 ppc4xx_pci_map_irq(int32_t devfn, int irq_num, int slot) "devfn 0x%x irq %d -> %d"
 ppc4xx_pci_set_irq(int irq_num) "PCI irq %d"

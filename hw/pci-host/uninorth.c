@@ -45,8 +45,9 @@
  * bits; AGP_BASE holds the aperture's 256 MB index on the bus in its top
  * nibble and bits 35:32 of the table address in its low bits.  Entries are
  * big-endian: bit 31 valid, the page number below.  Only AGP transactions
- * are translated; everything else goes straight to system memory, as there
- * is no DART behind the bridge.
+ * inside a live aperture are translated, to physical addresses; everything
+ * else comes out where u3_agp_set_gart_exit_as() says (the DART's address
+ * space on a machine that has one, system memory otherwise).
  *
  * The registers only come alive when an AGP master sits on the bus (see
  * u3_agp_machine_done()); otherwise the bridge looks as it always has.
@@ -101,6 +102,9 @@ static IOMMUTLBEntry u3_agp_translate(IOMMUMemoryRegion *iommu, hwaddr addr,
     if (!s->agp_master ||
         !(pci_get_long(cfg + U3_CFG_GART_CTRL) & U3_GART_CTRL_EN) ||
         addr < base || addr - base >= size) {
+        if (s->agp_exit_as) {
+            ret.target_as = s->agp_exit_as;
+        }
         return ret;
     }
 
@@ -118,6 +122,11 @@ static IOMMUTLBEntry u3_agp_translate(IOMMUMemoryRegion *iommu, hwaddr addr,
         ret.perm = IOMMU_NONE;
     }
     return ret;
+}
+
+void u3_agp_set_gart_exit_as(UNINHostState *s, AddressSpace *as)
+{
+    s->agp_exit_as = as;
 }
 
 static int pci_unin_map_irq(PCIDevice *pci_dev, int irq_num)
