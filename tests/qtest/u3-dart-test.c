@@ -223,7 +223,8 @@ static void test_fault_recorded(void)
     run_input(qts);
 
     g_assert_cmphex(qtest_readl(qts, DART_EXCP), ==, DESC_BUS >> 12);
-    qtest_writel(qts, DART_EXCP, 0);
+    /* Any write clears it, not only a write of 0 */
+    qtest_writel(qts, DART_EXCP, 0xffffffff);
     g_assert_cmphex(qtest_readl(qts, DART_EXCP), ==, 0);
 
     qtest_quit(qts);
