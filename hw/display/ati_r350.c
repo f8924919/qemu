@@ -5561,6 +5561,25 @@ static void ati_r350_agp_attach(ATIR350State *s)
     }
 }
 
+/*
+ * qemu_edid_generate() describes a digital (DisplayPort) monitor. The ATI
+ * Mac OS X driver then treats the head as single-link TMDS and drops every
+ * mode above 165MHz, which leaves 1920x1200 out even when it is the
+ * preferred mode. Present the same timings as an analog RGB monitor, the
+ * way the fixed EDID does, so the DAC's limit applies instead.
+ */
+static void ati_r350_edid_analog(uint8_t *edid)
+{
+    uint8_t sum = 0;
+
+    edid[20] = 0x08;                            /* analog, separate sync */
+    edid[24] = (edid[24] & ~0x18) | 0x08;       /* RGB colour display */
+    for (int i = 0; i < 127; i++) {
+        sum += edid[i];
+    }
+    edid[127] = -sum;
+}
+
 static void ati_r350_realize(PCIDevice *dev, Error **errp)
 {
     ATIR350State *s = ATI_R350(dev);
@@ -5843,12 +5862,13 @@ static void ati_r350_realize(PCIDevice *dev, Error **errp)
 
     /*
      * Any of the standard EDID properties asks for the generated EDID that
-     * std-vga uses (larger modes, but a digital 50-125Hz monitor); without
-     * them the guest keeps seeing the period CRT above.
+     * std-vga uses (larger modes, 50-125Hz), made analog; without them the
+     * guest keeps seeing the period CRT above.
      */
     if (s->edid_info.prefx || s->edid_info.maxx || s->edid_info.maxy ||
         s->edid_info.refresh_rate) {
         qemu_edid_generate(s->edid, sizeof(s->edid), &s->edid_info);
+        ati_r350_edid_analog(s->edid);
     } else {
         memcpy(s->edid, rage128_default_edid, sizeof(s->edid));
     }

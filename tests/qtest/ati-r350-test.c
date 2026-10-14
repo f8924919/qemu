@@ -934,7 +934,8 @@ static void add_cursor_tests(void)
 
 /*
  * EDID (#454). The fixed default is an Apple-style 17" CRT; any of the
- * standard EDID properties switches to qemu_edid_generate(). Read back
+ * standard EDID properties switches to qemu_edid_generate(), presented as
+ * an analog monitor. Read back
  * through the hardware I2C engine (DDC address 0xA0/0xA1).
  */
 #define I2C_CNTL_0              0x0090
@@ -1028,6 +1029,19 @@ static const EdidCase edid_cases[] = {
     { "refresh-rate", ",refresh_rate=60000", { .refresh_rate = 60000 } },
 };
 
+/* The R350 turns the generated (digital) EDID into an analog RGB one */
+static void edid_make_analog(uint8_t *edid)
+{
+    unsigned sum = 0;
+
+    edid[20] = 0x08;
+    edid[24] = (edid[24] & 0xe7) | 0x08;
+    for (int i = 0; i < 127; i++) {
+        sum += edid[i];
+    }
+    edid[127] = (256 - (sum & 0xff)) & 0xff;
+}
+
 /* Structure checks that do not lean on the generator */
 static void check_edid_structure(const uint8_t *edid, uint32_t w, uint32_t h)
 {
@@ -1039,6 +1053,9 @@ static void check_edid_structure(const uint8_t *edid, uint32_t w, uint32_t h)
     bool ranges = false;
 
     g_assert_cmpmem(edid, 8, header, 8);
+    /* analog input (bit 7 clear) and an RGB colour display */
+    g_assert_cmphex(edid[20] & 0x80, ==, 0);
+    g_assert_cmphex(edid[24] & 0x18, ==, 0x08);
     for (int i = 0; i < 128; i++) {
         sum += edid[i];
     }
@@ -1064,6 +1081,7 @@ static void run_edid_case(const void *opaque)
     R350 r;
 
     qemu_edid_generate(want, sizeof(want), &info);
+    edid_make_analog(want);
     r350_start_extra(&r, c->props);
     read_edid(&r, edid);
     r350_stop(&r);
