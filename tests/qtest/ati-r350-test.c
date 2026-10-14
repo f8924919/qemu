@@ -12,6 +12,7 @@
 #include "libqos/pci.h"
 #include "qemu/bswap.h"
 #include "qobject/qdict.h"
+#include "hw/display/edid.h"
 
 #define R350_VENDOR_ID          0x1002
 #define R350_DEVICE_ID          0x4e48
@@ -931,6 +932,178 @@ static void add_cursor_tests(void)
     }
 }
 
+/*
+ * EDID (#454). The fixed default is an Apple-style 17" CRT; any of the
+ * standard EDID properties switches to qemu_edid_generate(). Read back
+ * through the hardware I2C engine (DDC address 0xA0/0xA1).
+ */
+#define I2C_CNTL_0              0x0090
+#define I2C_CNTL_1              0x0094
+#define I2C_DATA                0x0098
+#define I2C_DONE                (1u << 0)
+#define I2C_NACK                (1u << 1)
+#define I2C_SOFT_RST            (1u << 5)
+#define I2C_RECEIVE             (1u << 10)
+#define I2C_GO                  (1u << 12)
+
+static const uint8_t r350_fixed_edid[128] = {
+    0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00,
+    0x06, 0x10, 0x75, 0x01, 0x00, 0x00, 0x00, 0x00,
+    0x0c, 0x09, 0x01, 0x01, 0x08, 0x20, 0x18, 0x78,
+    0x0a, 0xee, 0x91, 0xa3, 0x54, 0x4c, 0x99, 0x26,
+    0x0f, 0x50, 0x54, 0x31, 0x6b, 0x80, 0x01, 0x01,
+    0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x10, 0x27,
+    0x80, 0x30, 0x41, 0x66, 0x2d, 0x30, 0x40, 0x80,
+    0x13, 0x00, 0x40, 0xf0, 0x10, 0x00, 0x00, 0x1e,
+    0x00, 0x00, 0x00, 0xfd, 0x00, 0x32, 0x4b, 0x1e,
+    0x46, 0x0a, 0x00, 0x0a, 0x20, 0x20, 0x20, 0x20,
+    0x20, 0x20, 0x00, 0x00, 0x00, 0xfc, 0x00, 0x4d,
+    0x75, 0x6c, 0x74, 0x69, 0x70, 0x6c, 0x65, 0x20,
+    0x53, 0x63, 0x61, 0x6e, 0x00, 0x00, 0x00, 0x10,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x76,
+};
+
+static void r350_start_extra(R350 *r, const char *extra)
+{
+    QPCIDevice *dev = NULL;
+
+    r->qs = qtest_spapr_boot("-vga none -device ati-radeon9800,"
+                             "async-engine=off,async-display=off%s", extra);
+    qpci_device_foreach(r->qs->pcibus, R350_VENDOR_ID, R350_DEVICE_ID,
+                        find_r350, &dev);
+    g_assert(dev);
+    r->dev = dev;
+    r->vram = qpci_iomap(dev, VRAM_BAR, NULL);
+    r->mmio = qpci_iomap(dev, MMIO_BAR, NULL);
+    qpci_device_enable(dev);
+}
+
+static void i2c_go(R350 *r, uint8_t addr, uint8_t count, uint32_t extra)
+{
+    uint32_t cntl0;
+
+    qpci_io_writel(r->dev, r->mmio, I2C_CNTL_1, ((uint32_t)addr << 8) | count);
+    qpci_io_writel(r->dev, r->mmio, I2C_CNTL_0, I2C_GO | extra);
+    cntl0 = qpci_io_readl(r->dev, r->mmio, I2C_CNTL_0);
+    g_assert_cmphex(cntl0 & (I2C_DONE | I2C_NACK), ==, I2C_DONE);
+}
+
+static void read_edid(R350 *r, uint8_t *edid)
+{
+    qpci_io_writel(r->dev, r->mmio, I2C_CNTL_0, I2C_SOFT_RST);
+    qpci_io_writel(r->dev, r->mmio, I2C_DATA, 0);       /* word offset 0 */
+    i2c_go(r, 0xa0, 1, 0);
+    for (int off = 0; off < 128; off += 16) {
+        i2c_go(r, 0xa1, 16, I2C_RECEIVE);
+        for (int i = 0; i < 16; i++) {
+            edid[off + i] = qpci_io_readl(r->dev, r->mmio, I2C_DATA) & 0xff;
+        }
+    }
+}
+
+static void test_edid_default(void)
+{
+    R350 r;
+    uint8_t edid[128];
+
+    r350_start_extra(&r, "");
+    read_edid(&r, edid);
+    r350_stop(&r);
+    g_assert_cmpmem(edid, sizeof(edid), r350_fixed_edid,
+                    sizeof(r350_fixed_edid));
+}
+
+typedef struct {
+    const char *name;
+    const char *props;          /* appended to -device */
+    qemu_edid_info info;        /* the same values, for the generator */
+} EdidCase;
+
+static const EdidCase edid_cases[] = {
+    { "xres-yres", ",xres=1920,yres=1200", { .prefx = 1920, .prefy = 1200 } },
+    { "xmax", ",xmax=1024", { .maxx = 1024 } },
+    { "ymax", ",ymax=768", { .maxy = 768 } },
+    { "refresh-rate", ",refresh_rate=60000", { .refresh_rate = 60000 } },
+};
+
+/* Structure checks that do not lean on the generator */
+static void check_edid_structure(const uint8_t *edid, uint32_t w, uint32_t h)
+{
+    static const uint8_t header[8] = {
+        0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00
+    };
+    const uint8_t *dtd = edid + 54;
+    unsigned sum = 0;
+    bool ranges = false;
+
+    g_assert_cmpmem(edid, 8, header, 8);
+    for (int i = 0; i < 128; i++) {
+        sum += edid[i];
+    }
+    g_assert_cmpuint(sum & 0xff, ==, 0);
+    /* the first descriptor is the preferred mode's detailed timing */
+    g_assert_cmpuint(dtd[0] | dtd[1], !=, 0);
+    g_assert_cmpuint(dtd[2] | ((dtd[4] & 0xf0) << 4), ==, w);
+    g_assert_cmpuint(dtd[5] | ((dtd[7] & 0xf0) << 4), ==, h);
+    for (int d = 72; d < 126; d += 18) {
+        if (!edid[d] && !edid[d + 1] && edid[d + 3] == 0xfd) {
+            ranges = true;
+        }
+    }
+    g_assert_true(ranges);
+}
+
+static void run_edid_case(const void *opaque)
+{
+    const EdidCase *c = opaque;
+    qemu_edid_info info = c->info;
+    uint8_t want[128] = { 0 };
+    uint8_t edid[128];
+    R350 r;
+
+    qemu_edid_generate(want, sizeof(want), &info);
+    r350_start_extra(&r, c->props);
+    read_edid(&r, edid);
+    r350_stop(&r);
+    g_assert_cmpmem(edid, sizeof(edid), want, sizeof(want));
+    check_edid_structure(edid, c->info.prefx ? c->info.prefx : 1280,
+                         c->info.prefy ? c->info.prefy : 800);
+}
+
+/* xres or yres alone would give e.g. 1920x800: realize refuses it */
+static void test_edid_half_pref(void)
+{
+    if (g_test_subprocess()) {
+        R350 r;
+
+        r350_start_extra(&r, g_getenv("R350_EDID_PROPS"));
+        r350_stop(&r);
+        return;
+    }
+    g_setenv("R350_EDID_PROPS", ",xres=1920", true);
+    g_test_trap_subprocess(NULL, 0, 0);
+    g_test_trap_assert_failed();
+    g_test_trap_assert_stderr("*xres and yres*");
+    g_setenv("R350_EDID_PROPS", ",yres=1200", true);
+    g_test_trap_subprocess(NULL, 0, 0);
+    g_test_trap_assert_failed();
+    g_test_trap_assert_stderr("*xres and yres*");
+    g_unsetenv("R350_EDID_PROPS");
+}
+
+static void add_edid_tests(void)
+{
+    qtest_add_func("/ati-r350/edid/default", test_edid_default);
+    for (size_t i = 0; i < G_N_ELEMENTS(edid_cases); i++) {
+        g_autofree char *path = g_strdup_printf("/ati-r350/edid/%s",
+                                                edid_cases[i].name);
+        qtest_add_data_func(path, &edid_cases[i], run_edid_case);
+    }
+    qtest_add_func("/ati-r350/edid/half-pref", test_edid_half_pref);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -951,5 +1124,6 @@ int main(int argc, char **argv)
     qtest_add_func("/ati-r350/bitblt-multi/unsized-brush",
                    test_bitblt_multi_unsized_brush);
     add_cursor_tests();
+    add_edid_tests();
     return g_test_run();
 }

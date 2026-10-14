@@ -5566,6 +5566,12 @@ static void ati_r350_realize(PCIDevice *dev, Error **errp)
     ATIR350State *s = ATI_R350(dev);
     Object *obj = OBJECT(dev);
 
+    /* qemu_edid_generate() would make 1920x800 out of xres=1920 alone */
+    if (!s->edid_info.prefx != !s->edid_info.prefy) {
+        error_setg(errp, "xres and yres must be given together");
+        return;
+    }
+
     s->con = qemu_graphic_console_create(DEVICE(dev), 0,
                                          &ati_r350_gfx_ops, s);
 
@@ -5835,7 +5841,17 @@ static void ati_r350_realize(PCIDevice *dev, Error **errp)
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x76,
     };
 
-    memcpy(s->edid, rage128_default_edid, sizeof(s->edid));
+    /*
+     * Any of the standard EDID properties asks for the generated EDID that
+     * std-vga uses (larger modes, but a digital 50-125Hz monitor); without
+     * them the guest keeps seeing the period CRT above.
+     */
+    if (s->edid_info.prefx || s->edid_info.maxx || s->edid_info.maxy ||
+        s->edid_info.refresh_rate) {
+        qemu_edid_generate(s->edid, sizeof(s->edid), &s->edid_info);
+    } else {
+        memcpy(s->edid, rage128_default_edid, sizeof(s->edid));
+    }
 
     /*
      * The MONID bit-banged DDC bus (see the R350_GPIO_MONID write
