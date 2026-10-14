@@ -310,6 +310,44 @@ typedef struct ATIR350Mode {
 } ATIR350Mode;
 
 /*
+ * The guest's hardware cursor as guest_hwcursor draws it into the console
+ * surface: the confirmed cursor (CUR_* registers already decoded), not the
+ * registers themselves. The image is in the surface's own xRGB format, with
+ * the operation per pixel kept apart from the colour: a pixel value cannot
+ * tell "invert" from "alpha 0x80, black". For SPRITE_BLEND the top byte of
+ * the pixel carries the alpha (straight, not premultiplied).
+ */
+#define ATI_R350_SPRITE_DIM 64
+
+enum {
+    ATI_R350_OP_NONE,           /* transparent, or hidden by CUR_*_OFF */
+    ATI_R350_OP_SET,            /* opaque colour */
+    ATI_R350_OP_BLEND,          /* partial alpha */
+    ATI_R350_OP_INVERT,         /* invert the RGB underneath */
+};
+
+typedef struct ATIR350Sprite {
+    bool on;
+    int x, y;                   /* where map column/row 0 lands; may be < 0 */
+    uint32_t serial;            /* bumped on every change of the above */
+    uint32_t pix[ATI_R350_SPRITE_DIM * ATI_R350_SPRITE_DIM];
+    uint8_t op[ATI_R350_SPRITE_DIM * ATI_R350_SPRITE_DIM];
+} ATIR350Sprite;
+
+/*
+ * What the sprite covers on the console surface, saved before it was drawn
+ * (save-under). Belongs to whoever owns the display job: the worker while a
+ * job is in flight, the main loop otherwise.
+ */
+typedef struct ATIR350SaveUnder {
+    bool valid;
+    struct DisplaySurface *ds;  /* the surface the pixels belong to */
+    int x, y, w, h;             /* clipped to that surface */
+    uint32_t serial;            /* ATIR350Sprite.serial that was drawn */
+    uint32_t px[ATI_R350_SPRITE_DIM * ATI_R350_SPRITE_DIM];
+} ATIR350SaveUnder;
+
+/*
  * One frame for the display worker to convert, filled on the main loop
  * while the worker is idle; see "ASYNC DISPLAY" in ati_r350.c.
  */
@@ -319,6 +357,9 @@ typedef struct ATIR350DispJob {
     const uint8_t *vram;
     const uint8_t (*pal)[3];    /* palette, or the device's own */
     uint8_t palette[256][3];
+    /* guest_hwcursor: both NULL otherwise; spr NULL when the cursor is off */
+    const ATIR350Sprite *spr;
+    ATIR350SaveUnder *save;
 } ATIR350DispJob;
 
 enum {
@@ -915,6 +956,17 @@ struct ATIR350State {
      */
     bool hw_cursor_on;
     uint32_t hw_cursor_sum;
+    /*
+     * guest_hwcursor (property): draw the cursor into the console surface
+     * instead of handing a QEMUCursor to the UI. spr is the confirmed
+     * cursor, spr_snap the copy a display job works from while the main
+     * loop may change spr, spr_save the save-under. None of it is migrated:
+     * the CUR_* registers are, and the surface is drawn afresh.
+     */
+    bool guest_hwcursor;
+    ATIR350Sprite spr;
+    ATIR350Sprite spr_snap;
+    ATIR350SaveUnder spr_save;
     /*
      * CUR_LOCK is a single bit that merely appears in bit 31 of all three
      * of CUR_OFFSET / CUR_HORZ_VERT_POSN / CUR_HORZ_VERT_OFF (RRG 3-80):

@@ -544,6 +544,125 @@ static void ati_r350_draw(const ATIR350DispJob *j)
 }
 
 /*
+ * guest_hwcursor: the confirmed cursor drawn into a surface, with the
+ * pixels it covers saved first (save-under). These touch only the surface
+ * and the arguments -- they run on the display worker as well as on the
+ * main loop, and call nothing that needs the BQL.
+ */
+static bool ati_r350_sprite_clip(const ATIR350Sprite *sp, DisplaySurface *ds,
+                                 int *x0, int *y0, int *w, int *h)
+{
+    int sx = MAX(sp->x, 0);
+    int sy = MAX(sp->y, 0);
+    int ex = MIN(sp->x + ATI_R350_SPRITE_DIM, surface_width(ds));
+    int ey = MIN(sp->y + ATI_R350_SPRITE_DIM, surface_height(ds));
+
+    if (ex <= sx || ey <= sy) {
+        return false;
+    }
+    *x0 = sx;
+    *y0 = sy;
+    *w = ex - sx;
+    *h = ey - sy;
+    return true;
+}
+
+static uint32_t ati_r350_sprite_blend(uint32_t src, uint32_t dst)
+{
+    unsigned a = src >> 24;
+    uint32_t out = 0xff000000u;
+    int sh;
+
+    for (sh = 0; sh < 24; sh += 8) {
+        unsigned sc = (src >> sh) & 0xff;
+        unsigned dc = (dst >> sh) & 0xff;
+
+        out |= ((sc * a + dc * (255 - a) + 127) / 255) << sh;
+    }
+    return out;
+}
+
+/*
+ * Save what @sp covers on @ds into @sv, then draw it. @sv->valid says
+ * whether anything was saved (a cursor wholly off the surface saves
+ * nothing).
+ */
+static void ati_r350_sprite_draw(DisplaySurface *ds, const ATIR350Sprite *sp,
+                                 ATIR350SaveUnder *sv)
+{
+    int x0, y0, w, h, x, y;
+
+    sv->valid = false;
+    if (!sp->on || surface_bits_per_pixel(ds) != 32 ||
+        !ati_r350_sprite_clip(sp, ds, &x0, &y0, &w, &h)) {
+        return;
+    }
+    for (y = 0; y < h; y++) {
+        memcpy(&sv->px[y * w],
+               (uint32_t *)((uint8_t *)surface_data(ds) +
+                            (y0 + y) * surface_stride(ds)) + x0, w * 4);
+    }
+    sv->ds = ds;
+    sv->x = x0;
+    sv->y = y0;
+    sv->w = w;
+    sv->h = h;
+    sv->serial = sp->serial;
+    sv->valid = true;
+
+    for (y = 0; y < h; y++) {
+        uint32_t *dst = (uint32_t *)((uint8_t *)surface_data(ds) +
+                                     (y0 + y) * surface_stride(ds)) + x0;
+        unsigned i = (y0 + y - sp->y) * ATI_R350_SPRITE_DIM + (x0 - sp->x);
+
+        for (x = 0; x < w; x++, i++) {
+            switch (sp->op[i]) {
+            case ATI_R350_OP_SET:
+                dst[x] = 0xff000000u | (sp->pix[i] & 0xffffffu);
+                break;
+            case ATI_R350_OP_BLEND:
+                dst[x] = ati_r350_sprite_blend(sp->pix[i], dst[x]);
+                break;
+            case ATI_R350_OP_INVERT:
+                dst[x] ^= 0x00ffffffu;
+                break;
+            default:
+                break;
+            }
+        }
+    }
+}
+
+/* put back what ati_r350_sprite_draw() saved; @sv must belong to @ds */
+static void ati_r350_sprite_restore(DisplaySurface *ds, ATIR350SaveUnder *sv)
+{
+    int y;
+
+    for (y = 0; y < sv->h; y++) {
+        memcpy((uint32_t *)((uint8_t *)surface_data(ds) +
+                            (sv->y + y) * surface_stride(ds)) + sv->x,
+               &sv->px[y * sv->w], sv->w * 4);
+    }
+    sv->valid = false;
+}
+
+/*
+ * Right after the conversion, in the same job: it rewrote the whole
+ * surface, so whatever was saved before is stale (and the cursor it drew is
+ * gone); save what is there now and draw the cursor the job carries.
+ */
+static void ati_r350_job_sprite(const ATIR350DispJob *j)
+{
+    if (!j->save) {
+        return;
+    }
+    j->save->valid = false;
+    if (j->spr) {
+        ati_r350_sprite_draw(j->ds, j->spr, j->save);
+    }
+}
+
+/*
  * Auto-detect the real, currently-live framebuffer via VRAM write
  * activity rather than any register. Live testing (2026-08-02, both
  * Mac OS X 10.2 and Mac OS 9.2) found CRTC1's "Extended" mode-set
@@ -881,6 +1000,65 @@ static void ati_r350_cursor_update(ATIR350State *s);
 static void ati_r350_cursor_apply(ATIR350State *s);
 
 /*
+ * guest_hwcursor, the one way the main loop brings the console surface in
+ * line with the confirmed cursor (s->spr): the timer, the refresh tick,
+ * CUR_EN going down, reset and the display hand-over all end up here.
+ *
+ * With the display worker busy (a job queued, running or done but not yet
+ * handed over) the surface is the worker's, and so is the save-under; this
+ * only leaves the cursor as it is. That is the "not yet drawn" mark: the
+ * save-under carries the serial of the cursor it drew, and the hand-over
+ * calls this again once the frame is in. When idle, the old rectangle is put
+ * back from the save-under and the cursor is saved and drawn anew, each
+ * rectangle announced to the console.
+ */
+static void ati_r350_sprite_sync(ATIR350State *s)
+{
+    ATIR350SaveUnder *sv = &s->spr_save;
+    const ATIR350Sprite *sp = &s->spr;
+    DisplaySurface *ds;
+    bool want;
+
+    if (!s->guest_hwcursor || !s->con) {
+        return;
+    }
+    if (s->disp_on) {
+        unsigned state;
+
+        qemu_mutex_lock(&s->disp_lock);
+        state = s->disp_state;
+        qemu_mutex_unlock(&s->disp_lock);
+        if (state != ATI_R350_DISP_IDLE) {
+            return;
+        }
+    }
+    ds = qemu_console_surface(s->con);
+    /* only a surface the refresh has drawn a frame into gets the cursor */
+    want = sp->on && ds && s->mode.width &&
+           surface_width(ds) == s->mode.width &&
+           surface_height(ds) == s->mode.height;
+    if (want ? (sv->valid && sv->ds == ds && sv->serial == sp->serial)
+             : !sv->valid) {
+        return;
+    }
+    if (sv->valid) {
+        if (sv->ds == ds) {
+            trace_ati_r350_sprite_blit(sv->x, sv->y, sv->w, sv->h, true);
+            ati_r350_sprite_restore(ds, sv);
+            qemu_console_update(s->con, sv->x, sv->y, sv->w, sv->h);
+        }
+        sv->valid = false;
+    }
+    if (want) {
+        ati_r350_sprite_draw(ds, sp, sv);
+        if (sv->valid) {
+            trace_ati_r350_sprite_blit(sv->x, sv->y, sv->w, sv->h, false);
+            qemu_console_update(s->con, sv->x, sv->y, sv->w, sv->h);
+        }
+    }
+}
+
+/*
  * The refresh's decisions, BQL held: consume the dirty bitmap, settle
  * the mode, give the console a surface of its size, and say whether the
  * picture changed. Returns false when there is nothing to show at all.
@@ -1037,6 +1215,8 @@ static bool ati_r350_refresh_prepare(ATIR350State *s, ATIR350Mode *out,
                                           mode.width, mode.height, mode.bpp,
                                           mode.fb_offset, mode.pitch);
         ds = qemu_create_displaysurface(mode.width, mode.height);
+        /* the save-under belonged to the old surface: nothing to put back */
+        s->spr_save.valid = false;
         qemu_console_set_surface(s->con, ds);
         redraw = true;
     }
@@ -1128,6 +1308,20 @@ static void ati_r350_disp_post(ATIR350State *s, const ATIR350Mode *mode)
     j->vram = memory_region_get_ram_ptr(&s->vram);
     memcpy(j->palette, s->palette, sizeof(j->palette));
     j->pal = (const uint8_t (*)[3])j->palette;
+    /*
+     * The worker draws the cursor right after the conversion, from a copy:
+     * the main loop may change s->spr while the job runs. The save-under is
+     * the worker's until the hand-over.
+     */
+    j->spr = NULL;
+    j->save = NULL;
+    if (s->guest_hwcursor) {
+        if (s->spr.on) {
+            s->spr_snap = s->spr;
+            j->spr = &s->spr_snap;
+        }
+        j->save = &s->spr_save;
+    }
     qemu_mutex_lock(&s->disp_lock);
     s->disp_state = ATI_R350_DISP_QUEUED;
     qemu_cond_signal(&s->disp_cond);
@@ -1180,9 +1374,12 @@ static void ati_r350_disp_handover(void *opaque)
     if (qemu_console_surface(s->con) == s->disp_job.ds) {
         s->disp_frames++;
         ati_r350_cursor_apply(s);
+        /* the cursor the job drew may be out of date by now */
+        ati_r350_sprite_sync(s);
         qemu_console_update_full(s->con);
     } else {
         s->force_redraw = true;
+        ati_r350_sprite_sync(s);
     }
     if (s->disp_tick_missed) {
         s->disp_tick_missed = false;
@@ -1209,6 +1406,7 @@ static void *ati_r350_disp_thread(void *opaque)
         qemu_mutex_unlock(&s->disp_lock);
 
         ati_r350_draw(&s->disp_job);
+        ati_r350_job_sprite(&s->disp_job);
 
         qemu_mutex_lock(&s->disp_lock);
         s->disp_state = ATI_R350_DISP_DONE;
@@ -1281,8 +1479,17 @@ static bool ati_r350_update_display(void *opaque)
     j.ds = qemu_console_surface(s->con);
     j.vram = memory_region_get_ram_ptr(&s->vram);
     j.pal = (const uint8_t (*)[3])s->palette;
+    j.spr = NULL;
+    j.save = NULL;
+    if (s->guest_hwcursor) {
+        j.spr = s->spr.on ? &s->spr : NULL;
+        j.save = &s->spr_save;
+    }
     ati_r350_draw(&j);
+    ati_r350_job_sprite(&j);
     ati_r350_cursor_apply(s);
+    /* whether or not the registers said anything new: see the 2-stage note */
+    ati_r350_sprite_sync(s);
     qemu_console_update_full(s->con);
 
     return true;
@@ -4790,6 +4997,15 @@ static void ati_r350_reset_hold(Object *obj, ResetType type)
     }
     s->hw_cursor_sum = 0;
     s->cur_lock = false;
+    if (s->guest_hwcursor) {
+        /*
+         * Without a valid mode the surface keeps the last frame (see
+         * ati_r350_refresh_prepare), cursor included: take it off.
+         */
+        s->spr.on = false;
+        s->spr.serial++;
+        ati_r350_sprite_sync(s);
+    }
 
     /* command-stream framing and the host-data accumulator */
     memset(&s->pm4_fifo, 0, sizeof(s->pm4_fifo));
@@ -4876,9 +5092,144 @@ static void ati_r350_reset_hold(Object *obj, ResetType type)
  * classic Mac cursors only use that code to soften edges.
  */
 /*
+ * guest_hwcursor: the cursor registers decoded into s->spr, the way
+ * ati_r350_cursor_apply() decodes them into a QEMUCursor below (keep the
+ * two in step): colours in the surface's own xRGB, and what each pixel does
+ * in op. CUR_CLR0/1 and the pixels are 0x00RRGGBB / 0xAARRGGBB already.
+ */
+static void ati_r350_sprite_decode(ATIR350State *s)
+{
+    uint32_t coff = s->regs[R350_CUR_HORZ_VERT_OFF >> 2];
+    uint32_t vram_off = s->regs[R350_CUR_OFFSET >> 2] & R350_CUR_OFFSET_MASK;
+    uint32_t clr0 = 0xff000000u | (s->regs[R350_CUR_CLR0 >> 2] & 0xffffffu);
+    uint32_t clr1 = 0xff000000u | (s->regs[R350_CUR_CLR1 >> 2] & 0xffffffu);
+    unsigned horz_off = (coff >> R350_CUR_HORZ_OFF_SHIFT) &
+                        R350_CUR_HORZ_OFF_MASK;
+    unsigned vert_off = coff & R350_CUR_VERT_OFF_MASK;
+    unsigned cur_mode = (s->regs[R350_CRTC_GEN_CNTL >> 2] >>
+                         R350_CRTC_CUR_MODE_SHIFT) & R350_CRTC_CUR_MODE_MASK;
+    bool argb = (cur_mode == R350_CUR_MODE_ARGB_CODED ||
+                 cur_mode == R350_CUR_MODE_ARGB_ALPHA);
+    unsigned row_bytes = argb ? R350_CUR_ARGB_ROW_BYTES : R350_CUR_ROW_BYTES;
+    const uint8_t *src = (const uint8_t *)memory_region_get_ram_ptr(&s->vram) +
+                         vram_off;
+    ATIR350Sprite *sp = &s->spr;
+    unsigned row, px;
+
+    QEMU_BUILD_BUG_ON(ATI_R350_SPRITE_DIM != R350_CUR_WIDTH ||
+                      ATI_R350_SPRITE_DIM != R350_CUR_HEIGHT);
+    for (row = 0; row < R350_CUR_HEIGHT; row++) {
+        for (px = 0; px < R350_CUR_WIDTH; px++) {
+            unsigned i = row * R350_CUR_WIDTH + px;
+            uint32_t val = 0;
+            uint8_t op = ATI_R350_OP_NONE;
+
+            if (row >= R350_CUR_HEIGHT - vert_off || px < horz_off) {
+                /* outside the cursor */
+            } else if (argb) {
+                uint32_t p = ati_r350_vram_ld32(s, vram_off +
+                                                row * row_bytes + px * 4);
+
+                if (cur_mode == R350_CUR_MODE_ARGB_CODED) {
+                    /*
+                     * Bit 31 marks the two special codes; the low 24 bits
+                     * then say which. Anything else is an opaque colour.
+                     */
+                    if (!(p & 0x80000000u)) {
+                        val = p & 0xffffffu;
+                        op = ATI_R350_OP_SET;
+                    } else if ((p & 0xffffffu) == 0xffffffu) {
+                        op = ATI_R350_OP_INVERT;
+                    }
+                } else if ((p >> 24) == 0xff) {
+                    val = p & 0xffffffu;
+                    op = ATI_R350_OP_SET;
+                } else if ((p >> 24) != 0) {
+                    val = p;                /* alpha stays in the top byte */
+                    op = ATI_R350_OP_BLEND;
+                }
+            } else {
+                const uint8_t *line = src + row * row_bytes;
+                unsigned bit = 7 - (px & 7);
+                unsigned and_bit = (line[px >> 3] >> bit) & 1;
+                unsigned xor_bit = (line[8 + (px >> 3)] >> bit) & 1;
+
+                if (!and_bit) {
+                    val = (xor_bit ? clr1 : clr0) & 0xffffffu;
+                    op = ATI_R350_OP_SET;
+                } else if (xor_bit) {
+                    op = ATI_R350_OP_INVERT;
+                }
+            }
+            sp->pix[i] = val;
+            sp->op[i] = op;
+        }
+    }
+}
+
+/* the built-in arrow (an RGBA QEMUCursor) as a sprite */
+static void ati_r350_sprite_from_arrow(ATIR350State *s)
+{
+    QEMUCursor *c = ati_r350_builtin_arrow();
+    ATIR350Sprite *sp = &s->spr;
+    unsigned row, col;
+
+    memset(sp->pix, 0, sizeof(sp->pix));
+    memset(sp->op, ATI_R350_OP_NONE, sizeof(sp->op));
+    for (row = 0; row < c->height; row++) {
+        for (col = 0; col < c->width; col++) {
+            uint32_t v = c->data[row * c->width + col];
+            unsigned i = row * R350_CUR_WIDTH + col;
+
+            if (v >> 24) {
+                sp->pix[i] = ((v & 0xff) << 16) | (v & 0xff00) |
+                             ((v >> 16) & 0xff);
+                sp->op[i] = ATI_R350_OP_SET;
+            }
+        }
+    }
+    cursor_unref(c);
+}
+
+/*
+ * The sprite in s->spr is the cursor now, at (x, y). The UI gets one
+ * transparent cursor and a pointer position when the guest's cursor first
+ * shows (the sprite is the only cursor anybody sees); after that it hears
+ * nothing from here.
+ */
+static void ati_r350_sprite_take(ATIR350State *s, int x, int y, uint32_t sum)
+{
+    bool was_on = s->hw_cursor_on;
+
+    s->spr.x = x;
+    s->spr.y = y;
+    s->spr.on = true;
+    s->spr.serial++;
+    trace_ati_r350_sprite_set(x, y, true, s->spr.serial);
+    s->hw_cursor_on = true;
+    s->hw_cursor_sum = sum;
+    s->hw_cursor_x = x;
+    s->hw_cursor_y = y;
+    if (!was_on) {
+        QEMUCursor *c = cursor_alloc(16, 16);
+
+        qemu_console_set_cursor(s->con, c);     /* all zero: invisible */
+        cursor_unref(c);
+        qemu_console_set_mouse(s->con, 0, 0, true);
+    }
+    ati_r350_sprite_sync(s);
+}
+
+/*
  * Apply the cursor registers to the host pointer. Called from the
  * coalescing timer (see ati_r350_cursor_update) and from the display
  * refresh path.
+ *
+ * With guest_hwcursor this is the first of two stages: registers to the
+ * confirmed cursor in s->spr (CUR_LOCK, the unchanged-image shortcut, the
+ * VRAM range and CUR_EN are decided here and only here), then
+ * ati_r350_sprite_sync() puts it on the surface. The host pointer is not
+ * touched beyond the transparent cursor in ati_r350_sprite_take().
  */
 static void ati_r350_cursor_apply(ATIR350State *s)
 {
@@ -4934,8 +5285,15 @@ static void ati_r350_cursor_apply(ATIR350State *s)
             trace_ati_r350_cursor_off(s->hw_cursor_x, s->hw_cursor_y);
             s->hw_cursor_on = false;
             s->hw_cursor_sum = 0;
+            if (s->guest_hwcursor) {
+                s->spr.on = false;
+                s->spr.serial++;
+                trace_ati_r350_sprite_set(s->spr.x, s->spr.y, false,
+                                          s->spr.serial);
+            }
             qemu_console_set_mouse(s->con, 0, 0, false);
         }
+        ati_r350_sprite_sync(s);
         return;
     }
     if ((uint64_t)vram_off + image_bytes > ATI_R350_VRAM_SIZE) {
@@ -4989,7 +5347,15 @@ static void ati_r350_cursor_apply(ATIR350State *s)
             trace_ati_r350_cursor_move(vram_off, x, y, sum);
             s->hw_cursor_x = x;
             s->hw_cursor_y = y;
-            qemu_console_set_mouse(s->con, x, y, true);
+            if (s->guest_hwcursor) {
+                s->spr.x = x;
+                s->spr.y = y;
+                s->spr.serial++;
+                trace_ati_r350_sprite_set(x, y, true, s->spr.serial);
+                ati_r350_sprite_sync(s);
+            } else {
+                qemu_console_set_mouse(s->con, x, y, true);
+            }
         }
         return;
     }
@@ -5021,6 +5387,11 @@ static void ati_r350_cursor_apply(ATIR350State *s)
             /* substitute the built-in arrow: anything defined earlier
              * (or the box the junk decodes to) would persist otherwise,
              * since a console cursor cannot be undefined */
+            if (s->guest_hwcursor) {
+                ati_r350_sprite_from_arrow(s);
+                ati_r350_sprite_take(s, x, y, sum);
+                return;
+            }
             c = ati_r350_builtin_arrow();
             qemu_console_set_cursor(s->con, c);
             cursor_unref(c);
@@ -5031,6 +5402,12 @@ static void ati_r350_cursor_apply(ATIR350State *s)
             qemu_console_set_mouse(s->con, x, y, true);
             return;
         }
+    }
+
+    if (s->guest_hwcursor) {
+        ati_r350_sprite_decode(s);
+        ati_r350_sprite_take(s, x, y, sum);
+        return;
     }
 
     c = cursor_alloc(R350_CUR_WIDTH, R350_CUR_HEIGHT);
@@ -5593,6 +5970,14 @@ static const Property ati_r350_properties[] = {
     DEFINE_PROP_UINT32("fillwatch", ATIR350State, fillwatch_off, 0),
     DEFINE_PROP_UINT32("fillwatch-size", ATIR350State, fillwatch_size, 0),
     DEFINE_PROP_BOOL("second-display", ATIR350State, second_display, false),
+    /*
+     * Draw the guest's hardware cursor into the console surface instead of
+     * handing the UI a cursor. The registers carry no hot spot, so a UI
+     * that puts the cursor's hot spot (0,0) under its own pointer draws it
+     * offset by the cursor's real one; drawn here, the tip is where the
+     * guest put it. Off by default: the cursor goes to the UI as before.
+     */
+    DEFINE_PROP_BOOL("guest_hwcursor", ATIR350State, guest_hwcursor, false),
     /*
      * Diagnostic only: name a file and every draw the 3D engine runs is
      * written to it as a self-contained replay record for

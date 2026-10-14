@@ -253,6 +253,8 @@ ati_r350_pm4_p3_hdr(uint32_t opcode, uint32_t count) "packet3 opcode=0x%02x coun
 ati_r350_cursor_move(uint32_t off, int x, int y, uint32_t sum) "cursor move only @0x%x to (%d,%d) sum=0x%08x"
 ati_r350_cursor_upload(uint32_t off, unsigned hoff, unsigned voff, int x, int y, uint32_t p00, uint32_t p40, uint32_t p44) "cursor image @0x%x hoff=%u voff=%u at (%d,%d) px[0,0]=0x%08x px[0,4]=0x%08x px[4,4]=0x%08x"
 ati_r350_cursor_off(int x, int y) "cursor disabled (CRTC_CUR_EN clear), was at (%d,%d)"
+ati_r350_sprite_set(int x, int y, bool on, uint32_t serial) "guest cursor at (%d,%d) on=%d serial=%u"
+ati_r350_sprite_blit(int x, int y, int w, int h, bool restore) "guest cursor rect (%d,%d) %dx%d restore=%d"
 ati_r350_cur_reg(const char *name, uint32_t val, bool locked) "%s <- 0x%08x lock=%d"
 ati_r350_cursor_dump(uint32_t cur_offset, uint32_t off, uint64_t hi, uint64_t lo) "cur_offset=0x%x vram[0x%03x]=%016" PRIx64 "%016" PRIx64
 ati_r350_surface_realloc(int old_w, int old_h, unsigned w, unsigned h, unsigned bpp, uint32_t fb_offset, unsigned pitch) "DisplaySurface %dx%d -> %ux%u bpp=%u fb_offset=0x%x pitch=%u"

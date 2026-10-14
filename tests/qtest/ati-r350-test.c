@@ -10,6 +10,8 @@
 #include "libqtest.h"
 #include "libqos/libqos-spapr.h"
 #include "libqos/pci.h"
+#include "qemu/bswap.h"
+#include "qobject/qdict.h"
 
 #define R350_VENDOR_ID          0x1002
 #define R350_DEVICE_ID          0x4e48
@@ -62,12 +64,19 @@ static void find_r350(QPCIDevice *dev, int devfn, void *data)
     *(QPCIDevice **)data = dev;
 }
 
-static void r350_start(R350 *r)
+/*
+ * @async_display picks async-display=on / off; @hwcursor, when set, adds
+ * guest_hwcursor=on (the property is left out otherwise, so a build without
+ * it still runs the cases that do not need it).
+ */
+static void r350_start_cfg(R350 *r, bool async_display, bool hwcursor)
 {
     QPCIDevice *dev = NULL;
 
     r->qs = qtest_spapr_boot("-vga none -device ati-radeon9800,"
-                             "async-engine=off,async-display=off");
+                             "async-engine=off,async-display=%s%s",
+                             async_display ? "on" : "off",
+                             hwcursor ? ",guest_hwcursor=on" : "");
     qpci_device_foreach(r->qs->pcibus, R350_VENDOR_ID, R350_DEVICE_ID,
                         find_r350, &dev);
     g_assert(dev);
@@ -77,6 +86,11 @@ static void r350_start(R350 *r)
     qpci_device_enable(dev);
 
     qpci_io_writel(dev, r->mmio, DEFAULT_SC_BOTTOM_RIGHT, 0x1fff1fff);
+}
+
+static void r350_start(R350 *r)
+{
+    r350_start_cfg(r, false, false);
 }
 
 static void r350_stop(R350 *r)
@@ -332,6 +346,591 @@ static void test_bitblt_multi_unsized_brush(void)
     r350_stop(&r);
 }
 
+/*
+ * Hardware cursor drawn into the console surface (guest_hwcursor, #451).
+ *
+ * The scanout is a small 32bpp mode; the picture is read back with
+ * screendump (PPM), so what is compared is the console surface itself, not
+ * the cursor handed to a UI. Every case runs with async-display=off (the
+ * conversion and the overlay on the main loop) and =on (the worker does
+ * both).
+ */
+#define CRTC_GEN_CNTL           0x0050
+#define CRTC_EXT_CNTL           0x0054
+#define CRTC_H_TOTAL_DISP       0x0200
+#define CRTC_V_TOTAL_DISP       0x0208
+#define CRTC_OFFSET             0x0224
+#define CRTC_PITCH              0x022c
+#define CUR_OFFSET              0x0260
+#define CUR_HORZ_VERT_POSN      0x0264
+#define CUR_HORZ_VERT_OFF       0x0268
+
+#define GEN_CRTC_EXT_DISP_EN    (1u << 24)
+#define GEN_CRTC_EN             (1u << 25)
+#define GEN_PIX_WIDTH_32BPP     (6u << 8)
+#define GEN_CUR_EN              (1u << 16)
+#define GEN_CUR_MODE(m)         ((uint32_t)(m) << 20)
+#define CUR_LOCK                (1u << 31)
+
+#define SCR_W           160
+#define SCR_H           112
+#define FB_OFF          0x100000
+/* the cursor images sit outside the scanned-out range */
+#define IMG_A           0x10000
+#define IMG_B           0x18000
+#define CUR_SIZE        64
+
+/* mode 1 (ARGB coded): bit 31 set and the low 24 bits not all ones */
+#define TRANSP1         0x80000000u
+#define INVERT1         0x80ffffffu
+
+typedef struct {
+    bool async;
+    bool hw;
+} Cfg;
+
+typedef struct {
+    uint32_t px[SCR_W * SCR_H];         /* 0x00RRGGBB */
+} Screen;
+
+/* a cursor image dword at (x, y) of the 64x64 map, as the guest stores it */
+typedef struct {
+    int x, y;
+    uint32_t v;
+} CPx;
+
+static void wr(R350 *r, uint32_t reg, uint32_t v)
+{
+    qpci_io_writel(r->dev, r->mmio, reg, v);
+}
+
+/*
+ * R is always odd and G always odd, so no background pixel is pure red,
+ * pure blue or any colour the cases draw with an even R
+ */
+static uint32_t bg_color(int x, int y)
+{
+    return ((((x * 2 + 1) & 0xff) << 16) | (((y * 2 + 3) & 0xff) << 8) |
+            (((x ^ y) * 3 + 7) & 0xff));
+}
+
+static Screen *screen_new(void)
+{
+    Screen *s = g_new0(Screen, 1);
+
+    for (int y = 0; y < SCR_H; y++) {
+        for (int x = 0; x < SCR_W; x++) {
+            s->px[y * SCR_W + x] = bg_color(x, y);
+        }
+    }
+    return s;
+}
+
+static void scr_put(Screen *s, int x, int y, uint32_t c)
+{
+    if (x >= 0 && x < SCR_W && y >= 0 && y < SCR_H) {
+        s->px[y * SCR_W + x] = c & 0xffffff;
+    }
+}
+
+static void vram_write32(R350 *r, uint64_t off, const uint32_t *dw, size_t n)
+{
+    uint32_t *le = g_new(uint32_t, n);
+
+    for (size_t i = 0; i < n; i++) {
+        le[i] = cpu_to_le32(dw[i]);
+    }
+    qpci_memwrite(r->dev, r->vram, off, le, n * 4);
+    g_free(le);
+}
+
+/* the whole scanned-out frame, from @s */
+static void fb_write(R350 *r, const Screen *s)
+{
+    vram_write32(r, FB_OFF, s->px, SCR_W * SCR_H);
+}
+
+/* change one scanned-out pixel in VRAM and in the expectation */
+static void bg_set(R350 *r, Screen *s, int x, int y, uint32_t c)
+{
+    vram_write32(r, FB_OFF + (uint64_t)(y * SCR_W + x) * 4, &c, 1);
+    scr_put(s, x, y, c);
+}
+
+static void scr_mode(R350 *r)
+{
+    /* the reset value has CRTC_DISPLAY_DIS set; the mode is not valid so */
+    wr(r, CRTC_EXT_CNTL, 0);
+    wr(r, CRTC_H_TOTAL_DISP, ((SCR_W / 8 - 1) << 16) | (SCR_W / 8 - 1));
+    wr(r, CRTC_V_TOTAL_DISP, ((SCR_H - 1) << 16) | (SCR_H - 1));
+    wr(r, CRTC_PITCH, SCR_W / 8);
+    wr(r, CRTC_OFFSET, FB_OFF);
+    wr(r, CRTC_GEN_CNTL, GEN_CRTC_EN | GEN_CRTC_EXT_DISP_EN |
+                         GEN_PIX_WIDTH_32BPP);
+}
+
+/* the 1ms cursor timer runs on the virtual clock */
+static void settle(R350 *r)
+{
+    qtest_clock_step(r->qs->qts, 2 * 1000 * 1000);
+}
+
+static void screendump(R350 *r, uint32_t *out)
+{
+    g_autofree char *name = NULL;
+    g_autofree char *data = NULL;
+    GError *err = NULL;
+    QDict *rsp;
+    gsize len;
+    int w, h, hdr = 0, fd;
+
+    fd = g_file_open_tmp("ati-r350-XXXXXX.ppm", &name, &err);
+    g_assert_no_error(err);
+    close(fd);
+    rsp = qtest_qmp(r->qs->qts, "{'execute': 'screendump',"
+                    " 'arguments': {'filename': %s}}", name);
+    g_assert(!qdict_haskey(rsp, "error"));
+    qobject_unref(rsp);
+    g_assert(g_file_get_contents(name, &data, &len, &err));
+    g_assert_no_error(err);
+    unlink(name);
+
+    g_assert_cmpint(sscanf(data, "P6\n%d %d\n255\n%n", &w, &h, &hdr), ==, 2);
+    g_assert_cmpint(w, ==, SCR_W);
+    g_assert_cmpint(h, ==, SCR_H);
+    g_assert_cmpuint(len, ==, hdr + (gsize)w * h * 3);
+    for (int i = 0; i < w * h; i++) {
+        const uint8_t *p = (const uint8_t *)data + hdr + i * 3;
+
+        out[i] = (p[0] << 16) | (p[1] << 8) | p[2];
+    }
+}
+
+static bool near(uint32_t a, uint32_t b, int tol)
+{
+    for (int sh = 0; sh < 24; sh += 8) {
+        int d = (int)((a >> sh) & 0xff) - (int)((b >> sh) & 0xff);
+
+        if (d > tol || d < -tol) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* the picture is exactly @exp (each channel within @tol) */
+static void assert_screen(R350 *r, const Screen *exp, int tol)
+{
+    uint32_t *got = g_new(uint32_t, SCR_W * SCR_H);
+    int bad = 0;
+
+    screendump(r, got);
+    for (int y = 0; y < SCR_H; y++) {
+        for (int x = 0; x < SCR_W; x++) {
+            uint32_t g = got[y * SCR_W + x], e = exp->px[y * SCR_W + x];
+
+            if (!near(g, e, tol)) {
+                if (bad++ < 8) {
+                    g_printerr("screen (%d,%d): got 0x%06x want 0x%06x\n",
+                               x, y, g, e);
+                }
+            }
+        }
+    }
+    g_assert_cmpint(bad, ==, 0);
+    g_free(got);
+}
+
+/* the 64x64 map: every dword @fill, then the listed ones */
+static void cur_image(R350 *r, uint32_t vram_off, uint32_t fill,
+                      const CPx *pts, size_t n)
+{
+    uint32_t img[CUR_SIZE * CUR_SIZE];
+
+    for (int i = 0; i < CUR_SIZE * CUR_SIZE; i++) {
+        img[i] = fill;
+    }
+    for (size_t i = 0; i < n; i++) {
+        img[pts[i].y * CUR_SIZE + pts[i].x] = pts[i].v;
+    }
+    vram_write32(r, vram_off, img, CUR_SIZE * CUR_SIZE);
+}
+
+/*
+ * Program the cursor as the guest does: image, hidden columns/rows,
+ * position (CUR_HORZ_VERT_POSN carries the position *before* the hidden
+ * columns are taken off), then the enable and format in CRTC_GEN_CNTL.
+ * @lock is OR-ed into every cursor register: CUR_LOCK is one bit shared by
+ * the three, set or cleared by the last write to any of them.
+ */
+static void cur_prog(R350 *r, unsigned mode, uint32_t vram_off, int hx, int y,
+                     unsigned hoff, unsigned voff, bool en, uint32_t lock)
+{
+    wr(r, CUR_OFFSET, vram_off | lock);
+    wr(r, CUR_HORZ_VERT_OFF, ((hoff << 16) | voff) | lock);
+    wr(r, CUR_HORZ_VERT_POSN, (((uint32_t)hx << 16) | y) | lock);
+    wr(r, CRTC_GEN_CNTL, GEN_CRTC_EN | GEN_CRTC_EXT_DISP_EN |
+                         GEN_PIX_WIDTH_32BPP | GEN_CUR_MODE(mode) |
+                         (en ? GEN_CUR_EN : 0));
+    settle(r);
+}
+
+/*
+ * Opaque cursor pixels onto the expected picture. @x is where map column 0
+ * lands (position minus the hidden columns); the first @hoff columns and
+ * the last @voff rows are not part of the cursor.
+ */
+static void exp_cur(Screen *e, int x, int y, const CPx *pts, size_t n,
+                    unsigned hoff, unsigned voff)
+{
+    for (size_t i = 0; i < n; i++) {
+        if (pts[i].x >= hoff && pts[i].y < CUR_SIZE - voff) {
+            scr_put(e, x + pts[i].x, y + pts[i].y, pts[i].v);
+        }
+    }
+}
+
+/* mode 1 cursor shape used by (a), (b), (c), (d), (h), (i) */
+static const CPx shape_a[] = {
+    { 0, 0, 0x00402010 }, { 5, 3, 0x00806040 },
+    { 10, 20, 0x00c8d8e8 }, { 63, 63, 0x00a0b0c0 },
+};
+static const CPx shape_b[] = {
+    { 1, 1, 0x00e04020 }, { 30, 2, 0x00204060 }, { 62, 40, 0x0060a0e0 },
+};
+static const CPx shape_c[] = {         /* what (h) leaves in the old image */
+    { 0, 0, 0x00020406 }, { 4, 4, 0x0008090a }, { 63, 0, 0x000c0e10 },
+};
+static const CPx shape_d[] = {
+    { 3, 60, 0x00504030 }, { 20, 20, 0x00907050 }, { 40, 5, 0x00b0c0d0 },
+};
+
+#define N(a) ARRAY_SIZE(a)
+#define CX 10
+#define CY 6
+
+static void scr_start(R350 *r, const Cfg *c, Screen **exp)
+{
+    r350_start_cfg(r, c->async, c->hw);
+    scr_mode(r);
+    *exp = screen_new();
+    fb_write(r, *exp);
+    /* the mode is valid and the background is what was written */
+    assert_screen(r, *exp, 0);
+}
+
+static void scr_stop(R350 *r, Screen *exp)
+{
+    g_free(exp);
+    r350_stop(r);
+}
+
+/* nothing but the background: the part that needs no guest_hwcursor */
+static void cur_bg(const Cfg *c)
+{
+    R350 r;
+    Screen *exp;
+
+    scr_start(&r, c, &exp);
+    scr_stop(&r, exp);
+}
+
+/*
+ * (a) opaque pixels land at (X+px, Y+py); transparent ones show the picture;
+ * a full conversion of the picture (a scanned-out pixel written) does not
+ * take the cursor off again
+ */
+static void cur_a(const Cfg *c)
+{
+    R350 r;
+    Screen *exp;
+
+    scr_start(&r, c, &exp);
+    cur_image(&r, IMG_A, TRANSP1, shape_a, N(shape_a));
+    cur_prog(&r, 1, IMG_A, CX, CY, 0, 0, true, 0);
+    exp_cur(exp, CX, CY, shape_a, N(shape_a), 0, 0);
+    assert_screen(&r, exp, 0);
+
+    bg_set(&r, exp, 2, 100, 0x445566);
+    settle(&r);
+    assert_screen(&r, exp, 0);
+    scr_stop(&r, exp);
+}
+
+/* (b) moving restores everything under the old 64x64 and draws anew */
+static void cur_b(const Cfg *c)
+{
+    R350 r;
+    Screen *exp, *moved;
+
+    scr_start(&r, c, &exp);
+    cur_image(&r, IMG_A, TRANSP1, shape_a, N(shape_a));
+    cur_prog(&r, 1, IMG_A, CX, CY, 0, 0, true, 0);
+    exp_cur(exp, CX, CY, shape_a, N(shape_a), 0, 0);
+    assert_screen(&r, exp, 0);
+
+    moved = screen_new();
+    /* 10..73 and 90..153 do not overlap */
+    cur_prog(&r, 1, IMG_A, 90, 40, 0, 0, true, 0);
+    exp_cur(moved, 90, 40, shape_a, N(shape_a), 0, 0);
+    assert_screen(&r, moved, 0);
+    g_free(moved);
+    scr_stop(&r, exp);
+}
+
+/* (c) CUR_EN down: the whole picture is the background again */
+static void cur_c(const Cfg *c)
+{
+    R350 r;
+    Screen *exp, *bare;
+
+    scr_start(&r, c, &exp);
+    cur_image(&r, IMG_A, TRANSP1, shape_a, N(shape_a));
+    cur_prog(&r, 1, IMG_A, CX, CY, 0, 0, true, 0);
+    exp_cur(exp, CX, CY, shape_a, N(shape_a), 0, 0);
+    assert_screen(&r, exp, 0);
+
+    bare = screen_new();
+    cur_prog(&r, 1, IMG_A, CX, CY, 0, 0, false, 0);
+    assert_screen(&r, bare, 0);
+    g_free(bare);
+    scr_stop(&r, exp);
+}
+
+/* (d) guest_hwcursor off (the default): the cursor is never drawn */
+static void cur_d(const Cfg *c)
+{
+    R350 r;
+    Screen *exp;
+
+    g_assert(!c->hw);
+    scr_start(&r, c, &exp);
+    cur_image(&r, IMG_A, TRANSP1, shape_a, N(shape_a));
+    cur_prog(&r, 1, IMG_A, CX, CY, 0, 0, true, 0);
+    assert_screen(&r, exp, 0);
+    scr_stop(&r, exp);
+}
+
+/* (e) red and blue come out as red and blue, in mode 1 and in mode 3 */
+static void cur_e(const Cfg *c)
+{
+    static const CPx m1[] = { { 1, 1, 0x00ff0000 }, { 2, 1, 0x000000ff } };
+    static const CPx m3[] = { { 1, 3, 0xffff0000 }, { 2, 3, 0xff0000ff } };
+    R350 r;
+    Screen *exp, *two;
+
+    scr_start(&r, c, &exp);
+    cur_image(&r, IMG_A, TRANSP1, m1, N(m1));
+    cur_prog(&r, 1, IMG_A, CX, CY, 0, 0, true, 0);
+    scr_put(exp, CX + 1, CY + 1, 0xff0000);
+    scr_put(exp, CX + 2, CY + 1, 0x0000ff);
+    assert_screen(&r, exp, 0);
+
+    two = screen_new();
+    cur_image(&r, IMG_B, 0, m3, N(m3));
+    cur_prog(&r, 3, IMG_B, CX, CY, 0, 0, true, 0);
+    scr_put(two, CX + 1, CY + 3, 0xff0000);
+    scr_put(two, CX + 2, CY + 3, 0x0000ff);
+    assert_screen(&r, two, 0);
+    g_free(two);
+    scr_stop(&r, exp);
+}
+
+/*
+ * (f) mode 3 alpha 0x80 black over white is mid grey (not an inversion);
+ * a mode 1 inverting code over (0x12,0x34,0x56) is 0xedcba9. Mac OS X's
+ * arrow has edge pixels such as 0x5fe4e4e4 whose colour exceeds their
+ * alpha, so mode 3 is straight alpha: over black that is 228 * 95 / 255
+ * = 0x55, where a premultiplied blend would give 0xe4.
+ */
+static void cur_f(const Cfg *c)
+{
+    static const CPx m3[] = { { 2, 2, 0x80000000 }, { 6, 2, 0x5fe4e4e4 } };
+    static const CPx m1[] = { { 4, 4, INVERT1 } };
+    R350 r;
+    Screen *exp;
+
+    scr_start(&r, c, &exp);
+    bg_set(&r, exp, CX + 2, CY + 2, 0xffffff);
+    bg_set(&r, exp, CX + 4, CY + 4, 0x123456);
+    bg_set(&r, exp, CX + 6, CY + 2, 0x000000);
+    assert_screen(&r, exp, 0);
+
+    cur_image(&r, IMG_A, 0, m3, N(m3));
+    cur_prog(&r, 3, IMG_A, CX, CY, 0, 0, true, 0);
+    scr_put(exp, CX + 2, CY + 2, 0x7f7f7f);
+    scr_put(exp, CX + 6, CY + 2, 0x555555);
+    assert_screen(&r, exp, 1);
+
+    cur_image(&r, IMG_B, TRANSP1, m1, N(m1));
+    cur_prog(&r, 1, IMG_B, CX, CY, 0, 0, true, 0);
+    scr_put(exp, CX + 2, CY + 2, 0xffffff);
+    scr_put(exp, CX + 6, CY + 2, 0x000000);
+    scr_put(exp, CX + 4, CY + 4, 0xedcba9);
+    assert_screen(&r, exp, 0);
+    scr_stop(&r, exp);
+}
+
+/*
+ * (g) hidden columns/rows and the screen edges. The first arm is the shape
+ * the guest writes to push the cursor off the top-left: position (0,0),
+ * CUR_HORZ_OFF = 4 columns, CUR_VERT_OFF = hidden rows + 1 with CUR_OFFSET
+ * advanced by 256 bytes per hidden row (the map then starts at the first
+ * visible row and its last CUR_VERT_OFF rows are not part of the cursor).
+ */
+static void cur_g(const Cfg *c)
+{
+    /* map coordinates, counted from the advanced CUR_OFFSET */
+    static const CPx tl[] = {
+        { 4, 0, 0x00402010 },   /* first visible column and row -> (0,0) */
+        { 3, 2, 0x00806040 },   /* hidden column, would land at x = -1 */
+        { 10, 5, 0x00c8d8e8 },
+        { 63, 58, 0x00a0b0c0 }, /* last visible row */
+        { 20, 58, 0x00e0d0c0 },
+        { 20, 59, 0x00101010 }, /* the last CUR_VERT_OFF rows are not drawn */
+        { 20, 63, 0x00303030 },
+    };
+    static const CPx br[] = {
+        { 0, 0, 0x00402010 }, { 9, 9, 0x00806040 },
+        { 10, 10, 0x00c8d8e8 }, { 30, 2, 0x00a0b0c0 }, { 63, 63, 0x00e0d0c0 },
+    };
+    R350 r;
+    Screen *exp, *e2, *e3;
+
+    scr_start(&r, c, &exp);
+    cur_image(&r, IMG_A + 0x400, TRANSP1, tl, N(tl));
+    cur_prog(&r, 1, IMG_A + 0x400, 0, 0, 4, 5, true, 0);
+    exp_cur(exp, -4, 0, tl, N(tl), 4, 5);
+    assert_screen(&r, exp, 0);
+
+    /* the same shape further in: the hidden columns land on the screen */
+    e2 = screen_new();
+    cur_prog(&r, 1, IMG_A + 0x400, 30, 20, 4, 5, true, 0);
+    exp_cur(e2, 26, 20, tl, N(tl), 4, 5);
+    assert_screen(&r, e2, 0);
+    g_free(e2);
+
+    /* only a corner is on the screen */
+    e3 = screen_new();
+    cur_image(&r, IMG_B, TRANSP1, br, N(br));
+    cur_prog(&r, 1, IMG_B, SCR_W - 10, SCR_H - 10, 0, 0, true, 0);
+    exp_cur(e3, SCR_W - 10, SCR_H - 10, br, N(br), 0, 0);
+    assert_screen(&r, e3, 0);
+    g_free(e3);
+    scr_stop(&r, exp);
+}
+
+/*
+ * (h) under CUR_LOCK a new position and image are not taken up, not even
+ * by a full conversion of the picture; unlocking takes them up.
+ */
+static void cur_h(const Cfg *c)
+{
+    R350 r;
+    Screen *exp, *locked, *after;
+
+    scr_start(&r, c, &exp);
+    cur_image(&r, IMG_A, TRANSP1, shape_a, N(shape_a));
+    cur_prog(&r, 1, IMG_A, CX, CY, 0, 0, true, 0);
+    exp_cur(exp, CX, CY, shape_a, N(shape_a), 0, 0);
+    assert_screen(&r, exp, 0);
+
+    /* lock, write a new image and position, overwrite the old image too */
+    cur_image(&r, IMG_B, TRANSP1, shape_b, N(shape_b));
+    cur_prog(&r, 1, IMG_B, 90, 40, 0, 0, true, CUR_LOCK);
+    cur_image(&r, IMG_A, TRANSP1, shape_c, N(shape_c));
+    settle(&r);
+    assert_screen(&r, exp, 0);
+
+    /* a write into the scanned-out range converts the whole picture */
+    locked = screen_new();
+    bg_set(&r, locked, 2, 100, 0x445566);
+    exp_cur(locked, CX, CY, shape_a, N(shape_a), 0, 0);
+    settle(&r);
+    assert_screen(&r, locked, 0);
+    g_free(locked);
+
+    /* unlock: one write without the bit */
+    wr(&r, CUR_HORZ_VERT_POSN, (90u << 16) | 40);
+    settle(&r);
+    after = screen_new();
+    bg_set(&r, after, 2, 100, 0x445566);
+    exp_cur(after, 90, 40, shape_b, N(shape_b), 0, 0);
+    assert_screen(&r, after, 0);
+    g_free(after);
+    scr_stop(&r, exp);
+}
+
+/* (i) the image changes in place, the position does not */
+static void cur_i(const Cfg *c)
+{
+    R350 r;
+    Screen *exp, *changed;
+
+    scr_start(&r, c, &exp);
+    cur_image(&r, IMG_A, TRANSP1, shape_a, N(shape_a));
+    cur_prog(&r, 1, IMG_A, CX, CY, 0, 0, true, 0);
+    exp_cur(exp, CX, CY, shape_a, N(shape_a), 0, 0);
+    assert_screen(&r, exp, 0);
+
+    cur_image(&r, IMG_A, TRANSP1, shape_d, N(shape_d));
+    wr(&r, CUR_HORZ_VERT_POSN, ((uint32_t)CX << 16) | CY);
+    settle(&r);
+    changed = screen_new();
+    exp_cur(changed, CX, CY, shape_d, N(shape_d), 0, 0);
+    assert_screen(&r, changed, 0);
+    g_free(changed);
+    scr_stop(&r, exp);
+}
+
+typedef struct {
+    const char *name;
+    void (*fn)(const Cfg *);
+    bool hw;
+} CurCase;
+
+static const CurCase cur_cases[] = {
+    { "bg", cur_bg, false },
+    { "a", cur_a, true },
+    { "b", cur_b, true },
+    { "c", cur_c, true },
+    { "d", cur_d, false },
+    { "e", cur_e, true },
+    { "f", cur_f, true },
+    { "g", cur_g, true },
+    { "h", cur_h, true },
+    { "i", cur_i, true },
+};
+
+typedef struct {
+    const CurCase *cc;
+    bool async;
+} CurArg;
+
+static void run_cur(gconstpointer data)
+{
+    const CurArg *a = data;
+    Cfg cfg = { .async = a->async, .hw = a->cc->hw };
+
+    a->cc->fn(&cfg);
+}
+
+static void add_cursor_tests(void)
+{
+    for (size_t i = 0; i < ARRAY_SIZE(cur_cases); i++) {
+        for (int async = 0; async < 2; async++) {
+            CurArg *a = g_new0(CurArg, 1);
+            g_autofree char *path = g_strdup_printf(
+                "/ati-r350/cursor/%s/async-%s", cur_cases[i].name,
+                async ? "on" : "off");
+
+            a->cc = &cur_cases[i];
+            a->async = async;
+            qtest_add_data_func(path, a, run_cur);
+        }
+    }
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -351,5 +950,6 @@ int main(int argc, char **argv)
                    test_bitblt_multi_trailing);
     qtest_add_func("/ati-r350/bitblt-multi/unsized-brush",
                    test_bitblt_multi_unsized_brush);
+    add_cursor_tests();
     return g_test_run();
 }
