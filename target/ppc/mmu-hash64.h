@@ -11,6 +11,20 @@ bool ppc_hash64_xlate(PowerPCCPU *cpu, vaddr eaddr, MMUAccessType access_type,
                       hwaddr *raddrp, int *psizep, int *protp, int mmu_idx,
                       bool guest_visible);
 void ppc_hash64_tlbie_pages(PowerPCCPU *cpu, bool global);
+
+/* qemu-g5 #489 C3 counters (NOT FOR UPSTREAM) */
+enum {
+    G5C_TLBIE, G5C_TLBIE_NARROW, G5C_TLBIE_NARROW_HI,
+    G5C_DONE_LOCAL, G5C_DONE_GLOBAL, G5C_OVERFLOW,
+    G5C_RB_MASK0, G5C_RB_VSID, G5C_PAGE_CALLS, G5C_RANGE_CALLS,
+    G5C_SENT_HIT, G5C_SENT_LOCAL, G5C_SKIPPED, G5C_GLOBAL_NO_REMOTE,
+    G5C_WORK_FULL, G5C_STORE_SLB_OVER, G5C_KEEP_GLOBAL,
+    G5C_FULL_LOCAL, G5C_FULL_SYNCED,
+    G5C_NB1, /* G5C_NB1 + nb - 1 for nb in 1..16 */
+    G5C_N = G5C_NB1 + 16
+};
+void g5cnt_add(int idx, uint64_t n);
+void g5cnt_max(uint64_t v);
 void ppc_hash64_tlb_flush_hpte(PowerPCCPU *cpu,
                                target_ulong pte_index,
                                target_ulong pte0, target_ulong pte1);

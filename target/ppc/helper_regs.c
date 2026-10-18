@@ -423,6 +423,7 @@ void ppc_delayed_flush_all(CPUPPCState *env)
 {
     CPUState *cs = env_cpu(env);
 
+    g5cnt_add(G5C_FULL_LOCAL, 1);
     if (ppc_hrmor_mmuidx_mask(env)) {
         tlb_flush_by_mmuidx(cs, ppc_delayed_flush_mmuidx(env));
     } else {
@@ -443,6 +444,10 @@ void check_tlb_flush(CPUPPCState *env, bool global)
         need & (TLB_NEED_GLOBAL_FLUSH | TLB_NEED_PAGES_FLUSH) : 0;
 
 #if defined(TARGET_PPC64)
+    if ((need & TLB_NEED_PAGES_FLUSH) &&
+        env->tlbie_pages_nb > TLBIE_PAGES_MAX) {
+        g5cnt_add(G5C_OVERFLOW, 1);
+    }
     /* tlbie on the 970: only the translations of the pages it names */
     if ((need & TLB_NEED_PAGES_FLUSH) &&
         env->tlbie_pages_nb <= TLBIE_PAGES_MAX) {
@@ -458,6 +463,9 @@ void check_tlb_flush(CPUPPCState *env, bool global)
             ppc_hash64_tlbie_pages(env_archcpu(env), false);
         }
         /* A tlbie on another CPU reads the flags: clear them after */
+        if (keep_flags) {
+            g5cnt_add(G5C_KEEP_GLOBAL, 1);
+        }
         qatomic_set(&env->tlb_need_flush, keep_flags);
         if (!keep_flags) {
             env->tlbie_pages_nb = 0;
@@ -468,6 +476,7 @@ void check_tlb_flush(CPUPPCState *env, bool global)
 
     /* Handle global flushes first */
     if (global && (need & TLB_NEED_GLOBAL_FLUSH)) {
+        g5cnt_add(G5C_FULL_SYNCED, 1);
         if (ppc_hrmor_mmuidx_mask(env)) {
             tlb_flush_by_mmuidx_all_cpus_synced(cs,
                                                 ppc_delayed_flush_mmuidx(env));
@@ -479,6 +488,9 @@ void check_tlb_flush(CPUPPCState *env, bool global)
         ppc_delayed_flush_all(env);
     } else {
         return;
+    }
+    if (keep_flags) {
+        g5cnt_add(G5C_KEEP_GLOBAL, 1);
     }
     qatomic_set(&env->tlb_need_flush, keep_flags);
 #if defined(TARGET_PPC64)

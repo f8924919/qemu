@@ -38,6 +38,92 @@
 
 #ifdef CONFIG_TCG
 #include "exec/helper-proto.h"
+
+/* qemu-g5 #489 C3: throwaway counters (NOT FOR UPSTREAM) */
+#include <signal.h>
+static const char *const g5cnt_name[G5C_NB1] = {
+    "tlbie", "tlbie_narrow", "tlbie_narrow_hi",
+    "done_local", "done_global", "overflow",
+    "rb_mask0", "rb_vsid", "page_calls", "range_calls",
+    "sent_hit", "sent_local", "skipped", "global_no_remote",
+    "work_full", "store_slb_over", "keep_global",
+    "full_local", "full_synced",
+};
+static uint64_t g5cnt[G5C_N], g5cnt_snap[2][G5C_N];
+static uint64_t g5cnt_maxcalls, g5cnt_snap_max[2];
+static int g5cnt_nsnap;
+
+void g5cnt_add(int idx, uint64_t n)
+{
+    qatomic_add(&g5cnt[idx], n);
+}
+
+void g5cnt_max(uint64_t v)
+{
+    if (v > qatomic_read(&g5cnt_maxcalls)) {
+        qatomic_set(&g5cnt_maxcalls, v);
+    }
+}
+
+/* SIGUSR2: the first one is the start of W1, the last one its end */
+static void g5cnt_sig(int sig)
+{
+    int k = g5cnt_nsnap ? 1 : 0, i;
+
+    for (i = 0; i < G5C_N; i++) {
+        g5cnt_snap[k][i] = qatomic_read(&g5cnt[i]);
+    }
+    g5cnt_snap_max[k] = qatomic_read(&g5cnt_maxcalls);
+    g5cnt_nsnap++;
+}
+
+static void g5cnt_line(FILE *fp, const char *phase, const uint64_t *v,
+                       uint64_t max)
+{
+    int i;
+
+    fprintf(fp, "g5cnt phase=%s", phase);
+    for (i = 0; i < G5C_NB1; i++) {
+        fprintf(fp, " %s=%" PRIu64, g5cnt_name[i], v[i]);
+    }
+    for (i = 0; i < 16; i++) {
+        fprintf(fp, " nb%d=%" PRIu64, i + 1, v[G5C_NB1 + i]);
+    }
+    fprintf(fp, " max_calls_so_far=%" PRIu64 "\n", max);
+}
+
+static void g5cnt_dump(void)
+{
+    const char *f = getenv("G5CNT_FILE");
+    FILE *fp = f ? fopen(f, "w") : NULL;
+    uint64_t now[G5C_N];
+    int i;
+
+    if (!fp) {
+        return;
+    }
+    for (i = 0; i < G5C_N; i++) {
+        now[i] = qatomic_read(&g5cnt[i]);
+    }
+    fprintf(fp, "g5cnt snaps=%d\n", g5cnt_nsnap);
+    if (g5cnt_nsnap >= 1) {
+        g5cnt_line(fp, "w1_start", g5cnt_snap[0], g5cnt_snap_max[0]);
+    }
+    if (g5cnt_nsnap >= 2) {
+        g5cnt_line(fp, "w1_end", g5cnt_snap[1], g5cnt_snap_max[1]);
+    }
+    g5cnt_line(fp, "exit", now, qatomic_read(&g5cnt_maxcalls));
+    fclose(fp);
+}
+
+static void __attribute__((constructor)) g5cnt_init(void)
+{
+    struct sigaction sa = { .sa_handler = g5cnt_sig };
+
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGUSR2, &sa, NULL);
+    atexit(g5cnt_dump);
+}
 #endif
 
 /* #define DEBUG_SLB */
@@ -291,6 +377,7 @@ int ppc_store_slb(PowerPCCPU *cpu, target_ulong slot,
      * translated. A tlbie on another CPU reads the flag after the SLB.
      */
     if ((slb->esid & SLB_ESID_V) && (slb->esid != esid || slb->vsid != vsid)) {
+        g5cnt_add(G5C_STORE_SLB_OVER, 1);
         qatomic_set(&env->tlb_need_flush,
                     env->tlb_need_flush | TLB_NEED_LOCAL_FLUSH);
         smp_wmb(); /* pairs with smp_rmb() in ppc_hash64_tlbie_pages() */
@@ -1268,6 +1355,7 @@ static bool hash64_tlbie_cpu(PowerPCCPU *cpu, const target_ulong *rbs,
     CPUState *cs = CPU(cpu);
     MMUIdxMap idxmap = ppc_delayed_flush_mmuidx(env);
     bool hit = false;
+    uint64_t calls = 0;
     unsigned i;
     int n;
 
@@ -1276,6 +1364,10 @@ static bool hash64_tlbie_cpu(PowerPCCPU *cpu, const target_ulong *rbs,
         uint64_t mask = rb >> 32 ? 0xfffff : 0;
         uint64_t key = (rb >> SEGMENT_SHIFT_256M) & mask;
         uint64_t page = rb & ~SEGMENT_MASK_256M & TARGET_PAGE_MASK;
+
+        if (flush) {
+            g5cnt_add(mask ? G5C_RB_VSID : G5C_RB_MASK0, 1);
+        }
 
         for (n = 0; n < cpu->hash64_opts->slb_size; n++) {
             ppc_slb_t *slb = &env->slb[n];
@@ -1303,13 +1395,20 @@ static bool hash64_tlbie_cpu(PowerPCCPU *cpu, const target_ulong *rbs,
             ea = (esid & SLB_ESID_ESID) | page;
             shift = sps ? sps->page_shift : TARGET_PAGE_BITS;
             if (shift > TARGET_PAGE_BITS) {
+                g5cnt_add(G5C_RANGE_CALLS, 1);
+                calls++;
                 tlb_flush_range_by_mmuidx(cs, ea & ~((1ULL << shift) - 1),
                                           1ULL << shift, idxmap,
                                           TARGET_LONG_BITS);
             } else {
+                g5cnt_add(G5C_PAGE_CALLS, 1);
+                calls++;
                 tlb_flush_page_by_mmuidx(cs, ea, idxmap);
             }
         }
+    }
+    if (flush) {
+        g5cnt_max(calls);
     }
     return hit;
 }
@@ -1325,6 +1424,7 @@ static void hash64_tlbie_work(CPUState *cs, run_on_cpu_data data)
     PowerPCCPU *cpu = POWERPC_CPU(cs);
 
     if (cpu->env.tlb_need_flush & TLB_NEED_LOCAL_FLUSH) {
+        g5cnt_add(G5C_WORK_FULL, 1);
         ppc_delayed_flush_all(&cpu->env);
     } else {
         hash64_tlbie_cpu(cpu, p->rbs, p->nb, true);
@@ -1347,6 +1447,10 @@ void ppc_hash64_tlbie_pages(PowerPCCPU *cpu, bool global)
     CPUState *src = CPU(cpu), *cs;
     bool remote = false;
 
+    g5cnt_add(global ? G5C_DONE_GLOBAL : G5C_DONE_LOCAL, 1);
+    if (env->tlbie_pages_nb >= 1 && env->tlbie_pages_nb <= 16) {
+        g5cnt_add(G5C_NB1 + env->tlbie_pages_nb - 1, 1);
+    }
     hash64_tlbie_cpu(cpu, env->tlbie_pages, env->tlbie_pages_nb, true);
     if (!global) {
         return;
@@ -1368,8 +1472,12 @@ void ppc_hash64_tlbie_pages(PowerPCCPU *cpu, bool global)
             smp_rmb();
             if (!(qatomic_read(&other->env.tlb_need_flush) &
                   TLB_NEED_LOCAL_FLUSH)) {
+                g5cnt_add(G5C_SKIPPED, 1);
                 continue;
             }
+            g5cnt_add(G5C_SENT_LOCAL, 1);
+        } else {
+            g5cnt_add(G5C_SENT_HIT, 1);
         }
         p = g_new(Hash64TlbiePages, 1);
         p->nb = env->tlbie_pages_nb;
@@ -1379,6 +1487,8 @@ void ppc_hash64_tlbie_pages(PowerPCCPU *cpu, bool global)
     }
     if (remote) {
         async_safe_run_on_cpu(src, hash64_tlbie_sync, RUN_ON_CPU_NULL);
+    } else {
+        g5cnt_add(G5C_GLOBAL_NO_REMOTE, 1);
     }
 }
 
