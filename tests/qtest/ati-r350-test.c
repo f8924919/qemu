@@ -1163,10 +1163,16 @@ static char *r350_start_traced(R350 *r)
     return log;
 }
 
-/* The indexed draws the log holds, in order; the log is removed */
-static GPtrArray *indexed_draws(const char *log)
+#define DRAWN           "R300 indexed draw "
+#define SKIPPED         "R300 draw skipped "
+
+/*
+ * The indexed draws and the skipped draws the log holds, in the order
+ * they were traced; the log is removed.
+ */
+static GPtrArray *traced_draws(const char *log)
 {
-    GPtrArray *draws = g_ptr_array_new_with_free_func(g_free);
+    GPtrArray *ev = g_ptr_array_new_with_free_func(g_free);
     g_autofree char *text = NULL;
     g_auto(GStrv) lines = NULL;
 
@@ -1174,10 +1180,27 @@ static GPtrArray *indexed_draws(const char *log)
     unlink(log);
     lines = g_strsplit(text, "\n", -1);
     for (size_t i = 0; lines[i]; i++) {
-        const char *d = strstr(lines[i], "R300 indexed draw ");
+        const char *d = strstr(lines[i], DRAWN);
 
+        if (!d) {
+            d = strstr(lines[i], SKIPPED);
+        }
         if (d) {
-            g_ptr_array_add(draws, g_strdup(d));
+            g_ptr_array_add(ev, g_strdup(d));
+        }
+    }
+    return ev;
+}
+
+/* The indexed draws alone */
+static GPtrArray *indexed_draws(const char *log)
+{
+    g_autoptr(GPtrArray) ev = traced_draws(log);
+    GPtrArray *draws = g_ptr_array_new_with_free_func(g_free);
+
+    for (guint i = 0; i < ev->len; i++) {
+        if (g_str_has_prefix(g_ptr_array_index(ev, i), DRAWN)) {
+            g_ptr_array_add(draws, g_strdup(g_ptr_array_index(ev, i)));
         }
     }
     return draws;
@@ -1275,26 +1298,61 @@ static void run_indx_case(const void *data)
 }
 
 /*
- * The number of indexed draws a packet sequence produced. An inline draw
- * of indices 1 2 3 closes every sequence and must be the last one seen,
- * so that a count of zero cannot come from a log that recorded nothing.
+ * The indexed draws a packet sequence produced, and how many times its
+ * events before the closing draw hold the line @skip (when not NULL).
+ * An inline draw of indices 1 2 3 closes every sequence and must be the
+ * last indexed draw seen, so that a count of zero cannot come from a log
+ * that recorded nothing; what was traced after it is its own.
  */
-static guint count_draws(void (*seq)(R350 *r))
+static guint count_draws_skips(void (*seq)(R350 *r), const char *skip,
+                               guint *nskip)
 {
     static const uint16_t ctl[] = { 1, 2, 3 };
-    g_autoptr(GPtrArray) draws = NULL;
+    g_autoptr(GPtrArray) ev = NULL;
     g_autofree char *log = NULL;
+    guint draws = 0, last = 0;
     R350 r;
 
     log = r350_start_traced(&r);
     seq(&r);
     draw_inline(&r, ctl, ARRAY_SIZE(ctl), false);
     r350_stop(&r);
-    draws = indexed_draws(log);
-    g_assert_cmpuint(draws->len, >=, 1);
-    g_assert_nonnull(strstr(g_ptr_array_index(draws, draws->len - 1),
-                            "first 1 2 3 0"));
-    return draws->len - 1;
+    ev = traced_draws(log);
+    for (guint i = 0; i < ev->len; i++) {
+        if (g_str_has_prefix(g_ptr_array_index(ev, i), DRAWN)) {
+            draws++;
+            last = i;
+        }
+    }
+    g_assert_cmpuint(draws, >=, 1);
+    g_assert_nonnull(strstr(g_ptr_array_index(ev, last), "first 1 2 3 0"));
+    if (nskip) {
+        *nskip = 0;
+        for (guint i = 0; i < last; i++) {
+            *nskip += !strcmp(g_ptr_array_index(ev, i), skip);
+        }
+    }
+    return draws - 1;
+}
+
+static guint count_draws(void (*seq)(R350 *r))
+{
+    return count_draws_skips(seq, NULL, NULL);
+}
+
+/*
+ * (b) An INDX_BUFFER that is dropped draws nothing and says so once,
+ * with the VAP_VF_CNTL it was waiting with (0 if none) and its count.
+ */
+static void assert_dropped(void (*seq)(R350 *r), uint32_t vf, uint32_t ndw,
+                           guint draws)
+{
+    g_autofree char *skip = g_strdup_printf(SKIPPED "vf_cntl=0x%08x "
+                                            "vsize=0 info=0x%x", vf, ndw);
+    guint nskip;
+
+    g_assert_cmpuint(count_draws_skips(seq, skip, &nskip), ==, draws);
+    g_assert_cmpuint(nskip, ==, 1);
 }
 
 static const uint16_t idx3[] = { 4, 8, 15 };
@@ -1359,22 +1417,22 @@ static void seq_kept_across_packet(R350 *r)
 
 static void test_indx_wrong_port(void)
 {
-    g_assert_cmpuint(count_draws(seq_wrong_port), ==, 0);
+    assert_dropped(seq_wrong_port, VF(3, false), 2, 0);
 }
 
 static void test_indx_no_draw(void)
 {
-    g_assert_cmpuint(count_draws(seq_no_draw), ==, 0);
+    assert_dropped(seq_no_draw, 0, 2, 0);
 }
 
 static void test_indx_zero_dwords(void)
 {
-    g_assert_cmpuint(count_draws(seq_zero_dwords), ==, 0);
+    assert_dropped(seq_zero_dwords, VF(3, false), 0, 0);
 }
 
 static void test_indx_over_limit(void)
 {
-    g_assert_cmpuint(count_draws(seq_over_limit), ==, 0);
+    assert_dropped(seq_over_limit, VF(3, false), 0x10001, 0);
 }
 
 static void test_indx_at_limit(void)
@@ -1382,9 +1440,10 @@ static void test_indx_at_limit(void)
     g_assert_cmpuint(count_draws(seq_at_limit), ==, 1);
 }
 
+/* the first one draws, the second has no VAP_VF_CNTL left to use */
 static void test_indx_twice(void)
 {
-    g_assert_cmpuint(count_draws(seq_twice), ==, 1);
+    assert_dropped(seq_twice, 0, 2, 1);
 }
 
 static void test_indx_kept_across_packet(void)
@@ -1411,10 +1470,13 @@ static void test_indx_reset(void)
     indx_buffer(&r, VAP_PORT_IDX0, IDX_OFF, 2);
     draw_inline(&r, ctl3, ARRAY_SIZE(ctl3), false);
     r350_stop(&r);
-    draws = indexed_draws(log);
-    /* only the inline draw after the reset */
-    g_assert_cmpuint(draws->len, ==, 1);
-    g_assert_nonnull(strstr(g_ptr_array_index(draws, 0), "first 1 2 3 0"));
+    draws = traced_draws(log);
+    /* the INDX_BUFFER is dropped with no VAP_VF_CNTL; then the inline draw */
+    g_assert_cmpuint(draws->len, >=, 2);
+    g_assert_cmpstr(g_ptr_array_index(draws, 0), ==,
+                    SKIPPED "vf_cntl=0x00000000 vsize=0 info=0x2");
+    g_assert_true(g_str_has_prefix(g_ptr_array_index(draws, 1), DRAWN));
+    g_assert_nonnull(strstr(g_ptr_array_index(draws, 1), "first 1 2 3 0"));
 }
 
 /*
