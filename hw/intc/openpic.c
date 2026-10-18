@@ -825,6 +825,56 @@ out:
     return retval;
 }
 
+/* qemu-g5 #484 C0: throwaway counters (NOT FOR UPSTREAM) */
+#include "qemu/atomic.h"
+static uint64_t g5cnt_rd, g5cnt_wr, g5cnt_hi_rd, g5cnt_hi_wr;
+static int g5cnt_hi_max = -1;
+static char g5cnt_log[1024];
+static int g5cnt_nlog;
+
+static void g5cnt_note(OpenPICState *opp, int idx, hwaddr addr, uint64_t val,
+                       bool wr)
+{
+    if (opp->model != OPENPIC_MODEL_KEYLARGO) {
+        return;
+    }
+    qatomic_inc(wr ? &g5cnt_wr : &g5cnt_rd);
+    if (idx < opp->irq_ipi0) {
+        return;
+    }
+    qatomic_inc(wr ? &g5cnt_hi_wr : &g5cnt_hi_rd);
+    if (idx > g5cnt_hi_max) {
+        g5cnt_hi_max = idx;
+    }
+    if (g5cnt_nlog < 16) {
+        size_t l = strlen(g5cnt_log);
+        snprintf(g5cnt_log + l, sizeof(g5cnt_log) - l, " %c%#x=%#" PRIx64,
+                 wr ? 'w' : 'r', (unsigned)addr, val);
+        g5cnt_nlog++;
+    }
+}
+
+static void g5cnt_dump(void)
+{
+    const char *f = getenv("G5CNT_FILE");
+    FILE *fp = f ? fopen(f, "w") : NULL;
+
+    if (!fp) {
+        return;
+    }
+    fprintf(fp, "g5cnt src_rd=%" PRIu64 " src_wr=%" PRIu64
+            " hi_rd=%" PRIu64 " hi_wr=%" PRIu64 " hi_max_idx=%d first:%s\n",
+            qatomic_read(&g5cnt_rd), qatomic_read(&g5cnt_wr),
+            qatomic_read(&g5cnt_hi_rd), qatomic_read(&g5cnt_hi_wr),
+            g5cnt_hi_max, g5cnt_log);
+    fclose(fp);
+}
+
+static void __attribute__((constructor)) g5cnt_init(void)
+{
+    atexit(g5cnt_dump);
+}
+
 static void openpic_src_write(void *opaque, hwaddr addr, uint64_t val,
                               unsigned len)
 {
@@ -836,6 +886,7 @@ static void openpic_src_write(void *opaque, hwaddr addr, uint64_t val,
 
     addr = addr & 0xffff;
     idx = addr >> 5;
+    g5cnt_note(opp, idx, addr, val, true);
 
     switch (addr & 0x1f) {
     case 0x00:
@@ -873,6 +924,7 @@ static uint64_t openpic_src_read(void *opaque, uint64_t addr, unsigned len)
         retval = read_IRQreg_ilr(opp, idx);
         break;
     }
+    g5cnt_note(opp, idx, addr, retval, false);
 
     DPRINTF("%s: => 0x%08x", __func__, retval);
     return retval;
