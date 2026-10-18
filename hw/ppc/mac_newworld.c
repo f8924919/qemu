@@ -1060,21 +1060,6 @@ static const TypeInfo powerbook3_2_machine_info = {
 };
 
 #ifdef TARGET_PPC64
-static void powermac7_3_machine_class_init(ObjectClass *oc, const void *data)
-{
-    MachineClass *mc = MACHINE_CLASS(oc);
-
-    mc->desc = "Apple Power Mac G5 (Niagara)";
-    mc->default_cpu_type = POWERPC_CPU_TYPE_NAME("970fx_v3.1");
-    /*
-     * A PowerMac7,3 is a 2-way machine.  The KeyLargo pic can address more
-     * (KEYLARGO_MAX_CPU) and so can the OS, but no such G5 was built, so
-     * keep the machine to what the hardware had.  The base class leaves
-     * mac99 and the G4 machines uniprocessor.
-     */
-    mc->max_cpus = 2;
-    machine_add_audiodev_property(mc);
-}
 
 static bool powermac7_3_get_highmem(Object *obj, Error **errp)
 {
@@ -1107,6 +1092,43 @@ static void powermac7_3_set_dart(Object *obj, const char *value, Error **errp)
     }
 }
 
+static void powermac7_3_machine_class_init(ObjectClass *oc, const void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+
+    mc->desc = "Apple Power Mac G5 (Niagara)";
+    mc->default_cpu_type = POWERPC_CPU_TYPE_NAME("970fx_v3.1");
+    /*
+     * A PowerMac7,3 is a 2-way machine.  The KeyLargo pic can address more
+     * (KEYLARGO_MAX_CPU) and so can the OS, but no such G5 was built, so
+     * keep the machine to what the hardware had.  The base class leaves
+     * mac99 and the G4 machines uniprocessor.
+     */
+    mc->max_cpus = 2;
+    machine_add_audiodev_property(mc);
+
+    /*
+     * Class properties, so that -M powermac7_3,help lists them; the
+     * defaults are set in powermac7_3_instance_init().
+     */
+    object_class_property_add_bool(oc, "highmem", powermac7_3_get_highmem,
+                                   powermac7_3_set_highmem);
+    object_class_property_set_description(oc, "highmem",
+                                          "Allow more than 2 GiB of RAM (up "
+                                          "to 8 GiB), the excess placed from "
+                                          "4 GiB. The machine then gets a "
+                                          "DART, see x-dart");
+    object_class_property_add_str(oc, "x-dart", powermac7_3_get_dart,
+                                  powermac7_3_set_dart);
+    object_class_property_set_description(oc, "x-dart",
+                                          "Give the U3 a DART, the IOMMU in "
+                                          "front of its PCI buses: auto (the "
+                                          "default; only with more than "
+                                          "2 GiB of RAM), on or off. An "
+                                          "experimental knob for telling "
+                                          "DART effects apart");
+}
+
 static void powermac7_3_instance_init(Object *obj)
 {
     Core99MachineState *cms = CORE99_MACHINE(obj);
@@ -1118,24 +1140,8 @@ static void powermac7_3_instance_init(Object *obj)
 
     /* Off by default, so that the machine stays as it was measured */
     cms->highmem = false;
-    object_property_add_bool(obj, "highmem", powermac7_3_get_highmem,
-                             powermac7_3_set_highmem);
-    object_property_set_description(obj, "highmem",
-                                    "Allow more than 2 GiB of RAM (up to "
-                                    "8 GiB), the excess placed from 4 GiB. "
-                                    "The machine then gets a DART, see "
-                                    "x-dart");
-
     /* auto: a DART only when the RAM goes beyond 2 GiB */
     cms->dart = ON_OFF_AUTO_AUTO;
-    object_property_add_str(obj, "x-dart", powermac7_3_get_dart,
-                            powermac7_3_set_dart);
-    object_property_set_description(obj, "x-dart",
-                                    "Give the U3 a DART, the IOMMU in front "
-                                    "of its PCI buses: auto (the default; "
-                                    "only with more than 2 GiB of RAM), on "
-                                    "or off. An experimental knob for "
-                                    "telling DART effects apart");
 }
 
 static const TypeInfo powermac7_3_machine_info = {
