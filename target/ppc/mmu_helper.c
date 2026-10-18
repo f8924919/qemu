@@ -294,6 +294,13 @@ void ppc_tlb_invalidate_one(CPUPPCState *env, target_ulong addr)
 #if defined(TARGET_PPC64)
     if (env->mmu_model == POWERPC_MMU_64B) {
         /* Before ISA 2.06 RB holds the low 48 bits of the virtual address */
+        if (!FIELD_EX64(env->msr, MSR, SF)) {
+            /*
+             * In 32-bit mode only the effective address: tlbie clears the
+             * upper half of RB when it translates, tlbiel does not
+             */
+            addr = (uint32_t)addr;
+        }
         if (env->tlbie_pages_nb < TLBIE_PAGES_MAX) {
             env->tlbie_pages[env->tlbie_pages_nb] = addr;
         }
