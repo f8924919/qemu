@@ -1,5 +1,6 @@
 /*
- * QTest testcase for the ATI R350 (Radeon 9800) 2D packets
+ * QTest testcase for the ATI R350 (Radeon 9800) 2D packets, the indexed
+ * 3D draw packets, the hardware cursor and the EDID
  *
  * Copyright (c) 2026 The QEMU Project Developers
  *
@@ -27,6 +28,16 @@
 
 #define PKT3(op, n)     (0xc0000000u | (((n) - 1) << 16) | ((op) << 8))
 #define OP_BITBLT_MULTI 0x9b
+#define OP_NOP3         0x10
+#define OP_INDX_BUFFER  0x33
+#define OP_DRAW_INDX_2  0x36
+
+/* INDX_BUFFER names the port it feeds as a dword register index */
+#define VAP_PORT_IDX0   (0x2040 >> 2)
+/* VAP_VF_CNTL: triangle list, PRIM_WALK=1 (indices), NUM_VERTICES */
+#define VF_IDX32        (1u << 11)
+#define VF(n, idx32)    (((uint32_t)(n) << 16) | ((idx32) ? VF_IDX32 : 0) | \
+                         (1u << 4) | 4)
 
 /* GUI_CONTROL (DP_GUI_MASTER_CNTL) */
 #define GMC_SRC_PITCH_OFFSET    (1u << 0)
@@ -1122,6 +1133,352 @@ static void add_edid_tests(void)
     qtest_add_func("/ati-r350/edid/half-pref", test_edid_half_pref);
 }
 
+/*
+ * Indexed 3D draws. The tests do not set up the vertex arrays or a
+ * render target, so nothing is rasterized; what they compare is what
+ * ati_r350_r300_draw_indx() was handed, as its trace event reports it
+ * (VAP_VF_CNTL, the index count and the first four indices).
+ */
+#define IDX_OFF         0x300000        /* card address: the FB is at 0 */
+
+static char *r350_start_traced(R350 *r)
+{
+    QPCIDevice *dev = NULL;
+    char *log = NULL;
+    int fd = g_file_open_tmp("ati-r350-test-XXXXXX.log", &log, NULL);
+
+    g_assert(fd >= 0);
+    close(fd);
+    r->qs = qtest_spapr_boot("-vga none -device ati-radeon9800,"
+                             "async-engine=off,async-display=off "
+                             "-d trace:ati_r350_3d_indx*,"
+                             "trace:ati_r350_3d_skip -D %s", log);
+    qpci_device_foreach(r->qs->pcibus, R350_VENDOR_ID, R350_DEVICE_ID,
+                        find_r350, &dev);
+    g_assert(dev);
+    r->dev = dev;
+    r->vram = qpci_iomap(dev, VRAM_BAR, NULL);
+    r->mmio = qpci_iomap(dev, MMIO_BAR, NULL);
+    qpci_device_enable(dev);
+    return log;
+}
+
+/* The indexed draws the log holds, in order; the log is removed */
+static GPtrArray *indexed_draws(const char *log)
+{
+    GPtrArray *draws = g_ptr_array_new_with_free_func(g_free);
+    g_autofree char *text = NULL;
+    g_auto(GStrv) lines = NULL;
+
+    g_assert(g_file_get_contents(log, &text, NULL, NULL));
+    unlink(log);
+    lines = g_strsplit(text, "\n", -1);
+    for (size_t i = 0; lines[i]; i++) {
+        const char *d = strstr(lines[i], "R300 indexed draw ");
+
+        if (d) {
+            g_ptr_array_add(draws, g_strdup(d));
+        }
+    }
+    return draws;
+}
+
+/* Indices packed as the packet carries them: two per dword or one */
+static size_t pack_indices(uint32_t *dw, const uint16_t *idx, size_t n,
+                           bool idx32)
+{
+    size_t ndw = idx32 ? n : (n + 1) / 2;
+
+    for (size_t i = 0; i < ndw; i++) {
+        uint32_t hi = 2 * i + 1 < n ? idx[2 * i + 1] : 0;
+
+        dw[i] = idx32 ? idx[i] : idx[2 * i] | hi << 16;
+    }
+    return ndw;
+}
+
+static void draw_inline(R350 *r, const uint16_t *idx, size_t n, bool idx32)
+{
+    uint32_t pkt[2 + 16];
+    size_t ndw = pack_indices(pkt + 2, idx, n, idx32);
+
+    pkt[0] = PKT3(OP_DRAW_INDX_2, 1 + ndw);
+    pkt[1] = VF(n, idx32);
+    push(r, pkt, 2 + ndw);
+}
+
+/* A 3D_DRAW_INDX_2 that carries only VAP_VF_CNTL */
+static void draw_vf_only(R350 *r, size_t n, bool idx32)
+{
+    const uint32_t pkt[] = { PKT3(OP_DRAW_INDX_2, 1), VF(n, idx32) };
+
+    push(r, pkt, ARRAY_SIZE(pkt));
+}
+
+static void indx_buffer(R350 *r, uint32_t port, uint32_t addr, uint32_t ndw)
+{
+    const uint32_t pkt[] = { PKT3(OP_INDX_BUFFER, 3), port, addr, ndw };
+
+    push(r, pkt, ARRAY_SIZE(pkt));
+}
+
+/* The packed indices into VRAM at IDX_OFF; returns their dword count */
+static size_t put_indices(R350 *r, const uint16_t *idx, size_t n, bool idx32)
+{
+    uint32_t dw[16];
+    size_t ndw = pack_indices(dw, idx, n, idx32);
+
+    for (size_t i = 0; i < ndw; i++) {
+        dw[i] = cpu_to_le32(dw[i]);
+    }
+    qpci_memwrite(r->dev, r->vram, IDX_OFF, dw, ndw * 4);
+    return ndw;
+}
+
+typedef struct {
+    const char *name;
+    uint16_t idx[6];
+    size_t n;
+    bool idx32;
+} IndxCase;
+
+static const IndxCase indx_cases[] = {
+    { "three-16", { 4, 8, 15 }, 3, false },
+    { "six-16", { 7, 3, 9, 1, 5, 2 }, 6, false },
+    { "three-32", { 4, 8, 15 }, 3, true },
+    { "six-32", { 7, 3, 9, 1, 5, 2 }, 6, true },
+};
+
+/*
+ * (a) The same indices, inline and fetched by INDX_BUFFER after a
+ * 3D_DRAW_INDX_2 that carries none, reach the draw the same way.
+ */
+static void run_indx_case(const void *data)
+{
+    const IndxCase *c = data;
+    g_autoptr(GPtrArray) draws = NULL;
+    g_autofree char *log = NULL;
+    size_t ndw;
+    R350 r;
+
+    log = r350_start_traced(&r);
+    draw_inline(&r, c->idx, c->n, c->idx32);
+    ndw = put_indices(&r, c->idx, c->n, c->idx32);
+    draw_vf_only(&r, c->n, c->idx32);
+    indx_buffer(&r, VAP_PORT_IDX0, IDX_OFF, ndw);
+    r350_stop(&r);
+
+    draws = indexed_draws(log);
+    g_assert_cmpuint(draws->len, ==, 2);
+    g_assert_cmpstr(g_ptr_array_index(draws, 0), ==,
+                    g_ptr_array_index(draws, 1));
+}
+
+/*
+ * The number of indexed draws a packet sequence produced. An inline draw
+ * of indices 1 2 3 closes every sequence and must be the last one seen,
+ * so that a count of zero cannot come from a log that recorded nothing.
+ */
+static guint count_draws(void (*seq)(R350 *r))
+{
+    static const uint16_t ctl[] = { 1, 2, 3 };
+    g_autoptr(GPtrArray) draws = NULL;
+    g_autofree char *log = NULL;
+    R350 r;
+
+    log = r350_start_traced(&r);
+    seq(&r);
+    draw_inline(&r, ctl, ARRAY_SIZE(ctl), false);
+    r350_stop(&r);
+    draws = indexed_draws(log);
+    g_assert_cmpuint(draws->len, >=, 1);
+    g_assert_nonnull(strstr(g_ptr_array_index(draws, draws->len - 1),
+                            "first 1 2 3 0"));
+    return draws->len - 1;
+}
+
+static const uint16_t idx3[] = { 4, 8, 15 };
+
+static void seq_wrong_port(R350 *r)
+{
+    put_indices(r, idx3, 3, false);
+    draw_vf_only(r, 3, false);
+    indx_buffer(r, VAP_PORT_IDX0 + 1, IDX_OFF, 2);
+}
+
+static void seq_no_draw(R350 *r)
+{
+    put_indices(r, idx3, 3, false);
+    indx_buffer(r, VAP_PORT_IDX0, IDX_OFF, 2);
+}
+
+static void seq_zero_dwords(R350 *r)
+{
+    put_indices(r, idx3, 3, false);
+    draw_vf_only(r, 3, false);
+    indx_buffer(r, VAP_PORT_IDX0, IDX_OFF, 0);
+}
+
+static void seq_over_limit(R350 *r)
+{
+    put_indices(r, idx3, 3, false);
+    draw_vf_only(r, 3, false);
+    indx_buffer(r, VAP_PORT_IDX0, IDX_OFF, 0x10001);
+}
+
+/* the limit itself is taken: the draw uses the first two dwords */
+static void seq_at_limit(R350 *r)
+{
+    put_indices(r, idx3, 3, false);
+    draw_vf_only(r, 3, false);
+    indx_buffer(r, VAP_PORT_IDX0, IDX_OFF, 0x10000);
+}
+
+/* one INDX_BUFFER uses up the VAP_VF_CNTL it was waiting with */
+static void seq_twice(R350 *r)
+{
+    put_indices(r, idx3, 3, false);
+    draw_vf_only(r, 3, false);
+    indx_buffer(r, VAP_PORT_IDX0, IDX_OFF, 2);
+    indx_buffer(r, VAP_PORT_IDX0, IDX_OFF, 2);
+}
+
+/*
+ * (c) As in the cat7 G5-openbios build this was taken from: the waiting
+ * VAP_VF_CNTL outlives other packets until an INDX_BUFFER or a reset.
+ */
+static void seq_kept_across_packet(R350 *r)
+{
+    const uint32_t nop[] = { PKT3(OP_NOP3, 1), 0 };
+
+    put_indices(r, idx3, 3, false);
+    draw_vf_only(r, 3, false);
+    push(r, nop, ARRAY_SIZE(nop));
+    indx_buffer(r, VAP_PORT_IDX0, IDX_OFF, 2);
+}
+
+static void test_indx_wrong_port(void)
+{
+    g_assert_cmpuint(count_draws(seq_wrong_port), ==, 0);
+}
+
+static void test_indx_no_draw(void)
+{
+    g_assert_cmpuint(count_draws(seq_no_draw), ==, 0);
+}
+
+static void test_indx_zero_dwords(void)
+{
+    g_assert_cmpuint(count_draws(seq_zero_dwords), ==, 0);
+}
+
+static void test_indx_over_limit(void)
+{
+    g_assert_cmpuint(count_draws(seq_over_limit), ==, 0);
+}
+
+static void test_indx_at_limit(void)
+{
+    g_assert_cmpuint(count_draws(seq_at_limit), ==, 1);
+}
+
+static void test_indx_twice(void)
+{
+    g_assert_cmpuint(count_draws(seq_twice), ==, 1);
+}
+
+static void test_indx_kept_across_packet(void)
+{
+    g_assert_cmpuint(count_draws(seq_kept_across_packet), ==, 1);
+}
+
+/* A reset drops the VAP_VF_CNTL an INDX_BUFFER would have used */
+static void test_indx_reset(void)
+{
+    static const uint16_t ctl3[] = { 1, 2, 3 };
+    g_autoptr(GPtrArray) draws = NULL;
+    g_autofree char *log = NULL;
+    R350 r;
+
+    log = r350_start_traced(&r);
+    put_indices(&r, idx3, 3, false);
+    draw_vf_only(&r, 3, false);
+    qtest_system_reset(r.qs->qts);
+    r.vram = qpci_iomap(r.dev, VRAM_BAR, NULL);
+    r.mmio = qpci_iomap(r.dev, MMIO_BAR, NULL);
+    qpci_device_enable(r.dev);
+    put_indices(&r, idx3, 3, false);
+    indx_buffer(&r, VAP_PORT_IDX0, IDX_OFF, 2);
+    draw_inline(&r, ctl3, ARRAY_SIZE(ctl3), false);
+    r350_stop(&r);
+    draws = indexed_draws(log);
+    /* only the inline draw after the reset */
+    g_assert_cmpuint(draws->len, ==, 1);
+    g_assert_nonnull(strstr(g_ptr_array_index(draws, 0), "first 1 2 3 0"));
+}
+
+/*
+ * (d) The packet that follows an INDX_BUFFER is parsed from its header,
+ * whether the INDX_BUFFER payload is the three dwords it uses or longer.
+ */
+static void indx_then_blit(bool extra)
+{
+    static const uint32_t blit[] = {
+        PKT3(OP_BITBLT_MULTI, 6),
+        GMC_COPY | GMC_SRC_PITCH_OFFSET | GMC_DST_PITCH_OFFSET |
+        GMC_BRUSH(BRUSH_NONE),
+        PITCH_OFFSET(SRC_OFF, PITCH), PITCH_OFFSET(DST_OFF, PITCH),
+        XY(0, 0), XY(0, 0), XY(16, 4),
+    };
+    const uint32_t ib[] = {
+        PKT3(OP_INDX_BUFFER, extra ? 4 : 3), VAP_PORT_IDX0, IDX_OFF, 2,
+        0xdeadbeef,
+    };
+    static const int pts[][2] = { { 0, 0 }, { 15, 3 }, { 7, 1 } };
+    R350 r;
+
+    r350_start(&r);
+    seed(&r, SRC_OFF, PITCH, pts, ARRAY_SIZE(pts));
+    put_indices(&r, idx3, 3, false);
+    draw_vf_only(&r, 3, false);
+    push(&r, ib, extra ? 5 : 4);
+    push(&r, blit, ARRAY_SIZE(blit));
+    assert_copied(&r, DST_OFF, PITCH, pts, ARRAY_SIZE(pts), 0, 0);
+    r350_stop(&r);
+}
+
+static void test_indx_then_blit(void)
+{
+    indx_then_blit(false);
+}
+
+static void test_indx_extra_then_blit(void)
+{
+    indx_then_blit(true);
+}
+
+static void add_indx_tests(void)
+{
+    for (size_t i = 0; i < G_N_ELEMENTS(indx_cases); i++) {
+        g_autofree char *path = g_strdup_printf("/ati-r350/indx-buffer/%s",
+                                                indx_cases[i].name);
+        qtest_add_data_func(path, &indx_cases[i], run_indx_case);
+    }
+    qtest_add_func("/ati-r350/indx-buffer/wrong-port", test_indx_wrong_port);
+    qtest_add_func("/ati-r350/indx-buffer/no-draw", test_indx_no_draw);
+    qtest_add_func("/ati-r350/indx-buffer/zero-dwords",
+                   test_indx_zero_dwords);
+    qtest_add_func("/ati-r350/indx-buffer/over-limit", test_indx_over_limit);
+    qtest_add_func("/ati-r350/indx-buffer/at-limit", test_indx_at_limit);
+    qtest_add_func("/ati-r350/indx-buffer/twice", test_indx_twice);
+    qtest_add_func("/ati-r350/indx-buffer/kept-across-packet",
+                   test_indx_kept_across_packet);
+    qtest_add_func("/ati-r350/indx-buffer/reset", test_indx_reset);
+    qtest_add_func("/ati-r350/indx-buffer/then-blit", test_indx_then_blit);
+    qtest_add_func("/ati-r350/indx-buffer/extra-then-blit",
+                   test_indx_extra_then_blit);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -1143,5 +1500,6 @@ int main(int argc, char **argv)
                    test_bitblt_multi_unsized_brush);
     add_cursor_tests();
     add_edid_tests();
+    add_indx_tests();
     return g_test_run();
 }
