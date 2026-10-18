@@ -334,18 +334,22 @@ target_ulong helper_load_sr(CPUPPCState *env, target_ulong sr_num)
     if (mmu_is_64bit(env->mmu_model)) {
         PowerPCCPU *cpu = env_archcpu(env);
         uint64_t esid = ((uint64_t)(sr_num & 0xf) << 28) | SLB_ESID_V;
+        ppc_slb_t *slb = &env->slb[sr_num & 0xf];
         int n;
 
-        /* The SLB entry for that segment, in the format helper_store_sr takes */
-        for (n = 0; n < cpu->hash64_opts->slb_size; n++) {
-            ppc_slb_t *slb = &env->slb[n];
-
-            if (slb->esid == esid) {
-                return ((slb->vsid >> SLB_VSID_SHIFT) & 0xfffffff) |
-                       (((slb->vsid >> 8) & 0xf) << 27);
+        /*
+         * The SLB entry for that segment, in the format helper_store_sr
+         * takes.  mtsr writes entry sr_num, so look there first: slbmte may
+         * have put the same segment in another entry too.
+         */
+        for (n = 0; slb->esid != esid; n++) {
+            if (n == cpu->hash64_opts->slb_size) {
+                return 0;
             }
+            slb = &env->slb[n];
         }
-        return 0;
+        return ((slb->vsid >> SLB_VSID_SHIFT) & 0xfffffff) |
+               (((slb->vsid >> 8) & 0xf) << 27);
     }
 #endif
     return env->sr[sr_num];

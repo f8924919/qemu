@@ -2973,6 +2973,15 @@ static inline void gen_check_pending_tlb_flush(DisasContext *ctx)
     if (!ctx->lazy_tlb_flush) {
         return;
     }
+    /*
+     * Leaving the TB from here would skip the trace interrupt that
+     * ppc_tr_tb_stop() raises after the instruction: end the TB as
+     * ptesync does instead.
+     */
+    if (ctx->singlestep_flags & CPU_SINGLE_STEP) {
+        gen_check_tlb_flush(ctx, true);
+        return;
+    }
     l = gen_new_label();
     t = tcg_temp_new_i32();
     tcg_gen_ld_i32(t, tcg_env, offsetof(CPUPPCState, tlb_need_flush));
