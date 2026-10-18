@@ -816,6 +816,11 @@ static void usb_tablet_class_initfn(ObjectClass *klass, const void *data)
     uc->product_desc   = "QEMU USB Tablet";
     dc->vmsd = &vmstate_usb_ptr;
     device_class_set_props(dc, usb_tablet_properties);
+    object_class_property_set_description(klass, "abs-trim-percent",
+        "Shrink the absolute pointer range by this percentage, half from "
+        "each end, to cancel a guest that trims it the same way (Mac OS X "
+        "10.4.11 trims 15). 0 passes the values through; must be below "
+        "100");
     set_bit(DEVICE_CATEGORY_INPUT, dc->categories);
 }
 
