@@ -76,6 +76,12 @@ static bool trans_SYNC(DisasContext *ctx, arg_X_sync *a)
 
     tcg_gen_mb(bar | TCG_BAR_SC);
 
+    /* qemu-g5 #482 C0 (NOT FOR UPSTREAM): the syncs 1a05bc1 would hook */
+    if (!sc && l == 0 && (ctx->insns_flags & PPC_64B) &&
+        !(ctx->insns_flags2 & PPC2_ISA205) && !ctx->pr) {
+        gen_helper_g5cnt_sync(tcg_env);
+    }
+
     return true;
 }
 

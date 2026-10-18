@@ -38,6 +38,12 @@
 #include "exec/helper-proto.h"
 #include "accel/tcg/cpu-ldst.h"
 
+/* qemu-g5 #482 C0 counters (NOT FOR UPSTREAM) */
+#include "qemu/atomic.h"
+static uint64_t g5cnt_mtsr, g5cnt_mtsr_changed, g5cnt_mfsr, g5cnt_tlbie;
+static uint64_t g5cnt_sync, g5cnt_sync_pending;
+
+
 /* #define FLUSH_ALL_TLBS */
 
 /*****************************************************************************/
@@ -298,6 +304,7 @@ void ppc_tlb_invalidate_one(CPUPPCState *env, target_ulong addr)
          *      and we still don't have a tlb_flush_mask(env, n, mask) in QEMU,
          *      we just invalidate all TLBs
          */
+        qatomic_inc(&g5cnt_tlbie);
         env->tlb_need_flush |= TLB_NEED_LOCAL_FLUSH;
     } else
 #endif /* defined(TARGET_PPC64) */
@@ -324,6 +331,42 @@ void ppc_tlb_invalidate_one(CPUPPCState *env, target_ulong addr)
 #endif
 }
 
+
+/*
+ * qemu-g5 #482 C0: throwaway counters (NOT FOR UPSTREAM).  Dumped at exit
+ * to the file named by G5CNT_FILE.
+ */
+
+static void g5cnt_dump(void)
+{
+    const char *f = getenv("G5CNT_FILE");
+    FILE *fp = f ? fopen(f, "w") : NULL;
+
+    if (!fp) {
+        return;
+    }
+    fprintf(fp, "g5cnt mtsr=%" PRIu64 " mtsr_changed=%" PRIu64
+            " mfsr=%" PRIu64 " tlbie=%" PRIu64 " sync_heavy=%" PRIu64
+            " sync_heavy_pending=%" PRIu64 "\n",
+            qatomic_read(&g5cnt_mtsr), qatomic_read(&g5cnt_mtsr_changed),
+            qatomic_read(&g5cnt_mfsr), qatomic_read(&g5cnt_tlbie),
+            qatomic_read(&g5cnt_sync), qatomic_read(&g5cnt_sync_pending));
+    fclose(fp);
+}
+
+static void __attribute__((constructor)) g5cnt_init(void)
+{
+    atexit(g5cnt_dump);
+}
+
+void helper_g5cnt_sync(CPUPPCState *env)
+{
+    qatomic_inc(&g5cnt_sync);
+    if (env->tlb_need_flush) {
+        qatomic_inc(&g5cnt_sync_pending);
+    }
+}
+
 /*****************************************************************************/
 /* Special registers manipulation */
 
@@ -332,6 +375,7 @@ target_ulong helper_load_sr(CPUPPCState *env, target_ulong sr_num)
 {
 #if defined(TARGET_PPC64)
     if (mmu_is_64bit(env->mmu_model)) {
+        qatomic_inc(&g5cnt_mfsr);
         /* XXX */
         return 0;
     }
@@ -357,6 +401,10 @@ void helper_store_sr(CPUPPCState *env, target_ulong srnum, target_ulong value)
         /* flags = flags */
         vsid |= ((value >> 27) & 0xf) << 8;
 
+        qatomic_inc(&g5cnt_mtsr);
+        if (env->slb[srnum].esid != esid || env->slb[srnum].vsid != vsid) {
+            qatomic_inc(&g5cnt_mtsr_changed);
+        }
         ppc_store_slb(cpu, srnum, esid, vsid);
     } else
 #endif
