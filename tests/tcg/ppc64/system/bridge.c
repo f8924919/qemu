@@ -19,6 +19,22 @@
  *   (e) mfsrin returns what mtsr wrote even when another SLB entry, written
  *       with slbmte, holds the same segment.
  *
+ * The 970 drops only the pages a tlbie names, in the segments whose VSID
+ * matches the low VSID bits of RB.  These check that nothing it should
+ * drop survives:
+ *
+ *   (f) a tlbie whose RB holds the VSID and the page (the 64-bit form)
+ *       drops that page;
+ *   (g) another page of the segment, not named, still reads right;
+ *   (h) 16 pages (all kept) and 17 pages (one too many, so all is
+ *       dropped) are all dropped, the last one included;
+ *   (i) a tlbiel in 32-bit mode with stale bits in the upper half of RB
+ *       drops the page;
+ *   (j) slbmte giving a valid entry another VSID, then isync, makes the
+ *       page read through the new segment;
+ *   (k) a segment held in two SLB entries (two ESIDs, one VSID) is
+ *       dropped through both.
+ *
  * The test code runs in real mode; only the load under test is done with
  * data relocation on, inside one asm statement, so that nothing else (the
  * stack in particular) needs a mapping.  mtmsrd does not complete a
@@ -62,6 +78,21 @@
 
 #define VAL_1 0x1111111111111111UL
 #define VAL_2 0x2222222222222222UL
+
+/* Pages of (h): where they first map and where they are remapped */
+#define MANY_OLD  0x01100000UL
+#define MANY_NEW  0x01200000UL
+#define MANY_MAX  17
+#define VAL_OLD(i) (0xa000000000000000UL | (i))
+#define VAL_NEW(i) (0xb000000000000000UL | (i))
+
+/* A second segment for (k), held by SLB entry 5 */
+#define EA_K   0x50000000UL
+
+#define MSR_SF 0x8000000000000000UL
+
+/* tlbie RB before ISA 2.06: low VSID bits above the page in the segment */
+#define TLBIE_VA(vsid, ea) (((vsid) << 28) | ((ea) & 0x0fffffffUL))
 
 static int ok = 1;
 
@@ -278,6 +309,140 @@ static void case_mfsrin_slot(void)
     expect("mfsrin-slot", "written", mfsrin(EA_D), VSID_2);
 }
 
+static void tlbie_sync(unsigned long rb)
+{
+    asm volatile("tlbie %0,%1; tlbsync; sync" : : "r"(rb), "r"(0UL)
+                 : "memory");
+}
+
+/* (f) and (g): the 64-bit form of RB names one page */
+static void case_tlbie_va(void)
+{
+    unsigned long ea_g = EA_D + 0x1000;
+
+    start_case();
+    pte_put(VSID_1, EA_D, PAGE_1);
+    pte_put(VSID_1, ea_g, PAGE_2);
+    mtsr(VSID_1);
+    isync();
+    expect("tlbie-va", "before", load_dr(EA_D), VAL_1);
+    expect("tlbie-va", "other-before", load_dr(ea_g), VAL_2);
+
+    pte_put(VSID_1, EA_D, PAGE_2);
+    tlbie_sync(TLBIE_VA(VSID_1, EA_D));
+    expect("tlbie-va", "after", load_dr(EA_D), VAL_2);
+    /* (g) not named, not remapped */
+    expect("tlbie-va", "other-after", load_dr(ea_g), VAL_2);
+}
+
+/* "b07": page 7 before the remap, "a07" after */
+static void page_step(char *step, char when, int i)
+{
+    step[0] = when;
+    step[1] = '0' + i / 10;
+    step[2] = '0' + i % 10;
+    step[3] = 0;
+}
+
+/* (h) n pages remapped, then n tlbies completed by one sync */
+static void case_tlbie_many(const char *name, int n)
+{
+    char step[8];
+    int i;
+
+    start_case();
+    for (i = 0; i < n; i++) {
+        wr64(MANY_OLD + i * 0x1000UL, VAL_OLD(i));
+        wr64(MANY_NEW + i * 0x1000UL, VAL_NEW(i));
+        pte_put(VSID_1, EA_D + i * 0x1000UL, MANY_OLD + i * 0x1000UL);
+    }
+    mtsr(VSID_1);
+    isync();
+    for (i = 0; i < n; i++) {
+        page_step(step, 'b', i);
+        expect(name, step, load_dr(EA_D + i * 0x1000UL), VAL_OLD(i));
+    }
+
+    for (i = 0; i < n; i++) {
+        pte_put(VSID_1, EA_D + i * 0x1000UL, MANY_NEW + i * 0x1000UL);
+    }
+    for (i = 0; i < n; i++) {
+        asm volatile("tlbie %0,%1"
+                     : : "r"(TLBIE_VA(VSID_1, EA_D + i * 0x1000UL)), "r"(0UL)
+                     : "memory");
+    }
+    asm volatile("tlbsync; sync" : : : "memory");
+    for (i = 0; i < n; i++) {
+        page_step(step, 'a', i);
+        expect(name, step, load_dr(EA_D + i * 0x1000UL), VAL_NEW(i));
+    }
+}
+
+/*
+ * gas does not take tlbiel without the operands of later ISAs; spell it
+ * out with a fixed register as for mtsr.
+ */
+#define TLBIEL_R9 (0x7c000224 | (9 << 11))
+
+/* (i) tlbiel in 32-bit mode; the upper half of RB holds stale bits */
+static void case_tlbiel_32(void)
+{
+    unsigned long msr;
+
+    start_case();
+    pte_put(VSID_1, EA_D, PAGE_1);
+    mtsr(VSID_1);
+    isync();
+    expect("tlbiel-32", "before", load_dr(EA_D), VAL_1);
+
+    pte_put(VSID_1, EA_D, PAGE_2);
+    asm volatile("mfmsr %0" : "=r"(msr));
+    {
+        /* set here: a call in between may clobber r9 */
+        register unsigned long r9 asm("r9") = 0xffffffff00000000UL | EA_D;
+
+        asm volatile("mtmsrd %1; .long " STR(TLBIEL_R9) "; mtmsrd %2; isync"
+                     : : "r"(r9), "r"(msr & ~MSR_SF), "r"(msr) : "memory");
+    }
+    expect("tlbiel-32", "after", load_dr(EA_D), VAL_2);
+}
+
+/* (j) slbmte over a valid entry, without slbie */
+static void case_slbmte_over(void)
+{
+    unsigned long rb = (EA_D & SLB_ESID_ESID) | SLB_ESID_V | SR_NUM;
+
+    start_case();
+    pte_put(VSID_1, EA_D, PAGE_1);
+    pte_put(VSID_2, EA_D, PAGE_2);
+    asm volatile("slbmte %0,%1; isync"
+                 : : "r"(VSID_1 << SLB_VSID_SHIFT), "r"(rb) : "memory");
+    expect("slbmte-over", "vsid1", load_dr(EA_D), VAL_1);
+
+    asm volatile("slbmte %0,%1; isync"
+                 : : "r"(VSID_2 << SLB_VSID_SHIFT), "r"(rb) : "memory");
+    expect("slbmte-over", "vsid2", load_dr(EA_D), VAL_2);
+}
+
+/* (k) one VSID in two segments: the page drops through both */
+static void case_tlbie_two_esid(void)
+{
+    unsigned long rb = (EA_K & SLB_ESID_ESID) | SLB_ESID_V | 5;
+
+    start_case();
+    pte_put(VSID_1, EA_D, PAGE_1);
+    mtsr(VSID_1);
+    asm volatile("slbmte %0,%1; isync"
+                 : : "r"(VSID_1 << SLB_VSID_SHIFT), "r"(rb) : "memory");
+    expect("tlbie-two-esid", "before-d", load_dr(EA_D), VAL_1);
+    expect("tlbie-two-esid", "before-k", load_dr(EA_K), VAL_1);
+
+    pte_put(VSID_1, EA_D, PAGE_2);
+    tlbie_sync(TLBIE_VA(VSID_1, EA_D));
+    expect("tlbie-two-esid", "after-d", load_dr(EA_D), VAL_2);
+    expect("tlbie-two-esid", "after-k", load_dr(EA_K), VAL_2);
+}
+
 int main(void)
 {
     case_tlbie_sync();
@@ -285,6 +450,12 @@ int main(void)
     case_mfsrin();
     case_trace_sync();
     case_mfsrin_slot();
+    case_tlbie_va();
+    case_tlbie_many("tlbie-16", 16);
+    case_tlbie_many("tlbie-17", MANY_MAX);
+    case_tlbiel_32();
+    case_slbmte_over();
+    case_tlbie_two_esid();
 
     if (ok) {
         ml_printf("PASS: bridge\n");
