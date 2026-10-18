@@ -27,6 +27,7 @@
 
 #include "qemu/osdep.h"
 #include "libqtest.h"
+#include "qemu/bswap.h"
 #include "qobject/qdict.h"
 #include "qobject/qlist.h"
 #include "hw/ppc/openpic.h"
@@ -255,6 +256,91 @@ static void test_secondary_held(void)
     qtest_quit(qts);
 }
 
+/*
+ * The MPIC sits at 0xf8040000 and is little endian.  Firmware does not run
+ * under qtest, so the sources are programmed by hand through the source and
+ * per-CPU register blocks.
+ */
+#define MPIC_BASE          0xf8040000ULL
+#define MPIC_SPVE          (MPIC_BASE + 0x10e0)
+#define MPIC_IVPR(n)       (MPIC_BASE + 0x10000 + (n) * 0x20)
+#define MPIC_IDR(n)        (MPIC_IVPR(n) + 0x10)
+#define MPIC_CPU0_CTPR     (MPIC_BASE + 0x20080)
+#define MPIC_CPU0_IACK     (MPIC_BASE + 0x200a0)
+#define MPIC_CPU0_EOI      (MPIC_BASE + 0x200b0)
+
+/* Two external inputs nothing else drives under qtest */
+#define SRC_LOW            0x30
+#define SRC_HIGH           0x31
+
+static void mpic_writel(QTestState *qts, uint64_t addr, uint32_t val)
+{
+    qtest_writel(qts, addr, bswap32(val));
+}
+
+static uint32_t mpic_readl(QTestState *qts, uint64_t addr)
+{
+    return bswap32(qtest_readl(qts, addr));
+}
+
+/* Unmasked, edge sensitive, delivered to CPU 0 */
+static void mpic_edge_source(QTestState *qts, int n, int priority)
+{
+    mpic_writel(qts, MPIC_IDR(n), 1 << 0);
+    mpic_writel(qts, MPIC_IVPR(n), (priority << 16) | n);
+}
+
+/*
+ * An edge whose priority is not above CTPR has to stay pending until the
+ * guest lowers CTPR.  OpenBSD raises CTPR while it handles an interrupt;
+ * before upstream 2c87618bcc, the EOI of a higher priority interrupt
+ * re-raised INT without looking at CTPR, and the IACK that followed
+ * returned the spurious vector and dropped the masked edge on the way, so
+ * it never arrived once CTPR came back down.  No CPU runs here, so watch
+ * CPU 0's INT output (the first "sysbus-irq" line) and what IACK hands out.
+ */
+static void test_mpic_ctpr_keeps_edge(void)
+{
+    QTestState *qts;
+    g_autofree char *pic = NULL;
+    uint32_t spve;
+
+    qts = qtest_init("-machine powermac7_3");
+    pic = find_macio_pic(qts);
+    g_assert_nonnull(pic);
+
+    spve = mpic_readl(qts, MPIC_SPVE) & 0xff;
+    mpic_edge_source(qts, SRC_LOW, 2);
+    mpic_edge_source(qts, SRC_HIGH, 6);
+    mpic_writel(qts, MPIC_CPU0_CTPR, 4);
+    qtest_irq_intercept_out_named(qts, pic, "sysbus-irq");
+
+    qtest_set_irq_in(qts, pic, NULL, SRC_LOW, 1);
+    qtest_set_irq_in(qts, pic, NULL, SRC_LOW, 0);
+    g_assert_false(qtest_get_irq(qts, OPENPIC_OUTPUT_INT));
+    qtest_set_irq_in(qts, pic, NULL, SRC_HIGH, 1);
+    qtest_set_irq_in(qts, pic, NULL, SRC_HIGH, 0);
+    g_assert_true(qtest_get_irq(qts, OPENPIC_OUTPUT_INT));
+
+    /* Only the source above CTPR is handed out */
+    g_assert_cmphex(mpic_readl(qts, MPIC_CPU0_IACK) & 0xff, ==, SRC_HIGH);
+    g_assert_false(qtest_get_irq(qts, OPENPIC_OUTPUT_INT));
+    mpic_writel(qts, MPIC_CPU0_EOI, 0);
+
+    /* The low one is still masked by CTPR: no INT, and IACK is spurious */
+    g_assert_false(qtest_get_irq(qts, OPENPIC_OUTPUT_INT));
+    g_assert_cmphex(mpic_readl(qts, MPIC_CPU0_IACK) & 0xff, ==, spve);
+
+    /* ... and arrives once CTPR is lowered */
+    mpic_writel(qts, MPIC_CPU0_CTPR, 1);
+    g_assert_true(qtest_get_irq(qts, OPENPIC_OUTPUT_INT));
+    g_assert_cmphex(mpic_readl(qts, MPIC_CPU0_IACK) & 0xff, ==, SRC_LOW);
+    mpic_writel(qts, MPIC_CPU0_EOI, 0);
+    g_assert_cmphex(mpic_readl(qts, MPIC_CPU0_IACK) & 0xff, ==, spve);
+
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -269,6 +355,8 @@ int main(int argc, char **argv)
     qtest_add_func("/powermac7_3-smp/smp1-unchanged", test_smp1_unchanged);
     qtest_add_func("/powermac7_3-smp/irq-destinations", test_irq_destinations);
     qtest_add_func("/powermac7_3-smp/secondary-held", test_secondary_held);
+    qtest_add_func("/powermac7_3-smp/mpic-ctpr-keeps-edge",
+                   test_mpic_ctpr_keeps_edge);
 
     return g_test_run();
 }
