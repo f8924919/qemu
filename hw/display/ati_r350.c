@@ -6754,6 +6754,23 @@ static void ati_r350_class_init(ObjectClass *klass, const void *data)
     k->exit      = ati_r350_exit;
     dc->vmsd     = &vmstate_ati_r350;
     device_class_set_props(dc, ati_r350_properties);
+    /*
+     * After device_class_set_props(), which gives each property its
+     * type's default description ("on/off" for a bool).
+     */
+    dc->desc = "ATI Radeon 9800 (R350)";
+    object_class_property_set_description(klass, "gl",
+        "Host GPU rendering of the 3D engine: off (the default; software "
+        "only), on (host GL or Metal, falling back to software per draw), "
+        "fast (on plus an inexact faster blend) or verify (render both ways "
+        "and compare; for debugging)");
+    object_class_property_set_description(klass, "gl-api",
+        "Host API when gl is not off: gl (the default) or metal (macOS "
+        "only)");
+    object_class_property_set_description(klass, "guest_hwcursor",
+        "Draw the guest's hardware cursor into the display surface instead "
+        "of handing it to the UI, which draws it offset as the registers "
+        "carry no hot spot");
     rc->phases.hold = ati_r350_reset_hold;
     set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
 }
