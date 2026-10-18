@@ -41,7 +41,7 @@
 /* qemu-g5 #482 C0 counters (NOT FOR UPSTREAM) */
 #include "qemu/atomic.h"
 static uint64_t g5cnt_mtsr, g5cnt_mtsr_changed, g5cnt_mfsr, g5cnt_tlbie;
-static uint64_t g5cnt_sync, g5cnt_sync_pending;
+static uint64_t g5cnt_sync, g5cnt_sync_pending, g5cnt_sync_pending_global;
 
 
 /* #define FLUSH_ALL_TLBS */
@@ -347,10 +347,12 @@ static void g5cnt_dump(void)
     }
     fprintf(fp, "g5cnt mtsr=%" PRIu64 " mtsr_changed=%" PRIu64
             " mfsr=%" PRIu64 " tlbie=%" PRIu64 " sync_heavy=%" PRIu64
-            " sync_heavy_pending=%" PRIu64 "\n",
+            " sync_heavy_pending=%" PRIu64
+            " sync_heavy_pending_global=%" PRIu64 "\n",
             qatomic_read(&g5cnt_mtsr), qatomic_read(&g5cnt_mtsr_changed),
             qatomic_read(&g5cnt_mfsr), qatomic_read(&g5cnt_tlbie),
-            qatomic_read(&g5cnt_sync), qatomic_read(&g5cnt_sync_pending));
+            qatomic_read(&g5cnt_sync), qatomic_read(&g5cnt_sync_pending),
+            qatomic_read(&g5cnt_sync_pending_global));
     fclose(fp);
 }
 
@@ -364,6 +366,9 @@ void helper_g5cnt_sync(CPUPPCState *env)
     qatomic_inc(&g5cnt_sync);
     if (env->tlb_need_flush) {
         qatomic_inc(&g5cnt_sync_pending);
+        if (env->tlb_need_flush & TLB_NEED_GLOBAL_FLUSH) {
+            qatomic_inc(&g5cnt_sync_pending_global);
+        }
     }
 }
 
