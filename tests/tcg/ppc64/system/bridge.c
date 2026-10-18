@@ -13,7 +13,11 @@
  *       through the new segment; writing the same value again changes
  *       nothing;
  *   (c) mfsrin returns what mtsr wrote, and 0 for a segment the SLB does
- *       not hold.
+ *       not hold;
+ *   (d) single stepping (MSR[SE]) over a sync that completes a pending
+ *       tlbie still takes the trace interrupt after every instruction;
+ *   (e) mfsrin returns what mtsr wrote even when another SLB entry, written
+ *       with slbmte, holds the same segment.
  *
  * The test code runs in real mode; only the load under test is done with
  * data relocation on, inside one asm statement, so that nothing else (the
@@ -24,6 +28,8 @@
  */
 
 #include <minilib.h>
+
+#include "bridge.h"
 
 #define SPR_SDR1 25
 
@@ -51,6 +57,8 @@
 #define PTE1_RC   0x180UL      /* referenced and changed already set */
 
 #define MSR_DR 0x10UL
+
+#define VEC_TRACE 0xd00UL
 
 #define VAL_1 0x1111111111111111UL
 #define VAL_2 0x2222222222222222UL
@@ -137,6 +145,27 @@ static void isync(void)
     asm volatile("isync" : : : "memory");
 }
 
+static void wr32(unsigned long addr, unsigned int val)
+{
+    /* volatile: see wr64 */
+    *(volatile unsigned int *)addr = val;
+}
+
+static void install_vector(unsigned long vec, const char *start,
+                           const char *end)
+{
+    const unsigned int *src = (const unsigned int *)start;
+    unsigned long n = (end - start) / 4;
+    unsigned long i;
+
+    for (i = 0; i < n; i++) {
+        wr32(vec + 4 * i, src[i]);
+        asm volatile("dcbst 0,%0; sync; icbi 0,%0" : : "r"(vec + 4 * i)
+                     : "memory");
+    }
+    asm volatile("isync");
+}
+
 /*
  * A fresh start: empty SLB (slbia also drops the TLB at the isync), the
  * table in SDR1, both pages filled
@@ -212,11 +241,50 @@ static void case_mfsrin(void)
     expect("mfsrin", "absent", mfsrin(EA_D + 0x10000000UL), 0);
 }
 
+/* (d) single stepping over a sync that completes a pending tlbie */
+static void case_trace_sync(void)
+{
+    unsigned long want[5] = {
+        (unsigned long)br_l1, (unsigned long)br_l2, (unsigned long)br_l3,
+        (unsigned long)br_l4, (unsigned long)br_l5,
+    };
+    char step[8];
+    int i;
+
+    start_case();
+    install_vector(VEC_TRACE, br_trace_stub, br_trace_stub_end);
+    for (i = 0; i < 16; i++) {
+        br_trace_state[i] = 0;
+    }
+    br_trace_run(EA_D);
+    expect("trace-sync", "count", br_trace_state[0], 5);
+    for (i = 0; i < 5; i++) {
+        step[0] = '0' + i;
+        step[1] = 0;
+        expect("trace-sync", step, br_trace_state[1 + i], want[i]);
+    }
+}
+
+/* (e) mfsrin when slbmte put the same segment in another entry */
+static void case_mfsrin_slot(void)
+{
+    unsigned long rb = (EA_D & SLB_ESID_ESID) | SLB_ESID_V | 0;
+
+    start_case();
+    asm volatile("slbmte %0,%1" : : "r"(VSID_1 << SLB_VSID_SHIFT), "r"(rb)
+                 : "memory");
+    mtsr(VSID_2);
+    isync();
+    expect("mfsrin-slot", "written", mfsrin(EA_D), VSID_2);
+}
+
 int main(void)
 {
     case_tlbie_sync();
     case_mtsr();
     case_mfsrin();
+    case_trace_sync();
+    case_mfsrin_slot();
 
     if (ok) {
         ml_printf("PASS: bridge\n");
