@@ -15,6 +15,10 @@
  * the interrupt line the i2c raises, and descriptor retirement on both
  * DMA channels.
  *
+ * A DBDMA channel window is 0x80 bytes but holds only 16 registers; the
+ * dbdma tests check that the rest of the window neither reads back nor
+ * reaches the channel state that follows the registers.
+ *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
@@ -68,7 +72,23 @@
 #define DBDMA_CH(n)       (DBDMA_BASE + ((n) << 7))
 #define DBDMA_CONTROL     0x00
 #define DBDMA_STATUS      0x04
+#define DBDMA_CMDPTR_HI   0x08
 #define DBDMA_CMDPTR_LO   0x0c
+#define DBDMA_INTR_SEL    0x10
+#define DBDMA_BRANCH_SEL  0x14
+#define DBDMA_WAIT_SEL    0x18
+#define DBDMA_XFER_MODE   0x1c
+#define DBDMA_DATA2PTR_HI 0x20
+#define DBDMA_DATA2PTR_LO 0x24
+#define DBDMA_RES1        0x28
+#define DBDMA_ADDRESS_HI  0x2c
+#define DBDMA_BR_ADDR_HI  0x30
+#define DBDMA_RES2        0x34
+#define DBDMA_RES3        0x38
+#define DBDMA_RES4        0x3c
+#define DBDMA_IMPL_END    0x40
+#define DBDMA_WINDOW      0x80
+#define DBDMA_NCHANNELS   32
 #define DBDMA_RUN         0x8000
 #define DBDMA_ACTIVE      0x0400
 #define OUTPUT_LAST       0x1000
@@ -296,12 +316,25 @@ static uint16_t dma_xfer_status(QTestState *qts)
  * Without an audiodev the cell stays silent but must still retire them:
  * a guest whose output DMA never completes blocks its sound server.
  */
-static void dma_retires(int ch, uint16_t cmd, int irq)
+/* Fill the unimplemented part of a channel window, a distinct value a word */
+static void dbdma_fill_unimplemented(QTestState *qts, int ch)
+{
+    uint32_t off;
+
+    for (off = DBDMA_IMPL_END; off < DBDMA_WINDOW; off += 4) {
+        le_writel(qts, DBDMA_CH(ch) + off, 0xa5000000 | off);
+    }
+}
+
+static void dma_retires_after(int ch, uint16_t cmd, int irq, bool fill)
 {
     QTestState *qts = k2_init("");
 
     qtest_irq_intercept_in(qts, "pic");
     le_writel(qts, K2_FCR1, K2_FCR1_I2S0_BITS);
+    if (fill) {
+        dbdma_fill_unimplemented(qts, ch);
+    }
     dma_program(qts, ch, cmd);
 
     /* 4096 bytes are 1024 16-bit stereo frames: well under 100ms */
@@ -311,6 +344,11 @@ static void dma_retires(int ch, uint16_t cmd, int irq)
     g_assert_true(qtest_get_irq(qts, irq));
 
     qtest_quit(qts);
+}
+
+static void dma_retires(int ch, uint16_t cmd, int irq)
+{
+    dma_retires_after(ch, cmd, irq, false);
 }
 
 /*
@@ -374,6 +412,76 @@ static void test_dma_in_retires(void)
     dma_retires(2, INPUT_LAST, IRQ_I2S_RX);
 }
 
+/* The unimplemented part of every channel window reads as zero */
+static void test_dbdma_unimplemented_reads_zero(void)
+{
+    QTestState *qts = k2_init("");
+    uint32_t off;
+    int ch;
+
+    for (ch = 0; ch < DBDMA_NCHANNELS; ch++) {
+        dbdma_fill_unimplemented(qts, ch);
+    }
+    for (ch = 0; ch < DBDMA_NCHANNELS; ch++) {
+        for (off = DBDMA_IMPL_END; off < DBDMA_WINDOW; off += 4) {
+            g_assert_cmphex(le_readl(qts, DBDMA_CH(ch) + off), ==, 0);
+        }
+    }
+
+    qtest_quit(qts);
+}
+
+/*
+ * Writes past the registers leave the implemented ones alone, and the
+ * registers QEMU does not use read as zero.
+ */
+static void test_dbdma_implemented_regs_kept(void)
+{
+    static const struct {
+        uint32_t off;
+        uint32_t val;
+        uint32_t expect;
+    } regs[] = {
+        { DBDMA_STATUS,     0x000000a5, 0x000000a5 },
+        { DBDMA_CMDPTR_LO,  DESC_ADDR | 0x7, DESC_ADDR },
+        { DBDMA_INTR_SEL,   0x00110011, 0x00110011 },
+        { DBDMA_BRANCH_SEL, 0x00220022, 0x00220022 },
+        { DBDMA_WAIT_SEL,   0x00330033, 0x00330033 },
+        { DBDMA_RES1,       0x5a5a0001, 0x5a5a0001 },
+        { DBDMA_RES2,       0x5a5a0002, 0x5a5a0002 },
+        { DBDMA_RES3,       0x5a5a0003, 0x5a5a0003 },
+        { DBDMA_RES4,       0x5a5a0004, 0x5a5a0004 },
+        { DBDMA_XFER_MODE,  0x12345678, 0 },
+        { DBDMA_CMDPTR_HI,  0x12345678, 0 },
+        { DBDMA_DATA2PTR_HI, 0x12345678, 0 },
+        { DBDMA_DATA2PTR_LO, 0x12345678, 0 },
+        { DBDMA_ADDRESS_HI, 0x12345678, 0 },
+        { DBDMA_BR_ADDR_HI, 0x12345678, 0 },
+    };
+    QTestState *qts = k2_init("");
+    int i;
+
+    for (i = 0; i < ARRAY_SIZE(regs); i++) {
+        le_writel(qts, DBDMA_CH(0) + regs[i].off, regs[i].val);
+    }
+    dbdma_fill_unimplemented(qts, 0);
+
+    for (i = 0; i < ARRAY_SIZE(regs); i++) {
+        g_assert_cmphex(le_readl(qts, DBDMA_CH(0) + regs[i].off), ==,
+                        regs[i].expect);
+    }
+    /* CONTROL reads back the status */
+    g_assert_cmphex(le_readl(qts, DBDMA_CH(0) + DBDMA_CONTROL), ==, 0xa5);
+
+    qtest_quit(qts);
+}
+
+/* The channel still runs a program after writes past its registers */
+static void test_dbdma_runs_after_unimplemented_writes(void)
+{
+    dma_retires_after(0, OUTPUT_LAST, IRQ_I2S_TX, true);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -395,6 +503,12 @@ int main(int argc, char **argv)
                    test_dma_out_starts_on_time);
     qtest_add_func("/k2-sound/dma-usable-after-reset",
                    test_dma_usable_after_reset);
+    qtest_add_func("/k2-sound/dbdma-unimplemented-reads-zero",
+                   test_dbdma_unimplemented_reads_zero);
+    qtest_add_func("/k2-sound/dbdma-implemented-regs-kept",
+                   test_dbdma_implemented_regs_kept);
+    qtest_add_func("/k2-sound/dbdma-runs-after-unimplemented-writes",
+                   test_dbdma_runs_after_unimplemented_writes);
 
     return g_test_run();
 }
