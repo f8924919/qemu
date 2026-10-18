@@ -268,6 +268,14 @@ static void test_secondary_held(void)
 #define MPIC_CPU0_CTPR     (MPIC_BASE + 0x20080)
 #define MPIC_CPU0_IACK     (MPIC_BASE + 0x200a0)
 #define MPIC_CPU0_EOI      (MPIC_BASE + 0x200b0)
+#define MPIC_IPI_IVPR(n)   (MPIC_BASE + 0x10a0 + (n) * 0x10)
+#define MPIC_TMR_TVPR(n)   (MPIC_BASE + 0x1120 + (n) * 0x40)
+#define MPIC_CPU0_IPIDR(n) (MPIC_BASE + 0x20040 + (n) * 0x10)
+#define IVPR_MASK          (1u << 31)
+
+/* KeyLargo: 64 external sources, then the IPIs and the timers in src[] */
+#define KL_IPI0            64
+#define KL_TMR0            68
 
 /* Two external inputs nothing else drives under qtest */
 #define SRC_LOW            0x30
@@ -341,6 +349,74 @@ static void test_mpic_ctpr_keeps_edge(void)
     qtest_quit(qts);
 }
 
+/*
+ * The KeyLargo source window covers the 64 external sources only.  QEMU
+ * keeps the IPIs and timers right after them in src[], and NetBSD masks
+ * every source up to its IPI vector through the window; that must not
+ * reach the IPI (or timer) registers, and the window reads 0 past the
+ * last external source.
+ */
+static void test_mpic_src_window_ends(void)
+{
+    static const int beyond[] = { KL_IPI0, KL_TMR0, 72, 255 };
+    QTestState *qts;
+    g_autofree char *pic = NULL;
+    uint32_t spve, ipi, tmr;
+    int i;
+
+    qts = qtest_init("-machine powermac7_3");
+    pic = find_macio_pic(qts);
+    g_assert_nonnull(pic);
+    spve = mpic_readl(qts, MPIC_SPVE) & 0xff;
+
+    /* The last external sources still decode */
+    mpic_writel(qts, MPIC_IVPR(0), IVPR_MASK | (3 << 16) | 0x11);
+    mpic_writel(qts, MPIC_IDR(0), 1 << 0);
+    mpic_writel(qts, MPIC_IVPR(63), IVPR_MASK | (4 << 16) | 0x22);
+    mpic_writel(qts, MPIC_IDR(63), 1 << 0);
+    g_assert_cmphex(mpic_readl(qts, MPIC_IVPR(0)), ==,
+                    IVPR_MASK | (3 << 16) | 0x11);
+    g_assert_cmphex(mpic_readl(qts, MPIC_IDR(0)), ==, 1 << 0);
+    g_assert_cmphex(mpic_readl(qts, MPIC_IVPR(63)), ==,
+                    IVPR_MASK | (4 << 16) | 0x22);
+    g_assert_cmphex(mpic_readl(qts, MPIC_IDR(63)), ==, 1 << 0);
+
+    /* IPI 0 and timer 0, unmasked, through their own registers */
+    mpic_writel(qts, MPIC_IPI_IVPR(0), (5 << 16) | 0x50);
+    mpic_writel(qts, MPIC_TMR_TVPR(0), (6 << 16) | 0x60);
+    ipi = mpic_readl(qts, MPIC_IPI_IVPR(0));
+    tmr = mpic_readl(qts, MPIC_TMR_TVPR(0));
+    g_assert_cmphex(ipi, ==, (5 << 16) | 0x50);
+    g_assert_cmphex(tmr, ==, (6 << 16) | 0x60);
+
+    /* Masking "every source" past the last one leaves them alone */
+    for (i = 0; i < ARRAY_SIZE(beyond); i++) {
+        mpic_writel(qts, MPIC_IVPR(beyond[i]), IVPR_MASK | (1 << 16) | 0x7f);
+        mpic_writel(qts, MPIC_IDR(beyond[i]), 0);
+    }
+    g_assert_cmphex(mpic_readl(qts, MPIC_IPI_IVPR(0)), ==, ipi);
+    g_assert_cmphex(mpic_readl(qts, MPIC_TMR_TVPR(0)), ==, tmr);
+
+    /* ... and the window reads 0 there */
+    for (i = 0; i < ARRAY_SIZE(beyond); i++) {
+        g_assert_cmphex(mpic_readl(qts, MPIC_IVPR(beyond[i])), ==, 0);
+        g_assert_cmphex(mpic_readl(qts, MPIC_IDR(beyond[i])), ==, 0);
+    }
+
+    /* IPI 0 still arrives at CPU 0 (CTPR comes out of reset at 15) */
+    mpic_writel(qts, MPIC_CPU0_CTPR, 0);
+    qtest_irq_intercept_out_named(qts, pic, "sysbus-irq");
+    g_assert_false(qtest_get_irq(qts, OPENPIC_OUTPUT_INT));
+    mpic_writel(qts, MPIC_CPU0_IPIDR(0), 1 << 0);
+    g_assert_true(qtest_get_irq(qts, OPENPIC_OUTPUT_INT));
+    g_assert_cmphex(mpic_readl(qts, MPIC_CPU0_IACK) & 0xff, ==, 0x50);
+    mpic_writel(qts, MPIC_CPU0_EOI, 0);
+    g_assert_false(qtest_get_irq(qts, OPENPIC_OUTPUT_INT));
+    g_assert_cmphex(mpic_readl(qts, MPIC_CPU0_IACK) & 0xff, ==, spve);
+
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -357,6 +433,8 @@ int main(int argc, char **argv)
     qtest_add_func("/powermac7_3-smp/secondary-held", test_secondary_held);
     qtest_add_func("/powermac7_3-smp/mpic-ctpr-keeps-edge",
                    test_mpic_ctpr_keeps_edge);
+    qtest_add_func("/powermac7_3-smp/mpic-src-window-ends",
+                   test_mpic_src_window_ends);
 
     return g_test_run();
 }
