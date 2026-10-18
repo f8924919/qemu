@@ -132,7 +132,9 @@ void helper_SLBIA(CPUPPCState *env, uint32_t ih)
      * invalidated.
      */
 
-    env->tlb_need_flush |= TLB_NEED_LOCAL_FLUSH;
+    qatomic_set(&env->tlb_need_flush,
+                env->tlb_need_flush | TLB_NEED_LOCAL_FLUSH);
+    smp_wmb(); /* the flag before the SLB, see ppc_hash64_tlbie_pages() */
 
     starting_entry = 1; /* default for IH=0,1,2,6 */
 
@@ -173,7 +175,7 @@ void helper_SLBIA(CPUPPCState *env, uint32_t ih)
             }
         }
 
-        slb->esid &= ~SLB_ESID_V;
+        qatomic_set(&slb->esid, slb->esid & ~SLB_ESID_V);
     }
 }
 
@@ -216,15 +218,19 @@ static void __helper_slbie(CPUPPCState *env, target_ulong addr,
     }
 
     if (slb->esid & SLB_ESID_V) {
-        slb->esid &= ~SLB_ESID_V;
-
         /*
          * XXX: given the fact that segment size is 256 MB or 1TB,
          *      and we still don't have a tlb_flush_mask(env, n, mask)
          *      in QEMU, we just invalidate all TLBs
+         *
+         * The flag goes before the SLB: a tlbie on another CPU that no
+         * longer finds the segment then sees it (ppc_hash64_tlbie_pages()).
          */
-        env->tlb_need_flush |=
-            (global == false ? TLB_NEED_LOCAL_FLUSH : TLB_NEED_GLOBAL_FLUSH);
+        qatomic_set(&env->tlb_need_flush, env->tlb_need_flush |
+                    (global == false ? TLB_NEED_LOCAL_FLUSH :
+                     TLB_NEED_GLOBAL_FLUSH));
+        smp_wmb(); /* pairs with smp_rmb() in ppc_hash64_tlbie_pages() */
+        qatomic_set(&slb->esid, slb->esid & ~SLB_ESID_V);
     }
 }
 
@@ -289,9 +295,9 @@ int ppc_store_slb(PowerPCCPU *cpu, target_ulong slot,
                     env->tlb_need_flush | TLB_NEED_LOCAL_FLUSH);
         smp_wmb(); /* pairs with smp_rmb() in ppc_hash64_tlbie_pages() */
     }
-    slb->esid = esid;
-    slb->vsid = vsid;
-    slb->sps = sps;
+    qatomic_set(&slb->esid, esid);
+    qatomic_set(&slb->vsid, vsid);
+    qatomic_set(&slb->sps, sps);
 
     LOG_SLB("%s: " TARGET_FMT_lu " " TARGET_FMT_lx " - " TARGET_FMT_lx
             " => %016" PRIx64 " %016" PRIx64 "\n", __func__, slot, esid, vsid,
@@ -1355,7 +1361,11 @@ void ppc_hash64_tlbie_pages(PowerPCCPU *cpu, bool global)
         if (!hash64_tlbie_cpu(other, env->tlbie_pages, env->tlbie_pages_nb,
                               false)) {
             /* A segment it dropped may still be in its TLB */
-            smp_rmb(); /* pairs with smp_wmb() in ppc_store_slb() */
+            /*
+             * Pairs with smp_wmb() in ppc_store_slb(), slbie and slbia,
+             * which raise the flag before they change the SLB
+             */
+            smp_rmb();
             if (!(qatomic_read(&other->env.tlb_need_flush) &
                   TLB_NEED_LOCAL_FLUSH)) {
                 continue;
