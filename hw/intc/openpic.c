@@ -559,6 +559,26 @@ static void openpic_gcr_write(OpenPICState *opp, uint64_t val)
     ppce500_set_mpic_proxy(mpic_proxy);
 }
 
+/* qemu-g5 #484 C0: event log (NOT FOR UPSTREAM) */
+static uint64_t g5ev_seq, g5ev_ipi_ivpr_wr, g5ev_ipi_send;
+static uint64_t g5ev_first_send_seq;
+static char g5ev_log[4096];
+static int g5ev_n;
+
+static void G_GNUC_PRINTF(1, 2) g5ev(const char *fmt, ...)
+{
+    va_list ap;
+    size_t l = strlen(g5ev_log);
+
+    if (g5ev_n >= 48 || l >= sizeof(g5ev_log) - 64) {
+        return;
+    }
+    va_start(ap, fmt);
+    vsnprintf(g5ev_log + l, sizeof(g5ev_log) - l, fmt, ap);
+    va_end(ap);
+    g5ev_n++;
+}
+
 static void openpic_gbl_write(void *opaque, hwaddr addr, uint64_t val,
                               unsigned len)
 {
@@ -610,6 +630,10 @@ static void openpic_gbl_write(void *opaque, hwaddr addr, uint64_t val,
     case 0x10C0:
     case 0x10D0:
         idx = (addr - 0x10A0) >> 4;
+        g5ev_seq++;
+        if (g5ev_ipi_ivpr_wr++ < 16) {
+            g5ev(" ipivpr%d@%" PRIu64 "=%#" PRIx64, idx, g5ev_seq, val);
+        }
         write_IRQreg_ivpr(opp, opp->irq_ipi0 + idx, val);
         break;
     case 0x10E0: /* SPVE */
@@ -846,6 +870,12 @@ static void g5cnt_note(OpenPICState *opp, int idx, hwaddr addr, uint64_t val,
     if (idx > g5cnt_hi_max) {
         g5cnt_hi_max = idx;
     }
+    g5ev_seq++;
+    if (wr) {
+        g5ev(" hiw%d@%" PRIu64 "=%#" PRIx64 "(ipi0=%#x,ipi1=%#x)", idx,
+             g5ev_seq, val, opp->src[opp->irq_ipi0].ivpr,
+             opp->src[opp->irq_ipi0 + 1].ivpr);
+    }
     if (g5cnt_nlog < 16) {
         size_t l = strlen(g5cnt_log);
         snprintf(g5cnt_log + l, sizeof(g5cnt_log) - l, " %c%#x=%#" PRIx64,
@@ -867,6 +897,9 @@ static void g5cnt_dump(void)
             qatomic_read(&g5cnt_rd), qatomic_read(&g5cnt_wr),
             qatomic_read(&g5cnt_hi_rd), qatomic_read(&g5cnt_hi_wr),
             g5cnt_hi_max, g5cnt_log);
+    fprintf(fp, "g5ev ipi_ivpr_wr=%" PRIu64 " ipi_send=%" PRIu64
+            " first_send_seq=%" PRIu64 " log:%s\n",
+            g5ev_ipi_ivpr_wr, g5ev_ipi_send, g5ev_first_send_seq, g5ev_log);
     fclose(fp);
 }
 
@@ -1040,6 +1073,12 @@ static void openpic_cpu_write_internal(void *opaque, hwaddr addr,
     case 0x60:
     case 0x70:
         idx = (addr - 0x40) >> 4;
+        g5ev_seq++;
+        if (g5ev_ipi_send++ == 0) {
+            g5ev_first_send_seq = g5ev_seq;
+            g5ev(" send%d@%" PRIu64 "=%#x(ivpr=%#x)", idx, g5ev_seq,
+                 val, opp->src[opp->irq_ipi0 + idx].ivpr);
+        }
         /* we use IDE as mask which CPUs to deliver the IPI to still. */
         opp->src[opp->irq_ipi0 + idx].destmask |= val;
         openpic_set_irq(opp, opp->irq_ipi0 + idx, 1);
