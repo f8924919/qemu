@@ -1260,6 +1260,7 @@ static bool hash64_tlbie_cpu(PowerPCCPU *cpu, const target_ulong *rbs,
 {
     CPUPPCState *env = &cpu->env;
     CPUState *cs = CPU(cpu);
+    MMUIdxMap idxmap = ppc_delayed_flush_mmuidx(env);
     bool hit = false;
     unsigned i;
     int n;
@@ -1290,18 +1291,17 @@ static bool hash64_tlbie_cpu(PowerPCCPU *cpu, const target_ulong *rbs,
             }
             hit = true;
             if ((vsid & SLB_VSID_B) != SLB_VSID_B_256M) {
-                tlb_flush(cs);
+                ppc_delayed_flush_all(env);
                 return true;
             }
             ea = (esid & SLB_ESID_ESID) | page;
             shift = sps ? sps->page_shift : TARGET_PAGE_BITS;
             if (shift > TARGET_PAGE_BITS) {
                 tlb_flush_range_by_mmuidx(cs, ea & ~((1ULL << shift) - 1),
-                                          1ULL << shift,
-                                          (1 << NB_MMU_MODES) - 1,
+                                          1ULL << shift, idxmap,
                                           TARGET_LONG_BITS);
             } else {
-                tlb_flush_page(cs, ea);
+                tlb_flush_page_by_mmuidx(cs, ea, idxmap);
             }
         }
     }
@@ -1319,7 +1319,7 @@ static void hash64_tlbie_work(CPUState *cs, run_on_cpu_data data)
     PowerPCCPU *cpu = POWERPC_CPU(cs);
 
     if (cpu->env.tlb_need_flush & TLB_NEED_LOCAL_FLUSH) {
-        tlb_flush(cs);
+        ppc_delayed_flush_all(&cpu->env);
     } else {
         hash64_tlbie_cpu(cpu, p->rbs, p->nb, true);
     }

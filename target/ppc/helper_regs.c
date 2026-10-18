@@ -412,6 +412,24 @@ MMUIdxMap ppc_hrmor_mmuidx_mask(CPUPPCState *env)
     return mask;
 }
 
+/* The MMU indexes a delayed flush drops: all but ppc_hrmor_mmuidx_mask() */
+MMUIdxMap ppc_delayed_flush_mmuidx(CPUPPCState *env)
+{
+    return MAKE_64BIT_MASK(0, NB_MMU_MODES) & ~ppc_hrmor_mmuidx_mask(env);
+}
+
+/* A delayed flush of the whole TLB of the CPU of @env */
+void ppc_delayed_flush_all(CPUPPCState *env)
+{
+    CPUState *cs = env_cpu(env);
+
+    if (ppc_hrmor_mmuidx_mask(env)) {
+        tlb_flush_by_mmuidx(cs, ppc_delayed_flush_mmuidx(env));
+    } else {
+        tlb_flush(cs);
+    }
+}
+
 /*
  * A delayed flush (TLB_NEED_*) stands for a change to the SLB or to the
  * page tables, so the MMU indexes that read neither are kept.  Whatever
@@ -421,8 +439,8 @@ void check_tlb_flush(CPUPPCState *env, bool global)
 {
     CPUState *cs = env_cpu(env);
     uint32_t need = env->tlb_need_flush;
-    uint32_t keep = need & TLB_NEED_GLOBAL_FLUSH ?
-                    need & (TLB_NEED_GLOBAL_FLUSH | TLB_NEED_PAGES_FLUSH) : 0;
+    uint32_t keep_flags = need & TLB_NEED_GLOBAL_FLUSH ?
+        need & (TLB_NEED_GLOBAL_FLUSH | TLB_NEED_PAGES_FLUSH) : 0;
 
 #if defined(TARGET_PPC64)
     /* tlbie on the 970: only the translations of the pages it names */
@@ -430,18 +448,18 @@ void check_tlb_flush(CPUPPCState *env, bool global)
         env->tlbie_pages_nb <= TLBIE_PAGES_MAX) {
         if (global && (need & TLB_NEED_GLOBAL_FLUSH)) {
             if (need & TLB_NEED_LOCAL_FLUSH) {
-                tlb_flush(cs);
+                ppc_delayed_flush_all(env);
             }
             ppc_hash64_tlbie_pages(env_archcpu(env), true);
-            keep = 0;
+            keep_flags = 0;
         } else if (need & TLB_NEED_LOCAL_FLUSH) {
-            tlb_flush(cs);
+            ppc_delayed_flush_all(env);
         } else {
             ppc_hash64_tlbie_pages(env_archcpu(env), false);
         }
         /* A tlbie on another CPU reads the flags: clear them after */
-        qatomic_set(&env->tlb_need_flush, keep);
-        if (!keep) {
+        qatomic_set(&env->tlb_need_flush, keep_flags);
+        if (!keep_flags) {
             env->tlbie_pages_nb = 0;
         }
         return;
@@ -450,16 +468,21 @@ void check_tlb_flush(CPUPPCState *env, bool global)
 
     /* Handle global flushes first */
     if (global && (need & TLB_NEED_GLOBAL_FLUSH)) {
-        tlb_flush_all_cpus_synced(cs);
-        keep = 0;
+        if (ppc_hrmor_mmuidx_mask(env)) {
+            tlb_flush_by_mmuidx_all_cpus_synced(cs,
+                                                ppc_delayed_flush_mmuidx(env));
+        } else {
+            tlb_flush_all_cpus_synced(cs);
+        }
+        keep_flags = 0;
     } else if (need & (TLB_NEED_LOCAL_FLUSH | TLB_NEED_PAGES_FLUSH)) {
-        tlb_flush(cs);
+        ppc_delayed_flush_all(env);
     } else {
         return;
     }
-    qatomic_set(&env->tlb_need_flush, keep);
+    qatomic_set(&env->tlb_need_flush, keep_flags);
 #if defined(TARGET_PPC64)
-    if (!keep) {
+    if (!keep_flags) {
         env->tlbie_pages_nb = 0;
     }
 #endif

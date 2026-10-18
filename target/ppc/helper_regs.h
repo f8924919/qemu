@@ -32,6 +32,8 @@ int hreg_store_msr(CPUPPCState *env, target_ulong value, int alter_hv);
 static inline void check_tlb_flush(CPUPPCState *env, bool global) { }
 #else
 MMUIdxMap ppc_hrmor_mmuidx_mask(CPUPPCState *env);
+MMUIdxMap ppc_delayed_flush_mmuidx(CPUPPCState *env);
+void ppc_delayed_flush_all(CPUPPCState *env);
 void check_tlb_flush(CPUPPCState *env, bool global);
 #endif
 
