@@ -40,6 +40,15 @@
 #define KW_LANE3          3
 static uint64_t kw_base = KW_I2C_BASE;
 
+/*
+ * The machine the byte-0 tests run on.  main() runs every one of them a
+ * second time with x-u3-i2c-lane3=on: decoding byte 3 as well must not
+ * change anything a guest does through byte 0.
+ */
+#define KW_MACHINE        "-machine powermac7_3"
+#define KW_MACHINE_LANE3  "-machine powermac7_3,x-u3-i2c-lane3=on"
+static const char *kw_machine = KW_MACHINE;
+
 #define KW_MODE           KW_REG(0)
 #define KW_CONTROL        KW_REG(1)
 #define KW_STATUS         KW_REG(2)
@@ -175,7 +184,7 @@ static void i2c_write_sub(QTestState *qts, uint8_t addr8, uint8_t sub,
  */
 static void test_register_stride(void)
 {
-    QTestState *qts = qtest_init("-machine powermac7_3");
+    QTestState *qts = qtest_init(kw_machine);
 
     qtest_writeb(qts, KW_MODE, 0x21);
     qtest_writeb(qts, KW_SUBADDR, 0x5a);
@@ -196,7 +205,7 @@ static void test_register_stride(void)
  */
 static void test_isr_write_one_to_clear(void)
 {
-    QTestState *qts = qtest_init("-machine powermac7_3");
+    QTestState *qts = qtest_init(kw_machine);
 
     qtest_writeb(qts, KW_STATUS, 0);
     qtest_writeb(qts, KW_MODE, KW_I2C_MODE_STANDARDSUB);
@@ -225,7 +234,7 @@ static void test_isr_write_one_to_clear(void)
  */
 static void test_hwclock_roundtrip(void)
 {
-    QTestState *qts = qtest_init("-machine powermac7_3");
+    QTestState *qts = qtest_init(kw_machine);
     uint8_t orig, val;
 
     orig = i2c_read_sub(qts, HWCLOCK_ADDR8, HWCLOCK_REG);
@@ -250,7 +259,7 @@ static void test_hwclock_roundtrip(void)
  */
 static void test_unanswered_address_naks(void)
 {
-    QTestState *qts = qtest_init("-machine powermac7_3");
+    QTestState *qts = qtest_init(kw_machine);
 
     qtest_writeb(qts, KW_STATUS, 0);
     qtest_writeb(qts, KW_MODE, KW_I2C_MODE_STANDARD);
@@ -280,7 +289,7 @@ static void test_unanswered_address_naks(void)
  */
 static void test_channel_one_has_no_hwclock(void)
 {
-    QTestState *qts = qtest_init("-machine powermac7_3");
+    QTestState *qts = qtest_init(kw_machine);
 
     qtest_writeb(qts, KW_STATUS, 0);
     qtest_writeb(qts, KW_MODE, KW_I2C_MODE_STANDARD | 0x10);   /* channel 1 */
@@ -307,7 +316,7 @@ static void test_channel_one_has_no_hwclock(void)
  */
 static void test_read_stops_without_stop_write(void)
 {
-    QTestState *qts = qtest_init("-machine powermac7_3");
+    QTestState *qts = qtest_init(kw_machine);
 
     qtest_writeb(qts, KW_STATUS, 0);
     qtest_writeb(qts, KW_MODE, KW_I2C_MODE_COMBINED);
@@ -342,7 +351,7 @@ static void test_read_stops_without_stop_write(void)
  */
 static void test_multi_byte_read(void)
 {
-    QTestState *qts = qtest_init("-machine powermac7_3");
+    QTestState *qts = qtest_init(kw_machine);
     uint8_t first, second;
 
     /* Seed two adjacent registers so the two bytes are distinguishable */
@@ -393,7 +402,7 @@ static void test_multi_byte_read(void)
  */
 static void test_multi_byte_write(void)
 {
-    QTestState *qts = qtest_init("-machine powermac7_3");
+    QTestState *qts = qtest_init(kw_machine);
 
     qtest_writeb(qts, KW_STATUS, 0);
     qtest_writeb(qts, KW_MODE, KW_I2C_MODE_STANDARDSUB);
@@ -430,7 +439,7 @@ static void test_multi_byte_write(void)
  */
 static void test_subaddr_read_has_no_side_effect(void)
 {
-    QTestState *qts = qtest_init("-machine powermac7_3");
+    QTestState *qts = qtest_init(kw_machine);
     uint8_t before, after;
 
     qtest_writeb(qts, KW_STATUS, 0);
@@ -454,7 +463,7 @@ static void test_subaddr_read_has_no_side_effect(void)
 /* kw_i2c_xfer() clears the status register before every transfer. */
 static void test_status_write_is_accepted(void)
 {
-    QTestState *qts = qtest_init("-machine powermac7_3");
+    QTestState *qts = qtest_init(kw_machine);
 
     qtest_writeb(qts, KW_MODE, KW_I2C_MODE_STANDARD);
     qtest_writeb(qts, KW_ADDR, HWCLOCK_ADDR8 & ~1);
@@ -486,7 +495,7 @@ static void test_status_write_is_accepted(void)
  */
 static void test_stop_ends_the_bus_transfer(void)
 {
-    QTestState *qts = qtest_init("-machine powermac7_3");
+    QTestState *qts = qtest_init(kw_machine);
 
     /* Address the clock chip, then abandon the transfer with STOP */
     qtest_writeb(qts, KW_STATUS, 0);
@@ -522,7 +531,7 @@ static void test_stop_ends_the_bus_transfer(void)
  */
 static void test_control_start_bit_self_clears(void)
 {
-    QTestState *qts = qtest_init("-machine powermac7_3");
+    QTestState *qts = qtest_init(kw_machine);
 
     qtest_writeb(qts, KW_STATUS, 0);
     qtest_writeb(qts, KW_MODE, KW_I2C_MODE_STANDARDSUB);
@@ -539,7 +548,7 @@ static void test_control_start_bit_self_clears(void)
 /* A one-byte write the way Darwin ends it: STOP read-modify-written */
 static void test_darwin_write_stop_rmw(void)
 {
-    QTestState *qts = qtest_init("-machine powermac7_3");
+    QTestState *qts = qtest_init(kw_machine);
 
     qtest_writeb(qts, KW_STATUS, 0);
     qtest_writeb(qts, KW_MODE, KW_I2C_MODE_STANDARDSUB);
@@ -575,7 +584,7 @@ static void test_darwin_write_stop_rmw(void)
  */
 static void test_darwin_multi_byte_read(void)
 {
-    QTestState *qts = qtest_init("-machine powermac7_3");
+    QTestState *qts = qtest_init(kw_machine);
     uint8_t first, second;
 
     i2c_write_sub(qts, HWCLOCK_ADDR8, HWCLOCK_REG, 0x5a);
@@ -747,21 +756,43 @@ static void test_lane3_other_bytes_are_holes(void)
     qtest_quit(qts);
 }
 
-/* With the switch on, the existing byte-0 round trip still works. */
-static void test_lane3_on_keeps_byte0(void)
+static const struct {
+    const char *name;
+    void (*fn)(void);
+} byte0_tests[] = {
+    { "/keywest-i2c/register-stride", test_register_stride },
+    { "/keywest-i2c/isr-write-one-to-clear", test_isr_write_one_to_clear },
+    { "/keywest-i2c/hwclock-roundtrip", test_hwclock_roundtrip },
+    { "/keywest-i2c/unanswered-address-naks", test_unanswered_address_naks },
+    { "/keywest-i2c/channel-one-has-no-hwclock",
+      test_channel_one_has_no_hwclock },
+    { "/keywest-i2c/read-stops-without-stop-write",
+      test_read_stops_without_stop_write },
+    { "/keywest-i2c/multi-byte-read", test_multi_byte_read },
+    { "/keywest-i2c/multi-byte-write", test_multi_byte_write },
+    { "/keywest-i2c/subaddr-read-has-no-side-effect",
+      test_subaddr_read_has_no_side_effect },
+    { "/keywest-i2c/status-write-is-accepted", test_status_write_is_accepted },
+    { "/keywest-i2c/stop-ends-the-bus-transfer",
+      test_stop_ends_the_bus_transfer },
+    { "/keywest-i2c/control-start-bit-self-clears",
+      test_control_start_bit_self_clears },
+    { "/keywest-i2c/darwin-write-stop-rmw", test_darwin_write_stop_rmw },
+    { "/keywest-i2c/darwin-multi-byte-read", test_darwin_multi_byte_read },
+};
+
+/* Run one of the byte-0 tests with the lane3 switch on. */
+static void test_byte0_with_lane3(gconstpointer data)
 {
-    QTestState *qts = qtest_init("-machine powermac7_3,x-u3-i2c-lane3=on");
-    uint8_t val;
-
-    i2c_write_sub(qts, HWCLOCK_ADDR8, HWCLOCK_REG, 0x22);
-    val = i2c_read_sub(qts, HWCLOCK_ADDR8, HWCLOCK_REG);
-    g_assert_cmphex(val, ==, 0x22);
-
-    qtest_quit(qts);
+    kw_machine = KW_MACHINE_LANE3;
+    byte0_tests[GPOINTER_TO_UINT(data)].fn();
+    kw_machine = KW_MACHINE;
 }
 
 int main(int argc, char **argv)
 {
+    unsigned i;
+
     g_test_init(&argc, &argv, NULL);
 
     if (!qtest_has_machine("powermac7_3")) {
@@ -769,30 +800,14 @@ int main(int argc, char **argv)
         return 0;
     }
 
-    qtest_add_func("/keywest-i2c/register-stride", test_register_stride);
-    qtest_add_func("/keywest-i2c/isr-write-one-to-clear",
-                   test_isr_write_one_to_clear);
-    qtest_add_func("/keywest-i2c/hwclock-roundtrip", test_hwclock_roundtrip);
-    qtest_add_func("/keywest-i2c/unanswered-address-naks",
-                   test_unanswered_address_naks);
-    qtest_add_func("/keywest-i2c/channel-one-has-no-hwclock",
-                   test_channel_one_has_no_hwclock);
-    qtest_add_func("/keywest-i2c/read-stops-without-stop-write",
-                   test_read_stops_without_stop_write);
-    qtest_add_func("/keywest-i2c/multi-byte-read", test_multi_byte_read);
-    qtest_add_func("/keywest-i2c/multi-byte-write", test_multi_byte_write);
-    qtest_add_func("/keywest-i2c/subaddr-read-has-no-side-effect",
-                   test_subaddr_read_has_no_side_effect);
-    qtest_add_func("/keywest-i2c/status-write-is-accepted",
-                   test_status_write_is_accepted);
-    qtest_add_func("/keywest-i2c/stop-ends-the-bus-transfer",
-                   test_stop_ends_the_bus_transfer);
-    qtest_add_func("/keywest-i2c/control-start-bit-self-clears",
-                   test_control_start_bit_self_clears);
-    qtest_add_func("/keywest-i2c/darwin-write-stop-rmw",
-                   test_darwin_write_stop_rmw);
-    qtest_add_func("/keywest-i2c/darwin-multi-byte-read",
-                   test_darwin_multi_byte_read);
+    for (i = 0; i < ARRAY_SIZE(byte0_tests); i++) {
+        g_autofree char *path = NULL;
+
+        qtest_add_func(byte0_tests[i].name, byte0_tests[i].fn);
+        path = g_strdup_printf("/keywest-i2c/lane3-on/%s",
+                               byte0_tests[i].name + strlen("/keywest-i2c/"));
+        qtest_add_data_func(path, GUINT_TO_POINTER(i), test_byte0_with_lane3);
+    }
     qtest_add_func("/keywest-i2c/mac99-has-no-i2c", test_mac99_has_no_i2c);
     qtest_add_func("/keywest-i2c/lane3-off-is-hole", test_lane3_off_is_hole);
     qtest_add_func("/keywest-i2c/lane3-same-register",
@@ -802,8 +817,6 @@ int main(int argc, char **argv)
                    test_lane3_unanswered_address_naks);
     qtest_add_func("/keywest-i2c/lane3-other-bytes-are-holes",
                    test_lane3_other_bytes_are_holes);
-    qtest_add_func("/keywest-i2c/lane3-on-keeps-byte0",
-                   test_lane3_on_keeps_byte0);
 
     return g_test_run();
 }
