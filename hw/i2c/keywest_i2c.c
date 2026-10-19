@@ -91,6 +91,13 @@ struct KeywestI2CState {
      */
     uint32_t reg_shift;
     uint32_t num_channels;
+    /*
+     * Also decode byte 3 of each register slot.  The real Boot ROM of the
+     * PowerMac7,2 describes the U3 controller at 0xf8001003 with a step of
+     * 0x10 and drives it there; OpenBIOS says 0xf8001000, which is what
+     * the operating systems use.
+     */
+    bool lane3;
 
     I2CBus *bus[KEYWEST_I2C_MAX_CHANNELS];
 
@@ -272,13 +279,24 @@ static void keywest_i2c_recv_byte(KeywestI2CState *s)
     keywest_i2c_raise(s, KW_IRQ_DATA);
 }
 
+/* Whether addr is a register: byte 0 of a slot, or byte 3 with lane3 */
+static bool keywest_i2c_decodes(KeywestI2CState *s, hwaddr addr)
+{
+    hwaddr lane = addr & ((1u << s->reg_shift) - 1);
+
+    if ((addr >> s->reg_shift) >= KW_REG_COUNT) {
+        return false;
+    }
+    return lane == 0 || (s->lane3 && lane == 3);
+}
+
 static uint64_t keywest_i2c_read(void *opaque, hwaddr addr, unsigned size)
 {
     KeywestI2CState *s = KEYWEST_I2C(opaque);
     unsigned reg = addr >> s->reg_shift;
     uint64_t val = 0;
 
-    if ((addr & ((1u << s->reg_shift) - 1)) || reg >= KW_REG_COUNT) {
+    if (!keywest_i2c_decodes(s, addr)) {
         /* Unmapped hole inside the 4KB window */
         return 0;
     }
@@ -333,7 +351,7 @@ static void keywest_i2c_write(void *opaque, hwaddr addr, uint64_t val64,
     uint8_t val = val64;
     I2CBus *bus;
 
-    if ((addr & ((1u << s->reg_shift) - 1)) || reg >= KW_REG_COUNT) {
+    if (!keywest_i2c_decodes(s, addr)) {
         return;
     }
 
@@ -482,6 +500,10 @@ static void keywest_i2c_realize(DeviceState *dev, Error **errp)
                    KEYWEST_I2C_MAX_CHANNELS);
         return;
     }
+    if (s->lane3 && s->reg_shift < 2) {
+        error_setg(errp, "keywest-i2c: x-lane3 needs a reg-shift of 2 or more");
+        return;
+    }
 
     for (i = 0; i < s->num_channels; i++) {
         g_autofree char *name = g_strdup_printf("i2c%u", i);
@@ -521,6 +543,8 @@ static const Property keywest_i2c_properties[] = {
     DEFINE_PROP_UINT32("reg-shift", KeywestI2CState, reg_shift, 4),
     /* U3 exposes two channels; KeyLargo/K2 has one */
     DEFINE_PROP_UINT32("num-channels", KeywestI2CState, num_channels, 2),
+    /* Off: only a real boot ROM uses byte 3 (see KeywestI2CState) */
+    DEFINE_PROP_BOOL("x-lane3", KeywestI2CState, lane3, false),
 };
 
 static void keywest_i2c_class_init(ObjectClass *oc, const void *data)

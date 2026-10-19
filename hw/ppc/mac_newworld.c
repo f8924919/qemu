@@ -122,6 +122,8 @@ struct Core99MachineState {
     /* PowerMac7,3: also show the MacIO at 0x80000000 (x-macio-80000000) */
     bool macio_low;
     MemoryRegion macio_low_alias;
+    /* PowerMac7,3: U3 i2c also decodes byte 3 (x-u3-i2c-lane3) */
+    bool u3_i2c_lane3;
 };
 
 static void fw_cfg_boot_set(void *opaque, const char *boot_device,
@@ -460,6 +462,7 @@ static void ppc_core99_init(MachineState *machine)
         DeviceState *i2c_dev = qdev_new("keywest-i2c");
         SysBusDevice *i2c_sbd = SYS_BUS_DEVICE(i2c_dev);
 
+        qdev_prop_set_bit(i2c_dev, "x-lane3", core99_machine->u3_i2c_lane3);
         sysbus_realize_and_unref(i2c_sbd, &error_fatal);
         sysbus_mmio_map(i2c_sbd, 0, 0xf8001000);
 
@@ -1101,6 +1104,17 @@ static void powermac7_3_set_macio_low(Object *obj, bool value, Error **errp)
     CORE99_MACHINE(obj)->macio_low = value;
 }
 
+static bool powermac7_3_get_u3_i2c_lane3(Object *obj, Error **errp)
+{
+    return CORE99_MACHINE(obj)->u3_i2c_lane3;
+}
+
+static void powermac7_3_set_u3_i2c_lane3(Object *obj, bool value,
+                                         Error **errp)
+{
+    CORE99_MACHINE(obj)->u3_i2c_lane3 = value;
+}
+
 static char *powermac7_3_get_dart(Object *obj, Error **errp)
 {
     return g_strdup(OnOffAuto_str(CORE99_MACHINE(obj)->dart));
@@ -1167,6 +1181,14 @@ static void powermac7_3_machine_class_init(ObjectClass *oc, const void *data)
                                           "default). It shadows part of "
                                           "the AGP PCI hole, so do not use "
                                           "it with OpenBIOS");
+    object_class_property_add_bool(oc, "x-u3-i2c-lane3",
+                                   powermac7_3_get_u3_i2c_lane3,
+                                   powermac7_3_set_u3_i2c_lane3);
+    object_class_property_set_description(oc, "x-u3-i2c-lane3",
+                                          "Let the U3 i2c controller also "
+                                          "decode byte 3 of each register "
+                                          "slot, where a real boot ROM "
+                                          "drives it (off by default)");
 }
 
 static void powermac7_3_instance_init(Object *obj)
@@ -1184,6 +1206,8 @@ static void powermac7_3_instance_init(Object *obj)
     cms->dart = ON_OFF_AUTO_AUTO;
     /* Off: only a real boot ROM wants the MacIO at 0x80000000 */
     cms->macio_low = false;
+    /* Off: only a real boot ROM drives the U3 i2c at byte 3 */
+    cms->u3_i2c_lane3 = false;
 }
 
 static const TypeInfo powermac7_3_machine_info = {

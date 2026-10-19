@@ -482,6 +482,22 @@ static void test_dbdma_runs_after_unimplemented_writes(void)
     dma_retires_after(0, OUTPUT_LAST, IRQ_I2S_TX, true);
 }
 
+/*
+ * x-u3-i2c-lane3 is for the U3 controller only: the K2 one keeps byte 0
+ * and leaves byte 3 a hole.
+ */
+static void test_i2c_lane3_not_on_k2(void)
+{
+    QTestState *qts = k2_init("-machine powermac7_3,x-u3-i2c-lane3=on");
+
+    qtest_writeb(qts, KW_MODE, 0x21);
+    g_assert_cmphex(qtest_readb(qts, KW_MODE + 3), ==, 0);
+    qtest_writeb(qts, KW_MODE + 3, 0x42);
+    g_assert_cmphex(qtest_readb(qts, KW_MODE), ==, 0x21);
+
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -496,6 +512,7 @@ int main(int argc, char **argv)
     qtest_add_func("/k2-sound/unanswered-address-naks",
                    test_unanswered_address_naks);
     qtest_add_func("/k2-sound/i2c-irq-line", test_i2c_irq_line);
+    qtest_add_func("/k2-sound/i2c-lane3-not-on-k2", test_i2c_lane3_not_on_k2);
     qtest_add_func("/k2-sound/fcr-reads-back", test_fcr_reads_back);
     qtest_add_func("/k2-sound/dma-out-retires", test_dma_out_retires);
     qtest_add_func("/k2-sound/dma-in-retires", test_dma_in_retires);

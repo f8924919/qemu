@@ -29,7 +29,16 @@
 /* U3-internal offset 0x1000; AAPL,address in the device tree is absolute */
 #define KW_I2C_BASE       0xf8001000ULL
 #define KW_I2C_STEP       0x10
-#define KW_REG(n)         (KW_I2C_BASE + ((n) * KW_I2C_STEP))
+#define KW_REG(n)         (kw_base + ((n) * KW_I2C_STEP))
+
+/*
+ * The real Boot ROM describes the controller at 0xf8001003 (AAPL,address)
+ * with a step of 0x10, i.e. it uses byte 3 of each 16-byte slot, while
+ * OpenBIOS says 0xf8001000.  The lane3 tests move the base to exercise the
+ * same helpers through byte 3; everything else uses byte 0.
+ */
+#define KW_LANE3          3
+static uint64_t kw_base = KW_I2C_BASE;
 
 #define KW_MODE           KW_REG(0)
 #define KW_CONTROL        KW_REG(1)
@@ -621,6 +630,136 @@ static void test_mac99_has_no_i2c(void)
     qtest_quit(qts);
 }
 
+/*
+ * x-u3-i2c-lane3 (off by default): byte 3 of each slot is a hole, exactly
+ * as before, so nothing changes for guests that are not the real ROM.
+ */
+static void test_lane3_off_is_hole(void)
+{
+    QTestState *qts = qtest_init("-machine powermac7_3");
+
+    qtest_writeb(qts, KW_MODE, 0x21);
+    g_assert_cmphex(qtest_readb(qts, KW_MODE + KW_LANE3), ==, 0);
+
+    qtest_writeb(qts, KW_MODE + KW_LANE3, 0x42);
+    g_assert_cmphex(qtest_readb(qts, KW_MODE), ==, 0x21);
+
+    qtest_quit(qts);
+}
+
+/*
+ * With the switch on, byte 3 is the same register as byte 0, in both
+ * directions, for every register that keeps what is written.  The others
+ * (control, status, isr, data) are covered by the transfers below.
+ */
+static void test_lane3_same_register(void)
+{
+    QTestState *qts = qtest_init("-machine powermac7_3,x-u3-i2c-lane3=on");
+    static const unsigned regs[] = { 0, 4, 5, 6 };  /* mode ier addr sub */
+    unsigned i;
+
+    for (i = 0; i < ARRAY_SIZE(regs); i++) {
+        uint64_t r = KW_REG(regs[i]);
+
+        qtest_writeb(qts, r, 0x10 + i);
+        g_assert_cmphex(qtest_readb(qts, r + KW_LANE3), ==, 0x10 + i);
+        qtest_writeb(qts, r + KW_LANE3, 0x20 + i);
+        g_assert_cmphex(qtest_readb(qts, r), ==, 0x20 + i);
+    }
+
+    /* AAK is the one control bit that is held */
+    qtest_writeb(qts, KW_CONTROL + KW_LANE3, KW_I2C_CTL_AAK);
+    g_assert_cmphex(qtest_readb(qts, KW_CONTROL), ==, KW_I2C_CTL_AAK);
+    qtest_writeb(qts, KW_CONTROL, 0);
+    g_assert_cmphex(qtest_readb(qts, KW_CONTROL + KW_LANE3), ==, 0);
+
+    qtest_quit(qts);
+}
+
+/*
+ * The transfer the ROM starts: through byte 3, a read of the clock chip
+ * raises ADDR with the ack bit set (i2c_read_sub asserts both) and returns
+ * what was written through byte 0.  Writing through byte 3 and reading
+ * back through byte 0 shows it is the same chip, not a copy.
+ */
+static void test_lane3_hwclock(void)
+{
+    QTestState *qts = qtest_init("-machine powermac7_3,x-u3-i2c-lane3=on");
+    uint8_t val;
+
+    i2c_write_sub(qts, HWCLOCK_ADDR8, HWCLOCK_REG, 0x22);
+    kw_base = KW_I2C_BASE + KW_LANE3;
+    val = i2c_read_sub(qts, HWCLOCK_ADDR8, HWCLOCK_REG);
+    g_assert_cmphex(val, ==, 0x22);
+    i2c_write_sub(qts, HWCLOCK_ADDR8, HWCLOCK_REG, 0x11);
+    kw_base = KW_I2C_BASE;
+    val = i2c_read_sub(qts, HWCLOCK_ADDR8, HWCLOCK_REG);
+    g_assert_cmphex(val, ==, 0x11);
+
+    qtest_quit(qts);
+}
+
+/* Same NAK as test_unanswered_address_naks, through byte 3. */
+static void test_lane3_unanswered_address_naks(void)
+{
+    QTestState *qts = qtest_init("-machine powermac7_3,x-u3-i2c-lane3=on");
+
+    kw_base = KW_I2C_BASE + KW_LANE3;
+    qtest_writeb(qts, KW_STATUS, 0);
+    qtest_writeb(qts, KW_MODE, KW_I2C_MODE_STANDARD);
+    qtest_writeb(qts, KW_ADDR, 0xa0);
+    qtest_writeb(qts, KW_CONTROL, KW_I2C_CTL_XADDR);
+
+    i2c_wait_isr(qts, KW_I2C_IRQ_ADDR);
+    g_assert_cmphex(qtest_readb(qts, KW_STATUS) & KW_I2C_STAT_LAST_AAK,
+                    ==, 0);
+    g_assert_cmphex(qtest_readb(qts, KW_ISR) & KW_I2C_IRQ_STOP,
+                    ==, KW_I2C_IRQ_STOP);
+    kw_base = KW_I2C_BASE;
+
+    qtest_quit(qts);
+}
+
+/*
+ * Only byte 3 is added.  The other bytes of a slot, and the slots past the
+ * last register, stay holes with the switch on.
+ */
+static void test_lane3_other_bytes_are_holes(void)
+{
+    QTestState *qts = qtest_init("-machine powermac7_3,x-u3-i2c-lane3=on");
+    static const unsigned lanes[] = { 1, 2, 4, 0xf };
+    unsigned i;
+
+    qtest_writeb(qts, KW_MODE, 0x21);
+    for (i = 0; i < ARRAY_SIZE(lanes); i++) {
+        g_assert_cmphex(qtest_readb(qts, KW_MODE + lanes[i]), ==, 0);
+        qtest_writeb(qts, KW_MODE + lanes[i], 0x42);
+        g_assert_cmphex(qtest_readb(qts, KW_MODE), ==, 0x21);
+    }
+
+    /* Past the last register (data is 7), byte 0 and byte 3 alike */
+    qtest_writeb(qts, KW_REG(8), 0x42);
+    g_assert_cmphex(qtest_readb(qts, KW_REG(8)), ==, 0);
+    qtest_writeb(qts, KW_REG(8) + KW_LANE3, 0x42);
+    g_assert_cmphex(qtest_readb(qts, KW_REG(8) + KW_LANE3), ==, 0);
+    g_assert_cmphex(qtest_readb(qts, KW_MODE), ==, 0x21);
+
+    qtest_quit(qts);
+}
+
+/* With the switch on, the existing byte-0 round trip still works. */
+static void test_lane3_on_keeps_byte0(void)
+{
+    QTestState *qts = qtest_init("-machine powermac7_3,x-u3-i2c-lane3=on");
+    uint8_t val;
+
+    i2c_write_sub(qts, HWCLOCK_ADDR8, HWCLOCK_REG, 0x22);
+    val = i2c_read_sub(qts, HWCLOCK_ADDR8, HWCLOCK_REG);
+    g_assert_cmphex(val, ==, 0x22);
+
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -655,6 +794,16 @@ int main(int argc, char **argv)
     qtest_add_func("/keywest-i2c/darwin-multi-byte-read",
                    test_darwin_multi_byte_read);
     qtest_add_func("/keywest-i2c/mac99-has-no-i2c", test_mac99_has_no_i2c);
+    qtest_add_func("/keywest-i2c/lane3-off-is-hole", test_lane3_off_is_hole);
+    qtest_add_func("/keywest-i2c/lane3-same-register",
+                   test_lane3_same_register);
+    qtest_add_func("/keywest-i2c/lane3-hwclock", test_lane3_hwclock);
+    qtest_add_func("/keywest-i2c/lane3-unanswered-address-naks",
+                   test_lane3_unanswered_address_naks);
+    qtest_add_func("/keywest-i2c/lane3-other-bytes-are-holes",
+                   test_lane3_other_bytes_are_holes);
+    qtest_add_func("/keywest-i2c/lane3-on-keeps-byte0",
+                   test_lane3_on_keeps_byte0);
 
     return g_test_run();
 }
