@@ -47,7 +47,16 @@ static uint64_t kw_base = KW_I2C_BASE;
  */
 #define KW_MACHINE        "-machine powermac7_3"
 #define KW_MACHINE_LANE3  "-machine powermac7_3,x-u3-i2c-lane3=on"
+#define KW_MACHINE_SPD    "-machine powermac7_3,x-u3-i2c-spd=on"
 static const char *kw_machine = KW_MACHINE;
+
+/*
+ * The channel i2c_read_sub() selects, already shifted into the top nibble
+ * of the mode register.  The clock chip is on channel 0; the SPD tests
+ * move it to channel 1.
+ */
+#define KW_CHAN1          0x10
+static uint8_t kw_chan;
 
 #define KW_MODE           KW_REG(0)
 #define KW_CONTROL        KW_REG(1)
@@ -118,7 +127,8 @@ static uint8_t i2c_read_sub(QTestState *qts, uint8_t addr8, uint8_t sub)
     uint8_t val;
 
     qtest_writeb(qts, KW_STATUS, 0);
-    qtest_writeb(qts, KW_MODE, KW_I2C_MODE_COMBINED | KW_I2C_MODE_100KHZ);
+    qtest_writeb(qts, KW_MODE,
+                 KW_I2C_MODE_COMBINED | KW_I2C_MODE_100KHZ | kw_chan);
     qtest_writeb(qts, KW_ADDR, addr8 | 1);
     qtest_writeb(qts, KW_SUBADDR, sub);
     qtest_writeb(qts, KW_CONTROL, KW_I2C_CTL_XADDR);
@@ -789,6 +799,179 @@ static void test_byte0_with_lane3(gconstpointer data)
     kw_machine = KW_MACHINE;
 }
 
+/*
+ * ... and with the SPD switch on.  The EEPROMs sit on channel 1, so the
+ * clock chip on channel 0 and every NAK the byte-0 tests expect (0xa0 is
+ * asked for on channel 0) must be unchanged.
+ */
+static void test_byte0_with_spd(gconstpointer data)
+{
+    kw_machine = KW_MACHINE_SPD;
+    byte0_tests[GPOINTER_TO_UINT(data)].fn();
+    kw_machine = KW_MACHINE;
+}
+
+/*
+ * The real Boot ROM reads the memory SPD on channel 1 at 7-bit 0x50,
+ * 0x52, 0x54 and 0x56 with combined transfers.  x-u3-i2c-spd=on puts one
+ * pair of DIMMs there, at 0x50 and 0x51, each holding half of the RAM.
+ */
+#define SPD_ADDR8(a7)     ((a7) << 1)
+#define SPD_LEN           64
+
+/* A combined read of `addr8` on channel 1 that must come back as a NAK. */
+static void spd_assert_nak(QTestState *qts, uint8_t addr8)
+{
+    qtest_writeb(qts, KW_STATUS, 0);
+    qtest_writeb(qts, KW_MODE, KW_I2C_MODE_COMBINED | KW_CHAN1);
+    qtest_writeb(qts, KW_ADDR, addr8 | 1);
+    qtest_writeb(qts, KW_SUBADDR, 0);
+    qtest_writeb(qts, KW_CONTROL, KW_I2C_CTL_XADDR);
+
+    i2c_wait_isr(qts, KW_I2C_IRQ_ADDR);
+    g_assert_cmphex(qtest_readb(qts, KW_STATUS) & KW_I2C_STAT_LAST_AAK,
+                    ==, 0);
+    g_assert_cmphex(qtest_readb(qts, KW_ISR) & KW_I2C_IRQ_STOP,
+                    ==, KW_I2C_IRQ_STOP);
+    qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_ADDR | KW_I2C_IRQ_STOP);
+}
+
+/* Read the first SPD_LEN bytes of the EEPROM at `addr8`, one at a time. */
+static void spd_read(QTestState *qts, uint8_t addr8, uint8_t *buf)
+{
+    unsigned i;
+
+    kw_chan = KW_CHAN1;
+    for (i = 0; i < SPD_LEN; i++) {
+        /* i2c_read_sub() asserts the address was acked */
+        buf[i] = i2c_read_sub(qts, addr8, i);
+    }
+    kw_chan = 0;
+}
+
+/*
+ * What a DDR SPD from spd_data_generate() looks like, whatever the size:
+ * 128 bytes used, 256 bytes in the part, memory type 7, and byte 63 the
+ * checksum of bytes 0-62.
+ */
+static void spd_assert_ddr(const uint8_t *buf)
+{
+    unsigned i;
+    uint8_t sum = 0;
+
+    g_assert_cmphex(buf[0], ==, 128);
+    g_assert_cmphex(buf[1], ==, 8);
+    g_assert_cmphex(buf[2], ==, 0x07);
+    for (i = 0; i < 63; i++) {
+        sum += buf[i];
+    }
+    g_assert_cmphex(buf[63], ==, sum);
+}
+
+/* Off by default: channel 1 stays empty, 0x50 included. */
+static void test_spd_off_is_empty(void)
+{
+    QTestState *qts = qtest_init(KW_MACHINE);
+
+    spd_assert_nak(qts, SPD_ADDR8(0x50));
+    spd_assert_nak(qts, SPD_ADDR8(0x51));
+    qtest_quit(qts);
+}
+
+/* Both halves of the pair answer, with the same DDR SPD. */
+static void test_spd_pair(void)
+{
+    QTestState *qts = qtest_init(KW_MACHINE_SPD);
+    uint8_t lo[SPD_LEN], hi[SPD_LEN];
+
+    spd_read(qts, SPD_ADDR8(0x50), lo);
+    spd_read(qts, SPD_ADDR8(0x51), hi);
+    spd_assert_ddr(lo);
+    g_assert_cmpmem(lo, sizeof(lo), hi, sizeof(hi));
+
+    qtest_quit(qts);
+}
+
+/*
+ * A multi-byte read moves through the EEPROM.  This is the handshake of
+ * test_multi_byte_read, on channel 1, from subaddress 0.
+ */
+static void test_spd_multi_byte_read(void)
+{
+    QTestState *qts = qtest_init(KW_MACHINE_SPD);
+    uint8_t one[SPD_LEN], seq[4];
+    unsigned i;
+
+    spd_read(qts, SPD_ADDR8(0x50), one);
+
+    qtest_writeb(qts, KW_STATUS, 0);
+    qtest_writeb(qts, KW_MODE, KW_I2C_MODE_COMBINED | KW_CHAN1);
+    qtest_writeb(qts, KW_ADDR, SPD_ADDR8(0x50) | 1);
+    qtest_writeb(qts, KW_SUBADDR, 0);
+    qtest_writeb(qts, KW_CONTROL, KW_I2C_CTL_XADDR);
+    i2c_wait_isr(qts, KW_I2C_IRQ_ADDR);
+    g_assert_cmphex(qtest_readb(qts, KW_STATUS) & KW_I2C_STAT_LAST_AAK,
+                    ==, KW_I2C_STAT_LAST_AAK);
+
+    qtest_writeb(qts, KW_CONTROL, KW_I2C_CTL_AAK);
+    qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_ADDR);
+    for (i = 0; i < ARRAY_SIZE(seq); i++) {
+        i2c_wait_isr(qts, KW_I2C_IRQ_DATA);
+        seq[i] = qtest_readb(qts, KW_DATA);
+        qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_DATA);
+        if (i == ARRAY_SIZE(seq) - 2) {
+            /* One byte left */
+            qtest_writeb(qts, KW_CONTROL, 0);
+        }
+        qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_DATA);
+    }
+    i2c_wait_isr(qts, KW_I2C_IRQ_STOP);
+
+    g_assert_cmpmem(seq, sizeof(seq), one, sizeof(seq));
+    qtest_quit(qts);
+}
+
+/* Through byte 3, the way the real Boot ROM drives it, the bytes match. */
+static void test_spd_lane3(void)
+{
+    QTestState *qts =
+        qtest_init("-machine powermac7_3,x-u3-i2c-lane3=on,x-u3-i2c-spd=on");
+    uint8_t b0[SPD_LEN], b3[SPD_LEN];
+
+    spd_read(qts, SPD_ADDR8(0x50), b0);
+    kw_base = KW_I2C_BASE + KW_LANE3;
+    spd_read(qts, SPD_ADDR8(0x50), b3);
+    spd_assert_nak(qts, SPD_ADDR8(0x52));
+    kw_base = KW_I2C_BASE;
+    spd_assert_ddr(b0);
+    g_assert_cmpmem(b0, sizeof(b0), b3, sizeof(b3));
+
+    qtest_quit(qts);
+}
+
+/* Only the pair is added: the rest of 0x50-0x57 stays unanswered. */
+static void test_spd_other_addresses_nak(void)
+{
+    QTestState *qts = qtest_init(KW_MACHINE_SPD);
+    uint8_t a7;
+
+    for (a7 = 0x52; a7 <= 0x57; a7++) {
+        spd_assert_nak(qts, SPD_ADDR8(a7));
+    }
+    qtest_quit(qts);
+}
+
+/* The smallest RAM the pair accepts: 32 MiB per DIMM. */
+static void test_spd_smallest_ram(void)
+{
+    QTestState *qts = qtest_init(KW_MACHINE_SPD " -m 64");
+    uint8_t buf[SPD_LEN];
+
+    spd_read(qts, SPD_ADDR8(0x50), buf);
+    spd_assert_ddr(buf);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     unsigned i;
@@ -807,6 +990,10 @@ int main(int argc, char **argv)
         path = g_strdup_printf("/keywest-i2c/lane3-on/%s",
                                byte0_tests[i].name + strlen("/keywest-i2c/"));
         qtest_add_data_func(path, GUINT_TO_POINTER(i), test_byte0_with_lane3);
+        g_free(path);
+        path = g_strdup_printf("/keywest-i2c/spd-on/%s",
+                               byte0_tests[i].name + strlen("/keywest-i2c/"));
+        qtest_add_data_func(path, GUINT_TO_POINTER(i), test_byte0_with_spd);
     }
     qtest_add_func("/keywest-i2c/mac99-has-no-i2c", test_mac99_has_no_i2c);
     qtest_add_func("/keywest-i2c/lane3-off-is-hole", test_lane3_off_is_hole);
@@ -817,6 +1004,14 @@ int main(int argc, char **argv)
                    test_lane3_unanswered_address_naks);
     qtest_add_func("/keywest-i2c/lane3-other-bytes-are-holes",
                    test_lane3_other_bytes_are_holes);
+    qtest_add_func("/keywest-i2c/spd-off-is-empty", test_spd_off_is_empty);
+    qtest_add_func("/keywest-i2c/spd-pair", test_spd_pair);
+    qtest_add_func("/keywest-i2c/spd-multi-byte-read",
+                   test_spd_multi_byte_read);
+    qtest_add_func("/keywest-i2c/spd-lane3", test_spd_lane3);
+    qtest_add_func("/keywest-i2c/spd-other-addresses-nak",
+                   test_spd_other_addresses_nak);
+    qtest_add_func("/keywest-i2c/spd-smallest-ram", test_spd_smallest_ram);
 
     return g_test_run();
 }

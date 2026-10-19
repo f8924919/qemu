@@ -59,6 +59,7 @@
 #include "hw/pci-host/uninorth.h"
 #include "hw/pci-host/u3_dart.h"
 #include "hw/i2c/i2c.h"
+#include "hw/i2c/smbus_eeprom.h"
 #include "hw/input/adb.h"
 #include "hw/ppc/mac_dbdma.h"
 #include "hw/pci/pci.h"
@@ -124,6 +125,8 @@ struct Core99MachineState {
     MemoryRegion macio_low_alias;
     /* PowerMac7,3: U3 i2c also decodes byte 3 (x-u3-i2c-lane3) */
     bool u3_i2c_lane3;
+    /* PowerMac7,3: memory SPD EEPROMs on U3 i2c channel 1 (x-u3-i2c-spd) */
+    bool u3_i2c_spd;
 };
 
 static void fw_cfg_boot_set(void *opaque, const char *boot_device,
@@ -474,6 +477,29 @@ static void ppc_core99_init(MachineState *machine)
          */
         i2c_slave_create_simple(I2C_BUS(qdev_get_child_bus(i2c_dev, "i2c0")),
                                 "mac-hwclock", 0xd2 >> 1);
+
+        /*
+         * A real boot ROM reads the memory SPD on channel 1 (7-bit 0x50,
+         * 0x52, 0x54 and 0x56) before it sets up the memory controller.
+         * Give it one pair of DDR DIMMs, as the board takes them in pairs:
+         * 0x50 and 0x51, each with half of the RAM.
+         */
+        if (core99_machine->u3_i2c_spd) {
+            I2CBus *spd_bus = I2C_BUS(qdev_get_child_bus(i2c_dev, "i2c1"));
+            ram_addr_t dimm_size = machine->ram_size / 2;
+
+            /* What spd_data_generate() takes for DDR, without asserting */
+            if (!is_power_of_2(dimm_size) || dimm_size < 32 * MiB) {
+                error_report("x-u3-i2c-spd needs each of the two DIMMs "
+                             "(half of the RAM) to be a power of 2 of at "
+                             "least 32 MiB");
+                exit(1);
+            }
+            smbus_eeprom_init_one(spd_bus, 0x50,
+                                  spd_data_generate(DDR, dimm_size));
+            smbus_eeprom_init_one(spd_bus, 0x51,
+                                  spd_data_generate(DDR, dimm_size));
+        }
     }
 
     if (PPC_INPUT(env) == PPC_FLAGS_INPUT_970) {
@@ -1115,6 +1141,16 @@ static void powermac7_3_set_u3_i2c_lane3(Object *obj, bool value,
     CORE99_MACHINE(obj)->u3_i2c_lane3 = value;
 }
 
+static bool powermac7_3_get_u3_i2c_spd(Object *obj, Error **errp)
+{
+    return CORE99_MACHINE(obj)->u3_i2c_spd;
+}
+
+static void powermac7_3_set_u3_i2c_spd(Object *obj, bool value, Error **errp)
+{
+    CORE99_MACHINE(obj)->u3_i2c_spd = value;
+}
+
 static char *powermac7_3_get_dart(Object *obj, Error **errp)
 {
     return g_strdup(OnOffAuto_str(CORE99_MACHINE(obj)->dart));
@@ -1189,6 +1225,14 @@ static void powermac7_3_machine_class_init(ObjectClass *oc, const void *data)
                                           "decode byte 3 of each register "
                                           "slot, where a real boot ROM "
                                           "drives it (off by default)");
+    object_class_property_add_bool(oc, "x-u3-i2c-spd",
+                                   powermac7_3_get_u3_i2c_spd,
+                                   powermac7_3_set_u3_i2c_spd);
+    object_class_property_set_description(oc, "x-u3-i2c-spd",
+                                          "Put the memory SPD EEPROMs of "
+                                          "one pair of DDR DIMMs on U3 i2c "
+                                          "channel 1, for a real boot ROM "
+                                          "(off by default)");
 }
 
 static void powermac7_3_instance_init(Object *obj)
@@ -1208,6 +1252,8 @@ static void powermac7_3_instance_init(Object *obj)
     cms->macio_low = false;
     /* Off: only a real boot ROM drives the U3 i2c at byte 3 */
     cms->u3_i2c_lane3 = false;
+    /* Off: only a real boot ROM reads the SPD; OpenBIOS fills in memory */
+    cms->u3_i2c_spd = false;
 }
 
 static const TypeInfo powermac7_3_machine_info = {

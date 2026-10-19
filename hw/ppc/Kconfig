@@ -150,6 +150,7 @@ config MAC_NEWWORLD
     select KEYWEST_I2C
     select MAC_HWCLOCK
     select MAC_K2_SOUND
+    select SMBUS_EEPROM
 
 config E500
     bool
