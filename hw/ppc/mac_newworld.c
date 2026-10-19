@@ -119,6 +119,9 @@ struct Core99MachineState {
     bool highmem;
     /* PowerMac7,3: whether the U3 gets a DART (x-dart) */
     OnOffAuto dart;
+    /* PowerMac7,3: also show the MacIO at 0x80000000 (x-macio-80000000) */
+    bool macio_low;
+    MemoryRegion macio_low_alias;
 };
 
 static void fw_cfg_boot_set(void *opaque, const char *boot_device,
@@ -643,6 +646,23 @@ static void ppc_core99_init(MachineState *machine)
     pci_realize_and_unref(PCI_DEVICE(macio), k2_bus ? k2_bus : pci_bus,
                           &error_fatal);
 
+    if (core99_machine->macio_low) {
+        MemoryRegion *bar = &MACIO(macio)->bar;
+
+        /*
+         * A real boot ROM drives the MacIO at 0x80000000 long before it
+         * assigns any BAR.  Show the BAR contents there too, above the
+         * AGP PCI hole, leaving the PCI side alone; only where the BAR
+         * has a device is the hole covered.
+         */
+        memory_region_init_alias(&core99_machine->macio_low_alias,
+                                 OBJECT(machine), "macio-80000000", bar, 0,
+                                 memory_region_size(bar));
+        memory_region_add_subregion_overlap(get_system_memory(), 0x80000000,
+                                            &core99_machine->macio_low_alias,
+                                            1);
+    }
+
     /*
      * Hook the KeyLargo CPU reset lines up to the processors they name.
      * MacIO only grows them when it has a PMU, which is what carries the
@@ -1071,6 +1091,16 @@ static void powermac7_3_set_highmem(Object *obj, bool value, Error **errp)
     CORE99_MACHINE(obj)->highmem = value;
 }
 
+static bool powermac7_3_get_macio_low(Object *obj, Error **errp)
+{
+    return CORE99_MACHINE(obj)->macio_low;
+}
+
+static void powermac7_3_set_macio_low(Object *obj, bool value, Error **errp)
+{
+    CORE99_MACHINE(obj)->macio_low = value;
+}
+
 static char *powermac7_3_get_dart(Object *obj, Error **errp)
 {
     return g_strdup(OnOffAuto_str(CORE99_MACHINE(obj)->dart));
@@ -1127,6 +1157,16 @@ static void powermac7_3_machine_class_init(ObjectClass *oc, const void *data)
                                           "2 GiB of RAM), on or off. An "
                                           "experimental knob for telling "
                                           "DART effects apart");
+    object_class_property_add_bool(oc, "x-macio-80000000",
+                                   powermac7_3_get_macio_low,
+                                   powermac7_3_set_macio_low);
+    object_class_property_set_description(oc, "x-macio-80000000",
+                                          "Also show the MacIO at "
+                                          "0x80000000, for running a real "
+                                          "boot ROM with -bios (off by "
+                                          "default). It shadows part of "
+                                          "the AGP PCI hole, so do not use "
+                                          "it with OpenBIOS");
 }
 
 static void powermac7_3_instance_init(Object *obj)
@@ -1142,6 +1182,8 @@ static void powermac7_3_instance_init(Object *obj)
     cms->highmem = false;
     /* auto: a DART only when the RAM goes beyond 2 GiB */
     cms->dart = ON_OFF_AUTO_AUTO;
+    /* Off: only a real boot ROM wants the MacIO at 0x80000000 */
+    cms->macio_low = false;
 }
 
 static const TypeInfo powermac7_3_machine_info = {

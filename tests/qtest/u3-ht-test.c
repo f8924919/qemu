@@ -617,6 +617,140 @@ static void test_mac99_unin_version(void)
     qtest_quit(qts);
 }
 
+/*
+ * x-macio-80000000=on mirrors the macio BAR at 0x80000000 for running a
+ * real boot ROM, which uses the macio there before any BAR is assigned.
+ * The offsets below are relative to the macio BAR (hw/misc/macio/k2_sound.h
+ * and k2_sound.c); the K2 feature control registers and the I2S cell are
+ * little-endian.
+ */
+#define MACIO_LOW           0x80000000ULL
+#define MACIO_LOW_SIZE      0x80000ULL
+#define MACIO_OFF_FCR1      0x3c
+#define MACIO_OFF_I2S_INT   0x10000
+#define FCR1_I2S0_CELL_EN   0x00000400
+#define FCR1_I2S0_RESET     0x00000800
+#define FCR1_I2S0_CLK_EN    0x00001000
+#define FCR1_I2S0_ENABLE    0x00002000
+#define I2S_CLOCKS_STOPPED  0x01000000
+
+static void le_writel(QTestState *qts, uint64_t addr, uint32_t val)
+{
+    qtest_writel(qts, addr, bswap32(val));
+}
+
+static uint32_t le_readl(QTestState *qts, uint64_t addr)
+{
+    return bswap32(qtest_readl(qts, addr));
+}
+
+static bool mtree_has(QTestState *qts, const char *name)
+{
+    g_autofree char *out = qtest_hmp(qts, "info mtree");
+
+    return strstr(out, name) != NULL;
+}
+
+static void test_macio_low_fcr(void)
+{
+    QTestState *qts = qtest_init("-machine powermac7_3,x-macio-80000000=on");
+
+    le_writel(qts, MACIO_LOW + MACIO_OFF_FCR1, 0x12345678);
+    g_assert_cmphex(le_readl(qts, MACIO_LOW + MACIO_OFF_FCR1), ==, 0x12345678);
+    g_assert_true(mtree_has(qts, "macio-80000000"));
+
+    qtest_quit(qts);
+}
+
+/*
+ * The FCR1 reset value (0) already latches clocks-stopped, so start from
+ * a running, cleared cell and watch the bit go from 0 to 1.
+ */
+static void macio_low_i2s_running(QTestState *qts)
+{
+    le_writel(qts, MACIO_LOW + MACIO_OFF_FCR1,
+              FCR1_I2S0_CELL_EN | FCR1_I2S0_CLK_EN | FCR1_I2S0_ENABLE);
+    le_writel(qts, MACIO_LOW + MACIO_OFF_I2S_INT, I2S_CLOCKS_STOPPED);
+    g_assert_cmphex(le_readl(qts, MACIO_LOW + MACIO_OFF_I2S_INT) &
+                    I2S_CLOCKS_STOPPED, ==, 0);
+}
+
+static void test_macio_low_clocks_stopped(void)
+{
+    QTestState *qts = qtest_init("-machine powermac7_3,x-macio-80000000=on");
+
+    macio_low_i2s_running(qts);
+    le_writel(qts, MACIO_LOW + MACIO_OFF_FCR1,
+              FCR1_I2S0_CELL_EN | FCR1_I2S0_ENABLE);
+    g_assert_cmphex(le_readl(qts, MACIO_LOW + MACIO_OFF_I2S_INT) &
+                    I2S_CLOCKS_STOPPED, ==, I2S_CLOCKS_STOPPED);
+
+    qtest_quit(qts);
+}
+
+/* The order a real boot ROM uses before it waits for clocks-stopped */
+static void test_macio_low_rom_sequence(void)
+{
+    QTestState *qts = qtest_init("-machine powermac7_3,x-macio-80000000=on");
+    uint32_t fcr1;
+
+    macio_low_i2s_running(qts);
+    fcr1 = le_readl(qts, MACIO_LOW + MACIO_OFF_FCR1);
+    fcr1 = (fcr1 | FCR1_I2S0_RESET) & ~(FCR1_I2S0_CLK_EN | FCR1_I2S0_ENABLE);
+    le_writel(qts, MACIO_LOW + MACIO_OFF_FCR1, fcr1);
+    fcr1 &= ~FCR1_I2S0_RESET;
+    le_writel(qts, MACIO_LOW + MACIO_OFF_FCR1, fcr1);
+    g_assert_cmphex(le_readl(qts, MACIO_LOW + MACIO_OFF_I2S_INT) &
+                    I2S_CLOCKS_STOPPED, ==, I2S_CLOCKS_STOPPED);
+
+    qtest_quit(qts);
+}
+
+/* Only the macio devices are covered; the AGP hole shows elsewhere */
+static void test_macio_low_bounds(void)
+{
+    QTestState *qts = qtest_init("-machine powermac7_3,x-macio-80000000=on");
+
+    qtest_writel(qts, MACIO_LOW + MACIO_LOW_SIZE, 0x12345678);
+    g_assert_cmphex(qtest_readl(qts, MACIO_LOW + MACIO_LOW_SIZE), ==, 0);
+    qtest_writel(qts, MACIO_LOW, 0x12345678);
+    g_assert_cmphex(qtest_readl(qts, MACIO_LOW), ==, 0);
+
+    qtest_quit(qts);
+}
+
+static void test_macio_low_off(void)
+{
+    QTestState *qts = qtest_init("-machine powermac7_3");
+
+    le_writel(qts, MACIO_LOW + MACIO_OFF_FCR1, 0x12345678);
+    g_assert_cmphex(le_readl(qts, MACIO_LOW + MACIO_OFF_FCR1), !=, 0x12345678);
+    g_assert_cmphex(le_readl(qts, MACIO_LOW + MACIO_OFF_FCR1), ==, 0);
+    g_assert_false(mtree_has(qts, "macio-80000000"));
+
+    qtest_quit(qts);
+}
+
+/* With the BAR assigned, both addresses reach the same registers */
+static void test_macio_low_same_as_bar(void)
+{
+    QTestState *qts = qtest_init("-machine powermac7_3,x-macio-80000000=on");
+    uint64_t bar = U3_HT_MEM_BASE;
+
+    k2_program_bridge(qts);
+    cfg_writel(qts, U3_HT_CFG_BASE + CFA1(1, MACIO_DEVFN, PCI_BASE_ADDRESS_0),
+               (uint32_t)bar);
+    cfg_writew(qts, U3_HT_CFG_BASE + CFA1(1, MACIO_DEVFN, PCI_COMMAND),
+               PCI_COMMAND_MEMORY);
+
+    le_writel(qts, MACIO_LOW + MACIO_OFF_FCR1, 0x12345678);
+    g_assert_cmphex(le_readl(qts, bar + MACIO_OFF_FCR1), ==, 0x12345678);
+    le_writel(qts, bar + MACIO_OFF_FCR1, 0x87654321);
+    g_assert_cmphex(le_readl(qts, MACIO_LOW + MACIO_OFF_FCR1), ==, 0x87654321);
+
+    qtest_quit(qts);
+}
+
 static void test_mac99_unmapped(void)
 {
     QTestState *qts = qtest_init("-machine mac99 -cpu 970fx");
@@ -668,6 +802,14 @@ int main(int argc, char **argv)
     qtest_add_func("/u3-ht/unin-version", test_unin_version);
     qtest_add_func("/u3-ht/mac99-unin-version", test_mac99_unin_version);
     qtest_add_func("/u3-ht/mac99-unmapped", test_mac99_unmapped);
+    qtest_add_func("/u3-ht/macio-low-fcr", test_macio_low_fcr);
+    qtest_add_func("/u3-ht/macio-low-clocks-stopped",
+                   test_macio_low_clocks_stopped);
+    qtest_add_func("/u3-ht/macio-low-rom-sequence",
+                   test_macio_low_rom_sequence);
+    qtest_add_func("/u3-ht/macio-low-bounds", test_macio_low_bounds);
+    qtest_add_func("/u3-ht/macio-low-off", test_macio_low_off);
+    qtest_add_func("/u3-ht/macio-low-same-as-bar", test_macio_low_same_as_bar);
 
     return g_test_run();
 }
