@@ -165,6 +165,8 @@ struct DBDMAState {
     MemoryRegion mem;
     DBDMA_channel channels[DBDMA_CHANNELS];
     QEMUBH *bh;
+    /* A control write also sets s0-s7 in the status (x-devstat) */
+    bool devstat;
 };
 
 #define TYPE_MAC_DBDMA "mac-dbdma"

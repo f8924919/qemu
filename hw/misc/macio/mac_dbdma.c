@@ -39,6 +39,7 @@
 
 #include "qemu/osdep.h"
 #include "hw/core/irq.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/ppc/mac_dbdma.h"
 #include "migration/vmstate.h"
 #include "qemu/main-loop.h"
@@ -641,6 +642,15 @@ static void dbdma_control_write(DBDMA_channel *ch)
                         (value & PAUSE) ? "sett" : "clear");
     }
 
+    /*
+     * s0-s7 are written through the mask like any other control bit,
+     * when the machine asks for it; a real boot ROM raises s0 that way to
+     * end a program that branches on it.
+     */
+    if (dbdma_from_ch(ch)->devstat) {
+        status = (status & ~(mask & DEVSTAT)) | (value & mask & DEVSTAT);
+    }
+
     /* FLUSH is its own thing */
     if ((mask & FLUSH) && (value & FLUSH))  {
         DBDMA_DPRINTFCH(ch, " Setting FLUSH !\n");
@@ -929,6 +939,10 @@ static void mac_dbdma_realize(DeviceState *dev, Error **errp)
     s->bh = qemu_bh_new_guarded(DBDMA_run_bh, s, &dev->mem_reentrancy_guard);
 }
 
+static const Property mac_dbdma_properties[] = {
+    DEFINE_PROP_BOOL("x-devstat", DBDMAState, devstat, false),
+};
+
 static void mac_dbdma_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
@@ -936,6 +950,7 @@ static void mac_dbdma_class_init(ObjectClass *oc, const void *data)
     dc->realize = mac_dbdma_realize;
     device_class_set_legacy_reset(dc, mac_dbdma_reset);
     dc->vmsd = &vmstate_dbdma;
+    device_class_set_props(dc, mac_dbdma_properties);
 }
 
 static const TypeInfo mac_dbdma_type_info = {

@@ -129,6 +129,8 @@ struct Core99MachineState {
     bool u3_i2c_spd;
     /* PowerMac7,3: U3 i2c drives DUMB mode transfers (x-u3-i2c-dumb) */
     bool u3_i2c_dumb;
+    /* PowerMac7,3: DBDMA control writes set s0-s7 (x-dbdma-devstat) */
+    bool dbdma_devstat;
 };
 
 static void fw_cfg_boot_set(void *opaque, const char *boot_device,
@@ -672,6 +674,15 @@ static void ppc_core99_init(MachineState *machine)
         }
     }
 
+    /*
+     * Only when on: left alone, the DBDMA keeps whatever -global set, so
+     * the switch can be tried on the other machines too.
+     */
+    if (core99_machine->dbdma_devstat) {
+        dev = DEVICE(object_resolve_path_component(macio, "dbdma"));
+        qdev_prop_set_bit(dev, "x-devstat", true);
+    }
+
     dev = DEVICE(object_resolve_path_component(macio, "escc"));
     qdev_prop_set_chr(dev, "chrA", serial_hd(0));
     qdev_prop_set_chr(dev, "chrB", serial_hd(1));
@@ -1165,6 +1176,17 @@ static void powermac7_3_set_u3_i2c_dumb(Object *obj, bool value, Error **errp)
     CORE99_MACHINE(obj)->u3_i2c_dumb = value;
 }
 
+static bool powermac7_3_get_dbdma_devstat(Object *obj, Error **errp)
+{
+    return CORE99_MACHINE(obj)->dbdma_devstat;
+}
+
+static void powermac7_3_set_dbdma_devstat(Object *obj, bool value,
+                                          Error **errp)
+{
+    CORE99_MACHINE(obj)->dbdma_devstat = value;
+}
+
 static char *powermac7_3_get_dart(Object *obj, Error **errp)
 {
     return g_strdup(OnOffAuto_str(CORE99_MACHINE(obj)->dart));
@@ -1255,6 +1277,14 @@ static void powermac7_3_machine_class_init(ObjectClass *oc, const void *data)
                                           "DUMB (manual) mode transfers, "
                                           "which a real boot ROM uses (off "
                                           "by default)");
+    object_class_property_add_bool(oc, "x-dbdma-devstat",
+                                   powermac7_3_get_dbdma_devstat,
+                                   powermac7_3_set_dbdma_devstat);
+    object_class_property_set_description(oc, "x-dbdma-devstat",
+                                          "Let DBDMA control writes set "
+                                          "the s0-s7 status bits, which a "
+                                          "real boot ROM uses (off by "
+                                          "default)");
 }
 
 static void powermac7_3_instance_init(Object *obj)
@@ -1278,6 +1308,8 @@ static void powermac7_3_instance_init(Object *obj)
     cms->u3_i2c_spd = false;
     /* Off: Linux refuses DUMB mode; only a real boot ROM was seen using it */
     cms->u3_i2c_dumb = false;
+    /* Off: no guest driver was seen writing s0-s7 through control */
+    cms->dbdma_devstat = false;
 }
 
 static const TypeInfo powermac7_3_machine_info = {
