@@ -19,6 +19,10 @@
  * dbdma tests check that the rest of the window neither reads back nor
  * reaches the channel state that follows the registers.
  *
+ * With x-dbdma-devstat, a control write also sets s0-s7 in the channel
+ * status through its mask and value; a real boot ROM raises s0 that way
+ * to end a program that loops on a branch.
+ *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
@@ -90,11 +94,20 @@
 #define DBDMA_WINDOW      0x80
 #define DBDMA_NCHANNELS   32
 #define DBDMA_RUN         0x8000
+#define DBDMA_PAUSE       0x4000
+#define DBDMA_WAKE        0x1000
 #define DBDMA_ACTIVE      0x0400
+#define DBDMA_BT          0x0100
+#define DBDMA_DEVSTAT     0x00ff
 #define OUTPUT_LAST       0x1000
 #define INPUT_LAST        0x3000
 #define INTR_ALWAYS       0x0030
 #define DBDMA_STOP        0x7000
+#define DBDMA_NOP         0x6000
+#define BR_IFCLR          0x0008
+
+/* How many status reads a running program gets to retire */
+#define DBDMA_POLLS       1000
 
 /* mpic inputs (docs/arch/macio-k2-sound.md, allocation table) */
 #define IRQ_I2S_TX        0x01
@@ -316,6 +329,45 @@ static uint16_t dma_xfer_status(QTestState *qts)
  * Without an audiodev the cell stays silent but must still retire them:
  * a guest whose output DMA never completes blocks its sound server.
  */
+/*
+ * A program that loops on itself until the branch condition holds, then
+ * stops: a NOP that branches back to itself while the condition is clear,
+ * and a STOP after it.
+ */
+static void dma_program_loop(QTestState *qts, int ch, uint32_t branch_sel)
+{
+    uint8_t desc[32] = { 0 };
+
+    stw_le_p(desc + 2, DBDMA_NOP | BR_IFCLR);
+    stl_le_p(desc + 8, DESC_ADDR);
+    stw_le_p(desc + 16 + 2, DBDMA_STOP);
+    qtest_memwrite(qts, DESC_ADDR, desc, sizeof(desc));
+
+    le_writel(qts, DBDMA_CH(ch) + DBDMA_CONTROL, 0xffff0000);
+    le_writel(qts, DBDMA_CH(ch) + DBDMA_BRANCH_SEL, branch_sel);
+    le_writel(qts, DBDMA_CH(ch) + DBDMA_CMDPTR_LO, DESC_ADDR);
+    le_writel(qts, DBDMA_CH(ch) + DBDMA_CONTROL,
+              (DBDMA_RUN << 16) | DBDMA_RUN);
+}
+
+/*
+ * The channel runs from a bottom half, so a single read may come before
+ * the program has moved; read until ACTIVE drops or DBDMA_POLLS is spent.
+ */
+static uint32_t dbdma_poll_inactive(QTestState *qts, int ch)
+{
+    uint32_t status = 0;
+    int i;
+
+    for (i = 0; i < DBDMA_POLLS; i++) {
+        status = le_readl(qts, DBDMA_CH(ch) + DBDMA_STATUS);
+        if (!(status & DBDMA_ACTIVE)) {
+            break;
+        }
+    }
+    return status;
+}
+
 /* Fill the unimplemented part of a channel window, a distinct value a word */
 static void dbdma_fill_unimplemented(QTestState *qts, int ch)
 {
@@ -512,6 +564,141 @@ static void test_i2c_dumb_not_on_k2(void)
     qtest_quit(qts);
 }
 
+/*
+ * The real ROM's sequence on channel 0: clear, select s0 for the branch,
+ * run, then set s0 from the control register.  The loop ends and the
+ * STOP after it drops ACTIVE.
+ */
+static void test_devstat_ends_loop(void)
+{
+    QTestState *qts = k2_init("-machine powermac7_3,x-dbdma-devstat=on");
+    uint32_t status;
+    int i;
+
+    dma_program_loop(qts, 0, 0x00010001);
+    for (i = 0; i < 10; i++) {
+        status = le_readl(qts, DBDMA_CH(0) + DBDMA_STATUS);
+        g_assert_cmphex(status & (DBDMA_ACTIVE | DBDMA_DEVSTAT), ==,
+                        DBDMA_ACTIVE);
+    }
+
+    le_writel(qts, DBDMA_CH(0) + DBDMA_CONTROL, 0x00010001);
+    status = dbdma_poll_inactive(qts, 0);
+    g_assert_cmphex(status, ==, DBDMA_RUN | 0x01);
+    g_assert_cmphex(le_readl(qts, DBDMA_CH(0) + DBDMA_CMDPTR_LO), ==,
+                    DESC_ADDR + 16);
+    /* The NOP is written back with the status it ran under */
+    g_assert_cmphex(dma_xfer_status(qts) & DBDMA_DEVSTAT, ==, 0x01);
+
+    qtest_quit(qts);
+}
+
+/*
+ * Without the switch the same writes leave s0 clear and the loop keeps
+ * branching for as long as it is read.
+ */
+static void test_devstat_off_keeps_looping(void)
+{
+    QTestState *qts = k2_init("");
+    uint32_t status = 0;
+    int i;
+
+    dma_program_loop(qts, 0, 0x00010001);
+    /* Wait for the first branch, so that every read below sees the loop */
+    for (i = 0; i < DBDMA_POLLS; i++) {
+        status = le_readl(qts, DBDMA_CH(0) + DBDMA_STATUS);
+        if (status & DBDMA_BT) {
+            break;
+        }
+    }
+    g_assert_cmphex(status, ==, DBDMA_RUN | DBDMA_ACTIVE | DBDMA_BT);
+
+    le_writel(qts, DBDMA_CH(0) + DBDMA_CONTROL, 0x00010001);
+    for (i = 0; i < DBDMA_POLLS; i++) {
+        status = le_readl(qts, DBDMA_CH(0) + DBDMA_STATUS);
+        if (status != (DBDMA_RUN | DBDMA_ACTIVE | DBDMA_BT)) {
+            break;
+        }
+    }
+    g_assert_cmphex(status, ==, DBDMA_RUN | DBDMA_ACTIVE | DBDMA_BT);
+
+    qtest_quit(qts);
+}
+
+/* Without the switch a control write never reaches s0-s7 */
+static void test_devstat_off_ignored(void)
+{
+    QTestState *qts = k2_init("");
+
+    le_writel(qts, DBDMA_CH(0) + DBDMA_CONTROL, 0x00ff00a5);
+    g_assert_cmphex(le_readl(qts, DBDMA_CH(0) + DBDMA_STATUS), ==, 0);
+
+    qtest_quit(qts);
+}
+
+/* Only the bits in the mask change, whatever else the write does */
+static void devstat_mask(const char *extra)
+{
+    QTestState *qts = k2_init(extra);
+    uint32_t st = DBDMA_CH(0) + DBDMA_STATUS;
+
+    le_writel(qts, DBDMA_CH(0) + DBDMA_CONTROL, 0x00ff00a5);
+    g_assert_cmphex(le_readl(qts, st), ==, 0xa5);
+    le_writel(qts, DBDMA_CH(0) + DBDMA_CONTROL, 0x000000ff);
+    g_assert_cmphex(le_readl(qts, st), ==, 0xa5);
+    le_writel(qts, DBDMA_CH(0) + DBDMA_CONTROL,
+              (DBDMA_RUN | DBDMA_PAUSE | DBDMA_WAKE) << 16 | 0x00ff);
+    g_assert_cmphex(le_readl(qts, st), ==, 0xa5);
+    le_writel(qts, DBDMA_CH(0) + DBDMA_CONTROL, 0x00010000);
+    g_assert_cmphex(le_readl(qts, st), ==, 0xa4);
+    le_writel(qts, DBDMA_CH(0) + DBDMA_CONTROL, 0x00820082);
+    g_assert_cmphex(le_readl(qts, st), ==, 0xa6);
+
+    /* Stopping a running channel keeps the bits outside the mask */
+    dma_program(qts, 0, DBDMA_STOP);
+    dbdma_poll_inactive(qts, 0);
+    le_writel(qts, DBDMA_CH(0) + DBDMA_CONTROL, DBDMA_RUN << 16);
+    g_assert_cmphex(le_readl(qts, st), ==, 0xa6);
+
+    le_writel(qts, DBDMA_CH(0) + DBDMA_CONTROL, 0xffff0000);
+    g_assert_cmphex(le_readl(qts, st), ==, 0);
+
+    qtest_quit(qts);
+}
+
+static void test_devstat_mask(void)
+{
+    devstat_mask("-machine powermac7_3,x-dbdma-devstat=on");
+}
+
+/* The machine leaves the device alone when off, so -global works too */
+static void test_devstat_global(void)
+{
+    devstat_mask("-global mac-dbdma.x-devstat=on");
+}
+
+/*
+ * s4-s7 show in the status, but conditions still look at s0-s3 only: a
+ * branch on s4 sees an empty mask, so its condition always holds and the
+ * loop falls through to the STOP before s4 is set.  This pins down a known
+ * difference from the DBDMA documentation (s7..s0); widening the condition
+ * to eight bits turns it around.
+ */
+static void test_devstat_s4_not_a_condition(void)
+{
+    QTestState *qts = k2_init("-machine powermac7_3,x-dbdma-devstat=on");
+
+    le_writel(qts, DBDMA_CH(0) + DBDMA_CONTROL, 0x00100010);
+    g_assert_cmphex(le_readl(qts, DBDMA_CH(0) + DBDMA_STATUS), ==, 0x10);
+
+    dma_program_loop(qts, 0, 0x00100010);
+    g_assert_cmphex(dbdma_poll_inactive(qts, 0), ==, DBDMA_RUN);
+    g_assert_cmphex(le_readl(qts, DBDMA_CH(0) + DBDMA_CMDPTR_LO), ==,
+                    DESC_ADDR + 16);
+
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -541,6 +728,14 @@ int main(int argc, char **argv)
                    test_dbdma_implemented_regs_kept);
     qtest_add_func("/k2-sound/dbdma-runs-after-unimplemented-writes",
                    test_dbdma_runs_after_unimplemented_writes);
+    qtest_add_func("/k2-sound/devstat-ends-loop", test_devstat_ends_loop);
+    qtest_add_func("/k2-sound/devstat-off-keeps-looping",
+                   test_devstat_off_keeps_looping);
+    qtest_add_func("/k2-sound/devstat-off-ignored", test_devstat_off_ignored);
+    qtest_add_func("/k2-sound/devstat-mask", test_devstat_mask);
+    qtest_add_func("/k2-sound/devstat-global", test_devstat_global);
+    qtest_add_func("/k2-sound/devstat-s4-not-a-condition",
+                   test_devstat_s4_not_a_condition);
 
     return g_test_run();
 }
