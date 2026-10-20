@@ -15,6 +15,7 @@
 #include "qemu/osdep.h"
 #include "qemu/bswap.h"
 #include "libqtest.h"
+#include "qobject/qdict.h"
 #include "hw/pci/pci_regs.h"
 
 #define U3_HT_SELF_BASE   0xf8070000ULL
@@ -751,6 +752,129 @@ static void test_macio_low_same_as_bar(void)
     qtest_quit(qts);
 }
 
+/*
+ * x-u3-memctl: the U3 registers at 0xf8002000 that a real boot ROM
+ * writes and reads back (the memory bank setup, as far as one can tell),
+ * as plain storage.
+ */
+#define U3_MEMCTL           0xf8002000ULL
+#define U3_MEMCTL_SIZE      0x1000
+#define U3_MEMCTL_BANK0     (U3_MEMCTL + 0x1c0)
+#define U3_MEMCTL_MACHINE   "-machine powermac7_3,x-u3-memctl=on"
+
+static void test_memctl_ends(void)
+{
+    QTestState *qts = qtest_init(U3_MEMCTL_MACHINE);
+    uint64_t last = U3_MEMCTL + U3_MEMCTL_SIZE - 4;
+
+    g_assert_cmphex(qtest_readl(qts, U3_MEMCTL), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, last), ==, 0);
+    qtest_writel(qts, U3_MEMCTL, 0x12345678);
+    qtest_writel(qts, last, 0x9abcdef0);
+    g_assert_cmphex(qtest_readl(qts, U3_MEMCTL), ==, 0x12345678);
+    g_assert_cmphex(qtest_readl(qts, last), ==, 0x9abcdef0);
+
+    qtest_quit(qts);
+}
+
+/* The ROM writes a bank register as a word and reads its top byte back */
+static void test_memctl_widths(void)
+{
+    QTestState *qts = qtest_init(U3_MEMCTL_MACHINE);
+
+    qtest_writel(qts, U3_MEMCTL_BANK0, 0xc4a1b2c3);
+    g_assert_cmphex(qtest_readb(qts, U3_MEMCTL_BANK0), ==, 0xc4);
+    g_assert_cmphex(qtest_readb(qts, U3_MEMCTL_BANK0 + 1), ==, 0xa1);
+    g_assert_cmphex(qtest_readb(qts, U3_MEMCTL_BANK0 + 2), ==, 0xb2);
+    g_assert_cmphex(qtest_readb(qts, U3_MEMCTL_BANK0 + 3), ==, 0xc3);
+
+    /* A byte write leaves its neighbours alone */
+    qtest_writeb(qts, U3_MEMCTL_BANK0 + 1, 0x5a);
+    g_assert_cmphex(qtest_readl(qts, U3_MEMCTL_BANK0), ==, 0xc45ab2c3);
+
+    qtest_writew(qts, U3_MEMCTL_BANK0 + 0x10, 0xbeef);
+    g_assert_cmphex(qtest_readw(qts, U3_MEMCTL_BANK0 + 0x10), ==, 0xbeef);
+    g_assert_cmphex(qtest_readl(qts, U3_MEMCTL_BANK0 + 0x10), ==, 0xbeef0000);
+
+    qtest_quit(qts);
+}
+
+static void test_memctl_mtree(void)
+{
+    QTestState *qts = qtest_init(U3_MEMCTL_MACHINE);
+
+    g_assert_true(mtree_has(qts, "u3-memctl"));
+
+    qtest_quit(qts);
+}
+
+static void test_memctl_reset(void)
+{
+    QTestState *qts = qtest_init(U3_MEMCTL_MACHINE);
+
+    qtest_writel(qts, U3_MEMCTL_BANK0, 0xc4a1b2c3);
+    qtest_qmp_assert_success(qts, "{ 'execute': 'system_reset' }");
+    qtest_qmp_eventwait(qts, "RESET");
+    g_assert_cmphex(qtest_readl(qts, U3_MEMCTL_BANK0), ==, 0);
+
+    qtest_quit(qts);
+}
+
+static void test_memctl_off(void)
+{
+    QTestState *qts = qtest_init("-machine powermac7_3");
+
+    qtest_writel(qts, U3_MEMCTL_BANK0, 0xc4a1b2c3);
+    g_assert_cmphex(qtest_readl(qts, U3_MEMCTL_BANK0), ==, 0);
+    g_assert_false(mtree_has(qts, "u3-memctl"));
+
+    qtest_quit(qts);
+}
+
+/* On or off, the neighbours read the same: the i2c below, nothing above */
+static void test_memctl_bounds(void)
+{
+    QTestState *off = qtest_init("-machine powermac7_3");
+    QTestState *on = qtest_init(U3_MEMCTL_MACHINE);
+    static const uint64_t addrs[] = { U3_MEMCTL - 4,
+                                      U3_MEMCTL + U3_MEMCTL_SIZE };
+    int i;
+
+    for (i = 0; i < ARRAY_SIZE(addrs); i++) {
+        qtest_writel(off, addrs[i], 0x12345678);
+        qtest_writel(on, addrs[i], 0x12345678);
+        g_assert_cmphex(qtest_readl(on, addrs[i]), ==,
+                        qtest_readl(off, addrs[i]));
+    }
+    g_assert_cmphex(qtest_readl(on, U3_MEMCTL + U3_MEMCTL_SIZE), ==, 0);
+    g_assert_cmphex(qtest_readl(on, UNIN_BASE), ==, UNIN_VERSION_U3);
+
+    qtest_quit(on);
+    qtest_quit(off);
+}
+
+static bool machine_has_prop(QTestState *qts, const char *prop)
+{
+    QDict *resp = qtest_qmp(qts, "{ 'execute': 'qom-get', 'arguments': "
+                            "{ 'path': '/machine', 'property': %s } }", prop);
+    bool found = qdict_haskey(resp, "return");
+
+    qobject_unref(resp);
+    return found;
+}
+
+static void test_memctl_mac99(void)
+{
+    QTestState *qts = qtest_init("-machine powermac7_3");
+
+    g_assert_true(machine_has_prop(qts, "x-u3-memctl"));
+    qtest_quit(qts);
+
+    qts = qtest_init("-machine mac99 -cpu 970fx");
+    g_assert_false(machine_has_prop(qts, "x-u3-memctl"));
+    qtest_quit(qts);
+}
+
 static void test_mac99_unmapped(void)
 {
     QTestState *qts = qtest_init("-machine mac99 -cpu 970fx");
@@ -810,6 +934,13 @@ int main(int argc, char **argv)
     qtest_add_func("/u3-ht/macio-low-bounds", test_macio_low_bounds);
     qtest_add_func("/u3-ht/macio-low-off", test_macio_low_off);
     qtest_add_func("/u3-ht/macio-low-same-as-bar", test_macio_low_same_as_bar);
+    qtest_add_func("/u3-ht/memctl-ends", test_memctl_ends);
+    qtest_add_func("/u3-ht/memctl-widths", test_memctl_widths);
+    qtest_add_func("/u3-ht/memctl-mtree", test_memctl_mtree);
+    qtest_add_func("/u3-ht/memctl-reset", test_memctl_reset);
+    qtest_add_func("/u3-ht/memctl-off", test_memctl_off);
+    qtest_add_func("/u3-ht/memctl-bounds", test_memctl_bounds);
+    qtest_add_func("/u3-ht/memctl-mac99", test_memctl_mac99);
 
     return g_test_run();
 }
