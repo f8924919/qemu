@@ -203,6 +203,7 @@ qtests_ppc64 = \
   (config_all_devices.has_key('CONFIG_MAC_NEWWORLD') ? ['k2-sound-test'] : []) + \
   (config_all_devices.has_key('CONFIG_MAC_NEWWORLD') ? ['u3-dart-test'] : []) + \
   (config_all_devices.has_key('CONFIG_MAC_NEWWORLD') ? ['macio-nvram-test'] : []) + \
+  (config_all_devices.has_key('CONFIG_MAC_NEWWORLD') ? ['macio-nvram-flash-test'] : []) + \
   qtests_pci + ['migration-test', 'cpu-plug-test', 'drive_del-test']
 
 qtests_sh4 = (config_all_devices.has_key('CONFIG_ISA_TESTDEV') ? ['endianness-test'] : [])
@@ -411,6 +412,8 @@ qtests = {
   'cdrom-test': files('boot-sector.c'),
   'macio-nvram-test': files('migration/migration-qmp.c',
                             'migration/migration-util.c'),
+  'macio-nvram-flash-test': files('migration/migration-qmp.c',
+                                  'migration/migration-util.c'),
   'dbus-vmstate-test': files('migration/migration-qmp.c',
                              'migration/migration-util.c') + dbus_vmstate1 +
                        [gio],
