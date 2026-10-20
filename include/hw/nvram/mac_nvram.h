@@ -67,6 +67,13 @@ struct MacIONVRAMState {
     uint8_t status;
     bool reading_status;
 
+    /*
+     * Answer Read Identifier (0x90) as a Sharp part, which a real G5 boot
+     * ROM asks for before it names the chip (x-flash-id, off by default).
+     */
+    bool flash_id;
+    bool reading_id;
+
     /* Set while a migration is waiting to hand the contents to the image */
     VMChangeStateEntry *vmstate;
 };

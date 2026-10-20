@@ -134,6 +134,8 @@ struct Core99MachineState {
     bool u3_i2c_dumb;
     /* PowerMac7,3: DBDMA control writes set s0-s7 (x-dbdma-devstat) */
     bool dbdma_devstat;
+    /* PowerMac7,3: NVRAM flash answers Read Identifier (x-nvram-flash-id) */
+    bool nvram_flash_id;
     /* PowerMac7,3: U3 registers at 0xf8002000 as storage (x-u3-memctl) */
     bool u3_memctl;
     MemoryRegion u3_memctl_mr;
@@ -910,6 +912,10 @@ static void ppc_core99_init(MachineState *machine)
      */
     qdev_prop_set_uint32(dev, "block-size", CORE99_NVRAM_BANK_SIZE);
     qdev_prop_set_uint32(dev, "it_shift", 0);
+    /* Only when on, so that -global can turn it on on mac99 as well */
+    if (core99_machine->nvram_flash_id) {
+        qdev_prop_set_bit(dev, "x-flash-id", true);
+    }
     /* Same interface the OldWorld machine takes its NVRAM image on */
     dinfo = drive_get(IF_MTD, 0, 0);
     if (dinfo) {
@@ -1240,6 +1246,17 @@ static bool powermac7_3_get_dbdma_devstat(Object *obj, Error **errp)
     return CORE99_MACHINE(obj)->dbdma_devstat;
 }
 
+static bool powermac7_3_get_nvram_flash_id(Object *obj, Error **errp)
+{
+    return CORE99_MACHINE(obj)->nvram_flash_id;
+}
+
+static void powermac7_3_set_nvram_flash_id(Object *obj, bool value,
+                                           Error **errp)
+{
+    CORE99_MACHINE(obj)->nvram_flash_id = value;
+}
+
 static bool powermac7_3_get_u3_memctl(Object *obj, Error **errp)
 {
     return CORE99_MACHINE(obj)->u3_memctl;
@@ -1354,6 +1371,14 @@ static void powermac7_3_machine_class_init(ObjectClass *oc, const void *data)
                                           "the s0-s7 status bits, which a "
                                           "real boot ROM uses (off by "
                                           "default)");
+    object_class_property_add_bool(oc, "x-nvram-flash-id",
+                                   powermac7_3_get_nvram_flash_id,
+                                   powermac7_3_set_nvram_flash_id);
+    object_class_property_set_description(oc, "x-nvram-flash-id",
+                                          "Let the NVRAM flash answer the "
+                                          "Read Identifier command as a "
+                                          "Sharp part, which a real boot "
+                                          "ROM asks for (off by default)");
     object_class_property_add_bool(oc, "x-u3-memctl",
                                    powermac7_3_get_u3_memctl,
                                    powermac7_3_set_u3_memctl);
@@ -1387,6 +1412,7 @@ static void powermac7_3_instance_init(Object *obj)
     cms->u3_i2c_dumb = false;
     /* Off: no guest driver was seen writing s0-s7 through control */
     cms->dbdma_devstat = false;
+    cms->nvram_flash_id = false;
     /* Off: no guest OS was seen touching 0xf8002000; Linux does not */
     cms->u3_memctl = false;
 }

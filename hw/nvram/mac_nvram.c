@@ -57,6 +57,11 @@
 #define SM_FLASH_CMD_CLEAR_STATUS   0x50
 #define SM_FLASH_CMD_READ_STATUS    0x70
 #define SM_FLASH_CMD_RESET          0xff
+#define SM_FLASH_CMD_READ_ID        0x90
+
+/* What x-flash-id answers: a Sharp part, one of the IDs the G5 ROM knows */
+#define SM_FLASH_ID_MANUFACTURER    0xb0
+#define SM_FLASH_ID_DEVICE          0x4b
 
 #define SM_FLASH_STATUS_DONE        0x80
 #define SM_FLASH_STATUS_ERASE_ERR   0x20
@@ -106,6 +111,13 @@ static void macio_nvram_command(MacIONVRAMState *s, hwaddr addr, uint8_t value)
 
     default:
         break;
+    }
+
+    /* Any command but another Read Identifier ends the ID read-out */
+    s->reading_id = s->flash_id && value == SM_FLASH_CMD_READ_ID;
+    if (s->reading_id) {
+        s->reading_status = false;
+        return;
     }
 
     switch (value) {
@@ -165,6 +177,12 @@ static uint64_t macio_nvram_readb(void *opaque, hwaddr addr,
     if (s->block_size && s->reading_status) {
         trace_macio_nvram_read(addr, s->status);
         return s->status;
+    }
+    if (s->block_size && s->reading_id) {
+        value = addr == 0 ? SM_FLASH_ID_MANUFACTURER :
+                addr == 1 ? SM_FLASH_ID_DEVICE : 0;
+        trace_macio_nvram_read(addr, value);
+        return value;
     }
     value = s->data[addr];
     trace_macio_nvram_read(addr, value);
@@ -241,6 +259,29 @@ static const VMStateDescription vmstate_macio_nvram_flash = {
     }
 };
 
+static bool macio_nvram_flash_id_needed(void *opaque)
+{
+    MacIONVRAMState *s = opaque;
+
+    return s->block_size != 0 && s->flash_id;
+}
+
+/*
+ * Its own subsection, so that the stream is unchanged with the switch off.
+ * The name must not start with "macio_nvram/flash": the loader would take
+ * it for a subsection of that one.
+ */
+static const VMStateDescription vmstate_macio_nvram_flash_id = {
+    .name = "macio_nvram/read-id",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = macio_nvram_flash_id_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(reading_id, MacIONVRAMState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static const VMStateDescription vmstate_macio_nvram = {
     .name = "macio_nvram",
     .version_id = 1,
@@ -252,6 +293,7 @@ static const VMStateDescription vmstate_macio_nvram = {
     },
     .subsections = (const VMStateDescription * const []) {
         &vmstate_macio_nvram_flash,
+        &vmstate_macio_nvram_flash_id,
         NULL
     }
 };
@@ -265,6 +307,7 @@ static void macio_nvram_reset(DeviceState *dev)
     /* A part that has nothing to do reports itself ready */
     s->status = SM_FLASH_STATUS_DONE;
     s->reading_status = false;
+    s->reading_id = false;
 }
 
 static void macio_nvram_realizefn(DeviceState *dev, Error **errp)
@@ -321,6 +364,7 @@ static const Property macio_nvram_properties[] = {
     DEFINE_PROP_UINT32("size", MacIONVRAMState, size, 0),
     DEFINE_PROP_UINT32("it_shift", MacIONVRAMState, it_shift, 0),
     DEFINE_PROP_UINT32("block-size", MacIONVRAMState, block_size, 0),
+    DEFINE_PROP_BOOL("x-flash-id", MacIONVRAMState, flash_id, false),
     DEFINE_PROP_DRIVE("drive", MacIONVRAMState, blk),
 };
 
