@@ -77,6 +77,8 @@ enum {
 #define KW_IRQ_MASK         0x0f
 
 #define KEYWEST_I2C_MAX_CHANNELS 2
+/* xfer_chan before post_load has filled it in */
+#define KW_CHAN_UNSET       0xff
 
 struct KeywestI2CState {
     SysBusDevice parent_obj;
@@ -98,6 +100,12 @@ struct KeywestI2CState {
      * the operating systems use.
      */
     bool lane3;
+    /*
+     * Also drive DUMB (manual) mode transfers: START raises the START
+     * interrupt and the next data byte is the address.  The real Boot
+     * ROM of the PowerMac7,2 uses it; Linux refuses DUMB mode outright.
+     */
+    bool dumb;
 
     I2CBus *bus[KEYWEST_I2C_MAX_CHANNELS];
 
@@ -134,18 +142,44 @@ struct KeywestI2CState {
      * that arrives while that byte is still unread.
      */
     bool last_byte;
+    /*
+     * The channel the transfer was opened on.  The guest may rewrite the
+     * mode register before the transfer ends, and ending it on another
+     * bus would leave the device selected on this one.
+     */
+    uint8_t xfer_chan;
+
+    /* DUMB mode: START has been written, the next data byte is an address */
+    bool addr_pending;
+    /* The active transfer was opened that way, so it has no ADDR phase */
+    bool xfer_manual;
 };
 
 static void keywest_i2c_stop(KeywestI2CState *s);
 
-static I2CBus *keywest_i2c_active_bus(KeywestI2CState *s)
+static uint8_t keywest_i2c_mode_chan(KeywestI2CState *s)
 {
-    uint32_t chan = (s->mode & KW_MODE_CHAN_MASK) >> KW_MODE_CHAN_SHIFT;
+    return (s->mode & KW_MODE_CHAN_MASK) >> KW_MODE_CHAN_SHIFT;
+}
 
+static I2CBus *keywest_i2c_chan_bus(KeywestI2CState *s, uint8_t chan)
+{
     if (chan >= s->num_channels) {
         return NULL;
     }
     return s->bus[chan];
+}
+
+/* The bus a new transfer goes out on: the one the mode register selects */
+static I2CBus *keywest_i2c_active_bus(KeywestI2CState *s)
+{
+    return keywest_i2c_chan_bus(s, keywest_i2c_mode_chan(s));
+}
+
+/* The bus the transfer in progress was opened on */
+static I2CBus *keywest_i2c_xfer_bus(KeywestI2CState *s)
+{
+    return keywest_i2c_chan_bus(s, s->xfer_chan);
 }
 
 static void keywest_i2c_update_irq(KeywestI2CState *s)
@@ -176,6 +210,9 @@ static void keywest_i2c_start(KeywestI2CState *s)
     bool nak = true;
 
     s->xfer_recv = s->addr & 1;
+    s->xfer_chan = keywest_i2c_mode_chan(s);
+    s->xfer_manual = false;
+    s->addr_pending = false;
 
     trace_keywest_i2c_xfer_start(s->addr, s->mode, s->subaddr);
 
@@ -251,24 +288,86 @@ done:
     keywest_i2c_raise(s, KW_IRQ_ADDR);
 }
 
-static void keywest_i2c_stop(KeywestI2CState *s)
+/* End the transfer in progress, if any, without raising anything */
+static void keywest_i2c_abort(KeywestI2CState *s)
 {
-    I2CBus *bus = keywest_i2c_active_bus(s);
+    I2CBus *bus = keywest_i2c_xfer_bus(s);
 
     if (s->xfer_active && bus != NULL) {
         i2c_end_transfer(bus);
     }
     s->xfer_active = false;
+    s->xfer_manual = false;
     s->data_ready = false;
     s->write_done = false;
     s->status &= ~KW_STAT_BUSY;
+}
+
+static void keywest_i2c_stop(KeywestI2CState *s)
+{
+    keywest_i2c_abort(s);
+    s->addr_pending = false;
     keywest_i2c_raise(s, KW_IRQ_STOP);
+}
+
+/*
+ * START in DUMB mode: a bare start condition.  The controller does not
+ * address anything itself; the guest hands the address byte over through
+ * the data register (keywest_i2c_manual_open()).  A transfer still open
+ * is ended, as a repeated start would, without a STOP interrupt.
+ */
+static void keywest_i2c_dumb_start(KeywestI2CState *s)
+{
+    trace_keywest_i2c_dumb_start(s->mode, s->isr);
+    keywest_i2c_abort(s);
+    s->addr_pending = true;
+    keywest_i2c_raise(s, KW_IRQ_START);
+}
+
+/*
+ * The address byte of a DUMB mode transfer, R/W in bit 0.  It answers
+ * with DATA, and on a NAK with STOP as well, ending the transfer the way
+ * an address NAK does in the other modes.  From here on the transfer
+ * takes the same paths as one opened with XADDR, minus the ADDR phase.
+ */
+static void keywest_i2c_manual_open(KeywestI2CState *s, uint8_t val)
+{
+    I2CBus *bus;
+
+    s->addr_pending = false;
+    s->addr = val;
+    s->xfer_recv = val & 1;
+    s->xfer_chan = keywest_i2c_mode_chan(s);
+    s->data_ready = false;
+    /* Whatever ended the previous transfer must not end this one */
+    s->last_byte = false;
+    bus = keywest_i2c_xfer_bus(s);
+
+    trace_keywest_i2c_xfer_start(val, s->mode, 0);
+
+    if (bus != NULL && i2c_start_transfer(bus, val >> 1, s->xfer_recv) == 0) {
+        s->xfer_active = true;
+        s->xfer_manual = true;
+        s->status |= KW_STAT_LAST_AAK | KW_STAT_BUSY;
+        /* The address has gone out, so the first DATA ack is answered */
+        s->write_done = !s->xfer_recv;
+        keywest_i2c_raise(s, KW_IRQ_DATA);
+        return;
+    }
+
+    if (bus != NULL) {
+        i2c_end_transfer(bus);
+    }
+    s->status &= ~KW_STAT_LAST_AAK;
+    trace_keywest_i2c_nak(val, s->mode);
+    keywest_i2c_raise(s, KW_IRQ_DATA);
+    keywest_i2c_stop(s);
 }
 
 /* Pull the next byte in during a read transfer. */
 static void keywest_i2c_recv_byte(KeywestI2CState *s)
 {
-    I2CBus *bus = keywest_i2c_active_bus(s);
+    I2CBus *bus = keywest_i2c_xfer_bus(s);
 
     if (!s->xfer_active || bus == NULL) {
         return;
@@ -369,9 +468,13 @@ static void keywest_i2c_write(void *opaque, hwaddr addr, uint64_t val64,
          * register and ORing the bit in, so a stored XADDR would restart
          * the transfer every time it does that.
          */
-        s->control = val & ~(KW_CTL_XADDR | KW_CTL_STOP);
+        s->control = val & ~(KW_CTL_XADDR | KW_CTL_STOP |
+                             (s->dumb ? KW_CTL_START : 0));
         if (val & KW_CTL_XADDR) {
             keywest_i2c_start(s);
+        } else if (s->dumb && (val & KW_CTL_START) &&
+                   (s->mode & KW_MODE_MODE_MASK) == KW_MODE_DUMB) {
+            keywest_i2c_dumb_start(s);
         } else if (val & KW_CTL_STOP) {
             keywest_i2c_stop(s);
         }
@@ -392,9 +495,11 @@ static void keywest_i2c_write(void *opaque, hwaddr addr, uint64_t val64,
         /*
          * Acking the address phase of a read is what produces the first
          * data byte -- the guest arms AAK and then acks, and expects a
-         * DATA interrupt to follow.
+         * DATA interrupt to follow.  A DUMB mode transfer has no address
+         * phase, so an ADDR ack there (all bits acked at once) is not one.
          */
-        if ((val & KW_IRQ_ADDR) && s->xfer_active && s->xfer_recv) {
+        if ((val & KW_IRQ_ADDR) && s->xfer_active && s->xfer_recv &&
+            !s->xfer_manual) {
             keywest_i2c_recv_byte(s);
         }
         /*
@@ -440,8 +545,10 @@ static void keywest_i2c_write(void *opaque, hwaddr addr, uint64_t val64,
 
     case KW_REG_DATA:
         s->data = val;
-        if (s->xfer_active && !s->xfer_recv) {
-            bus = keywest_i2c_active_bus(s);
+        if (s->addr_pending) {
+            keywest_i2c_manual_open(s, val);
+        } else if (s->xfer_active && !s->xfer_recv) {
+            bus = keywest_i2c_xfer_bus(s);
             s->write_done = false;
             if (bus != NULL && i2c_send(bus, val) != 0) {
                 s->status &= ~KW_STAT_LAST_AAK;
@@ -486,6 +593,9 @@ static void keywest_i2c_reset_hold(Object *obj, ResetType type)
     s->data_ready = false;
     s->write_done = false;
     s->last_byte = false;
+    s->xfer_chan = 0;
+    s->addr_pending = false;
+    s->xfer_manual = false;
     keywest_i2c_update_irq(s);
 }
 
@@ -516,10 +626,70 @@ static void keywest_i2c_realize(DeviceState *dev, Error **errp)
     sysbus_init_irq(sbd, &s->irq);
 }
 
+static bool keywest_i2c_dumb_needed(void *opaque)
+{
+    KeywestI2CState *s = opaque;
+
+    return s->addr_pending || s->xfer_manual;
+}
+
+static const VMStateDescription vmstate_keywest_i2c_dumb = {
+    .name = "keywest-i2c/dumb",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = keywest_i2c_dumb_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(addr_pending, KeywestI2CState),
+        VMSTATE_BOOL(xfer_manual, KeywestI2CState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+/* Only sent when it differs from what the mode register says */
+static bool keywest_i2c_xfer_chan_needed(void *opaque)
+{
+    KeywestI2CState *s = opaque;
+
+    return s->xfer_active && s->xfer_chan != keywest_i2c_mode_chan(s);
+}
+
+static const VMStateDescription vmstate_keywest_i2c_xfer_chan = {
+    .name = "keywest-i2c/xfer-chan",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = keywest_i2c_xfer_chan_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT8(xfer_chan, KeywestI2CState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static int keywest_i2c_pre_load(void *opaque)
+{
+    KeywestI2CState *s = opaque;
+
+    s->xfer_chan = KW_CHAN_UNSET;
+    s->addr_pending = false;
+    s->xfer_manual = false;
+    return 0;
+}
+
+static int keywest_i2c_post_load(void *opaque, int version_id)
+{
+    KeywestI2CState *s = opaque;
+
+    if (s->xfer_chan == KW_CHAN_UNSET) {
+        s->xfer_chan = keywest_i2c_mode_chan(s);
+    }
+    return 0;
+}
+
 static const VMStateDescription vmstate_keywest_i2c = {
     .name = "keywest-i2c",
     .version_id = 2,
     .minimum_version_id = 1,
+    .pre_load = keywest_i2c_pre_load,
+    .post_load = keywest_i2c_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT8(mode, KeywestI2CState),
         VMSTATE_UINT8(control, KeywestI2CState),
@@ -535,6 +705,11 @@ static const VMStateDescription vmstate_keywest_i2c = {
         VMSTATE_BOOL(write_done, KeywestI2CState),
         VMSTATE_BOOL_V(last_byte, KeywestI2CState, 2),
         VMSTATE_END_OF_LIST()
+    },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_keywest_i2c_dumb,
+        &vmstate_keywest_i2c_xfer_chan,
+        NULL
     }
 };
 
@@ -545,6 +720,8 @@ static const Property keywest_i2c_properties[] = {
     DEFINE_PROP_UINT32("num-channels", KeywestI2CState, num_channels, 2),
     /* Off: only a real boot ROM uses byte 3 (see KeywestI2CState) */
     DEFINE_PROP_BOOL("x-lane3", KeywestI2CState, lane3, false),
+    /* Off: only a real boot ROM uses DUMB mode (see KeywestI2CState) */
+    DEFINE_PROP_BOOL("x-dumb", KeywestI2CState, dumb, false),
 };
 
 static void keywest_i2c_class_init(ObjectClass *oc, const void *data)

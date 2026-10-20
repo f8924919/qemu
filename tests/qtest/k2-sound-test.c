@@ -498,6 +498,20 @@ static void test_i2c_lane3_not_on_k2(void)
     qtest_quit(qts);
 }
 
+/* So is x-u3-i2c-dumb: START in DUMB mode does nothing on K2 */
+static void test_i2c_dumb_not_on_k2(void)
+{
+    QTestState *qts = k2_init("-machine powermac7_3,x-u3-i2c-dumb=on");
+
+    qtest_writeb(qts, KW_MODE, 0x00);
+    qtest_writeb(qts, KW_ISR, 0x0f);
+    qtest_writeb(qts, KW_CONTROL, 0x08);
+    g_assert_cmphex(qtest_readb(qts, KW_ISR), ==, 0);
+    g_assert_cmphex(qtest_readb(qts, KW_CONTROL), ==, 0x08);
+
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -513,6 +527,7 @@ int main(int argc, char **argv)
                    test_unanswered_address_naks);
     qtest_add_func("/k2-sound/i2c-irq-line", test_i2c_irq_line);
     qtest_add_func("/k2-sound/i2c-lane3-not-on-k2", test_i2c_lane3_not_on_k2);
+    qtest_add_func("/k2-sound/i2c-dumb-not-on-k2", test_i2c_dumb_not_on_k2);
     qtest_add_func("/k2-sound/fcr-reads-back", test_fcr_reads_back);
     qtest_add_func("/k2-sound/dma-out-retires", test_dma_out_retires);
     qtest_add_func("/k2-sound/dma-in-retires", test_dma_in_retires);

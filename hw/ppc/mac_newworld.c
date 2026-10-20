@@ -127,6 +127,8 @@ struct Core99MachineState {
     bool u3_i2c_lane3;
     /* PowerMac7,3: memory SPD EEPROMs on U3 i2c channel 1 (x-u3-i2c-spd) */
     bool u3_i2c_spd;
+    /* PowerMac7,3: U3 i2c drives DUMB mode transfers (x-u3-i2c-dumb) */
+    bool u3_i2c_dumb;
 };
 
 static void fw_cfg_boot_set(void *opaque, const char *boot_device,
@@ -466,23 +468,25 @@ static void ppc_core99_init(MachineState *machine)
         SysBusDevice *i2c_sbd = SYS_BUS_DEVICE(i2c_dev);
 
         qdev_prop_set_bit(i2c_dev, "x-lane3", core99_machine->u3_i2c_lane3);
+        qdev_prop_set_bit(i2c_dev, "x-dumb", core99_machine->u3_i2c_dumb);
         sysbus_realize_and_unref(i2c_sbd, &error_fatal);
         sysbus_mmio_map(i2c_sbd, 0, 0xf8001000);
 
         /*
          * i2c-hwclock@d2 in the device tree: an 8-bit address, so the bus
-         * sees 0x69.  It lives on channel 0; the second channel exists
-         * because the firmware describes two, not because anything is on
-         * it.
+         * sees 0x69.  It lives on channel 0.  The firmware describes a
+         * second channel too; nothing is on it unless x-u3-i2c-spd is on.
          */
         i2c_slave_create_simple(I2C_BUS(qdev_get_child_bus(i2c_dev, "i2c0")),
                                 "mac-hwclock", 0xd2 >> 1);
 
         /*
-         * A real boot ROM reads the memory SPD on channel 1 (7-bit 0x50,
-         * 0x52, 0x54 and 0x56) before it sets up the memory controller.
-         * Give it one pair of DDR DIMMs, as the board takes them in pairs:
-         * 0x50 and 0x51, each with half of the RAM.
+         * A real boot ROM addresses channel 1 at 7-bit 0x50, 0x52, 0x54
+         * and 0x56, where memory SPD EEPROMs usually sit, and with this
+         * pair in place reads bytes from 0x50 and 0x51; what it does with
+         * them has not been traced.  Give it one pair of DDR DIMMs, as the
+         * board takes them in pairs: 0x50 and 0x51, each with half of the
+         * RAM.
          */
         if (core99_machine->u3_i2c_spd) {
             I2CBus *spd_bus = I2C_BUS(qdev_get_child_bus(i2c_dev, "i2c1"));
@@ -1151,6 +1155,16 @@ static void powermac7_3_set_u3_i2c_spd(Object *obj, bool value, Error **errp)
     CORE99_MACHINE(obj)->u3_i2c_spd = value;
 }
 
+static bool powermac7_3_get_u3_i2c_dumb(Object *obj, Error **errp)
+{
+    return CORE99_MACHINE(obj)->u3_i2c_dumb;
+}
+
+static void powermac7_3_set_u3_i2c_dumb(Object *obj, bool value, Error **errp)
+{
+    CORE99_MACHINE(obj)->u3_i2c_dumb = value;
+}
+
 static char *powermac7_3_get_dart(Object *obj, Error **errp)
 {
     return g_strdup(OnOffAuto_str(CORE99_MACHINE(obj)->dart));
@@ -1233,6 +1247,14 @@ static void powermac7_3_machine_class_init(ObjectClass *oc, const void *data)
                                           "one pair of DDR DIMMs on U3 i2c "
                                           "channel 1, for a real boot ROM "
                                           "(off by default)");
+    object_class_property_add_bool(oc, "x-u3-i2c-dumb",
+                                   powermac7_3_get_u3_i2c_dumb,
+                                   powermac7_3_set_u3_i2c_dumb);
+    object_class_property_set_description(oc, "x-u3-i2c-dumb",
+                                          "Let the U3 i2c controller drive "
+                                          "DUMB (manual) mode transfers, "
+                                          "which a real boot ROM uses (off "
+                                          "by default)");
 }
 
 static void powermac7_3_instance_init(Object *obj)
@@ -1254,6 +1276,8 @@ static void powermac7_3_instance_init(Object *obj)
     cms->u3_i2c_lane3 = false;
     /* Off: only a real boot ROM reads the SPD; OpenBIOS fills in memory */
     cms->u3_i2c_spd = false;
+    /* Off: Linux refuses DUMB mode; only a real boot ROM was seen using it */
+    cms->u3_i2c_dumb = false;
 }
 
 static const TypeInfo powermac7_3_machine_info = {

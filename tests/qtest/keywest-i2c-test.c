@@ -43,11 +43,15 @@ static uint64_t kw_base = KW_I2C_BASE;
 /*
  * The machine the byte-0 tests run on.  main() runs every one of them a
  * second time with x-u3-i2c-lane3=on: decoding byte 3 as well must not
- * change anything a guest does through byte 0.
+ * change anything a guest does through byte 0.  The same goes for the
+ * SPD and the DUMB switches.
  */
 #define KW_MACHINE        "-machine powermac7_3"
 #define KW_MACHINE_LANE3  "-machine powermac7_3,x-u3-i2c-lane3=on"
 #define KW_MACHINE_SPD    "-machine powermac7_3,x-u3-i2c-spd=on"
+#define KW_MACHINE_DUMB   "-machine powermac7_3,x-u3-i2c-dumb=on"
+#define KW_MACHINE_DUMB_SPD \
+    "-machine powermac7_3,x-u3-i2c-dumb=on,x-u3-i2c-spd=on"
 static const char *kw_machine = KW_MACHINE;
 
 /*
@@ -812,6 +816,17 @@ static void test_byte0_with_spd(gconstpointer data)
 }
 
 /*
+ * ... and with the DUMB switch on.  None of the byte-0 tests uses DUMB
+ * mode, and START reading back as 0 is invisible to them.
+ */
+static void test_byte0_with_dumb(gconstpointer data)
+{
+    kw_machine = KW_MACHINE_DUMB;
+    byte0_tests[GPOINTER_TO_UINT(data)].fn();
+    kw_machine = KW_MACHINE;
+}
+
+/*
  * The real Boot ROM reads the memory SPD on channel 1 at 7-bit 0x50,
  * 0x52, 0x54 and 0x56 with combined transfers.  x-u3-i2c-spd=on puts one
  * pair of DIMMs there, at 0x50 and 0x51, each holding half of the RAM.
@@ -972,6 +987,385 @@ static void test_spd_smallest_ram(void)
     qtest_quit(qts);
 }
 
+/*
+ * The real Boot ROM also drives the controller in DUMB (manual) mode: it
+ * writes START to the control register with the mode's transfer type at
+ * 0, waits for the START interrupt, and then hands the address byte over
+ * through the data register.  x-u3-i2c-dumb=on makes the U3 controller
+ * do that; everything here except the "off" and channel tests runs with
+ * it on.
+ */
+#define KW_I2C_MODE_DUMB        0x00
+#define KW_I2C_CTL_START        0x08
+#define KW_I2C_IRQ_START        0x08
+
+/* DUMB mode on channel `chan`, START, and wait for the START interrupt */
+static void dumb_start(QTestState *qts, uint8_t chan)
+{
+    qtest_writeb(qts, KW_MODE, KW_I2C_MODE_DUMB | chan);
+    qtest_writeb(qts, KW_CONTROL, KW_I2C_CTL_START);
+    i2c_wait_isr(qts, KW_I2C_IRQ_START);
+    qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_START);
+}
+
+/*
+ * Open a manual transfer to the 8-bit address `addr8` on channel `chan`.
+ * Returns whether the address was acked; on a NAK the STOP interrupt is
+ * left for the caller to look at.
+ */
+static bool dumb_open(QTestState *qts, uint8_t chan, uint8_t addr8)
+{
+    qtest_writeb(qts, KW_ISR, 0x0f);
+    dumb_start(qts, chan);
+    qtest_writeb(qts, KW_DATA, addr8);
+    i2c_wait_isr(qts, KW_I2C_IRQ_DATA);
+    /* There is no address phase of the controller's own here */
+    g_assert_cmphex(qtest_readb(qts, KW_ISR) & KW_I2C_IRQ_ADDR, ==, 0);
+    return qtest_readb(qts, KW_STATUS) & KW_I2C_STAT_LAST_AAK;
+}
+
+/* A manual one-byte write to register `reg` of the clock chip */
+static void dumb_write_reg(QTestState *qts, uint8_t reg, uint8_t val)
+{
+    g_assert_true(dumb_open(qts, 0, HWCLOCK_ADDR8 & ~1));
+    g_assert_cmphex(qtest_readb(qts, KW_STATUS) & KW_I2C_STAT_BUSY,
+                    ==, KW_I2C_STAT_BUSY);
+    /* The address byte has gone out, so acking DATA raises it again */
+    qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_DATA);
+    i2c_wait_isr(qts, KW_I2C_IRQ_DATA);
+    qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_DATA);
+
+    qtest_writeb(qts, KW_DATA, reg);
+    i2c_wait_isr(qts, KW_I2C_IRQ_DATA);
+    qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_DATA);
+    qtest_writeb(qts, KW_DATA, val);
+    i2c_wait_isr(qts, KW_I2C_IRQ_DATA);
+    qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_DATA);
+
+    qtest_writeb(qts, KW_CONTROL, KW_I2C_CTL_STOP);
+    i2c_wait_isr(qts, KW_I2C_IRQ_STOP);
+    qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_STOP);
+    g_assert_cmphex(qtest_readb(qts, KW_STATUS) & KW_I2C_STAT_BUSY, ==, 0);
+}
+
+/*
+ * Point the clock chip at `reg` with a manual write, then read it back
+ * with a manual read after a repeated START, one byte with AAK clear --
+ * the controller stops by itself on the ack after the byte.  `ack` is
+ * the value written to the ISR to acknowledge DATA.
+ */
+static uint8_t dumb_read_reg(QTestState *qts, uint8_t reg, uint8_t ack)
+{
+    uint8_t val;
+
+    g_assert_true(dumb_open(qts, 0, HWCLOCK_ADDR8 & ~1));
+    qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_DATA);
+    qtest_writeb(qts, KW_DATA, reg);
+    i2c_wait_isr(qts, KW_I2C_IRQ_DATA);
+
+    /* Repeated START: ends the write without a STOP interrupt */
+    qtest_writeb(qts, KW_ISR, 0x0f);
+    g_assert_true(dumb_open(qts, 0, HWCLOCK_ADDR8 | 1));
+    g_assert_cmphex(qtest_readb(qts, KW_ISR) & KW_I2C_IRQ_STOP, ==, 0);
+
+    qtest_writeb(qts, KW_CONTROL, 0);
+    qtest_writeb(qts, KW_ISR, ack);
+    i2c_wait_isr(qts, KW_I2C_IRQ_DATA);
+    val = qtest_readb(qts, KW_DATA);
+    qtest_writeb(qts, KW_ISR, ack);
+    i2c_wait_isr(qts, KW_I2C_IRQ_STOP);
+    g_assert_cmphex(qtest_readb(qts, KW_STATUS) & KW_I2C_STAT_BUSY, ==, 0);
+    qtest_writeb(qts, KW_ISR, 0x0f);
+
+    return val;
+}
+
+/* START in DUMB mode raises the START interrupt, write-1-to-clear */
+static void test_dumb_start_raises_isr(void)
+{
+    QTestState *qts = qtest_init(KW_MACHINE_DUMB);
+
+    /* Leave ADDR and STOP set from a NAK: START must not clear them */
+    qtest_writeb(qts, KW_MODE, KW_I2C_MODE_STANDARD);
+    qtest_writeb(qts, KW_ADDR, 0xa0);
+    qtest_writeb(qts, KW_CONTROL, KW_I2C_CTL_XADDR);
+    g_assert_cmphex(qtest_readb(qts, KW_ISR), ==,
+                    KW_I2C_IRQ_ADDR | KW_I2C_IRQ_STOP);
+
+    qtest_writeb(qts, KW_MODE, KW_I2C_MODE_DUMB);
+    qtest_writeb(qts, KW_CONTROL, KW_I2C_CTL_START);
+    g_assert_cmphex(qtest_readb(qts, KW_ISR), ==,
+                    KW_I2C_IRQ_ADDR | KW_I2C_IRQ_STOP | KW_I2C_IRQ_START);
+    /* A command, like XADDR and STOP: it does not read back */
+    g_assert_cmphex(qtest_readb(qts, KW_CONTROL) & KW_I2C_CTL_START, ==, 0);
+
+    qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_START);
+    g_assert_cmphex(qtest_readb(qts, KW_ISR), ==,
+                    KW_I2C_IRQ_ADDR | KW_I2C_IRQ_STOP);
+
+    /* Not an edge on a stored bit: a second START works as well */
+    qtest_writeb(qts, KW_CONTROL, KW_I2C_CTL_START);
+    g_assert_cmphex(qtest_readb(qts, KW_ISR) & KW_I2C_IRQ_START,
+                    ==, KW_I2C_IRQ_START);
+    qtest_writeb(qts, KW_CONTROL, KW_I2C_CTL_START);
+    g_assert_cmphex(qtest_readb(qts, KW_ISR) & KW_I2C_IRQ_START,
+                    ==, KW_I2C_IRQ_START);
+
+    qtest_quit(qts);
+}
+
+/* With the switch off, START stays a stored bit that does nothing */
+static void test_dumb_off_start_ignored(void)
+{
+    QTestState *qts = qtest_init(KW_MACHINE);
+
+    qtest_writeb(qts, KW_MODE, KW_I2C_MODE_DUMB);
+    qtest_writeb(qts, KW_CONTROL, KW_I2C_CTL_START);
+    g_assert_cmphex(qtest_readb(qts, KW_ISR), ==, 0);
+    g_assert_cmphex(qtest_readb(qts, KW_CONTROL), ==, KW_I2C_CTL_START);
+    qtest_writeb(qts, KW_DATA, HWCLOCK_ADDR8);
+    g_assert_cmphex(qtest_readb(qts, KW_ISR), ==, 0);
+
+    qtest_quit(qts);
+}
+
+/* START in the other modes does nothing, and opens nothing */
+static void test_dumb_start_other_modes(void)
+{
+    static const uint8_t modes[] = {
+        KW_I2C_MODE_STANDARD, KW_I2C_MODE_STANDARDSUB, KW_I2C_MODE_COMBINED,
+    };
+    QTestState *qts = qtest_init(KW_MACHINE_DUMB);
+    unsigned i;
+
+    for (i = 0; i < ARRAY_SIZE(modes); i++) {
+        qtest_writeb(qts, KW_MODE, modes[i]);
+        qtest_writeb(qts, KW_CONTROL, KW_I2C_CTL_START);
+        g_assert_cmphex(qtest_readb(qts, KW_ISR), ==, 0);
+        g_assert_cmphex(qtest_readb(qts, KW_CONTROL), ==, 0);
+        qtest_writeb(qts, KW_DATA, HWCLOCK_ADDR8);
+        g_assert_cmphex(qtest_readb(qts, KW_ISR), ==, 0);
+    }
+
+    qtest_quit(qts);
+}
+
+/*
+ * A manual write and a manual read of the clock chip.  An ordinary read
+ * goes first, so that the manual read starts from the state a finished
+ * transfer leaves behind (its last byte), as the ROM's does.
+ */
+static void test_dumb_write_then_read(void)
+{
+    QTestState *qts = qtest_init(KW_MACHINE_DUMB);
+
+    i2c_read_sub(qts, HWCLOCK_ADDR8, HWCLOCK_REG);
+    dumb_write_reg(qts, HWCLOCK_REG, 0x5a);
+    /* The address register holds what the manual transfer used */
+    g_assert_cmphex(qtest_readb(qts, KW_ADDR), ==, HWCLOCK_ADDR8 & ~1);
+    g_assert_cmphex(i2c_read_sub(qts, HWCLOCK_ADDR8, HWCLOCK_REG), ==, 0x5a);
+    g_assert_cmphex(dumb_read_reg(qts, HWCLOCK_REG, KW_I2C_IRQ_DATA),
+                    ==, 0x5a);
+    g_assert_cmphex(qtest_readb(qts, KW_ADDR), ==, HWCLOCK_ADDR8 | 1);
+
+    qtest_quit(qts);
+}
+
+/*
+ * Acking everything at once must not fetch an extra byte: a manual
+ * transfer has no address interrupt, so an ADDR ack in the same write
+ * means nothing.
+ */
+static void test_dumb_read_ack_all(void)
+{
+    QTestState *qts = qtest_init(KW_MACHINE_DUMB);
+
+    i2c_write_sub(qts, HWCLOCK_ADDR8, HWCLOCK_REG, 0xa5);
+    g_assert_cmphex(dumb_read_reg(qts, HWCLOCK_REG, 0x0f), ==, 0xa5);
+
+    qtest_quit(qts);
+}
+
+/* With AAK set a manual read goes on, as AAK means everywhere else */
+static void test_dumb_read_aak(void)
+{
+    QTestState *qts = qtest_init(KW_MACHINE_DUMB);
+
+    i2c_write_sub(qts, HWCLOCK_ADDR8, HWCLOCK_REG, 0x11);
+    i2c_write_sub(qts, HWCLOCK_ADDR8, HWCLOCK_REG + 1, 0x22);
+
+    g_assert_true(dumb_open(qts, 0, HWCLOCK_ADDR8 & ~1));
+    qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_DATA);
+    qtest_writeb(qts, KW_DATA, HWCLOCK_REG);
+    i2c_wait_isr(qts, KW_I2C_IRQ_DATA);
+    g_assert_true(dumb_open(qts, 0, HWCLOCK_ADDR8 | 1));
+
+    qtest_writeb(qts, KW_CONTROL, KW_I2C_CTL_AAK);
+    qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_DATA);
+    i2c_wait_isr(qts, KW_I2C_IRQ_DATA);
+    g_assert_cmphex(qtest_readb(qts, KW_DATA), ==, 0x11);
+    qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_DATA);
+    i2c_wait_isr(qts, KW_I2C_IRQ_DATA);
+    g_assert_cmphex(qtest_readb(qts, KW_ISR) & KW_I2C_IRQ_STOP, ==, 0);
+
+    /* Drop AAK before taking the second byte: the next ack stops */
+    qtest_writeb(qts, KW_CONTROL, 0);
+    qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_DATA);
+    i2c_wait_isr(qts, KW_I2C_IRQ_DATA);
+    g_assert_cmphex(qtest_readb(qts, KW_DATA), ==, 0x22);
+    qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_DATA);
+    i2c_wait_isr(qts, KW_I2C_IRQ_STOP);
+
+    qtest_quit(qts);
+}
+
+/* An address nobody answers: DATA and STOP, and the bus is let go */
+static void test_dumb_nak(void)
+{
+    QTestState *qts = qtest_init(KW_MACHINE_DUMB);
+
+    g_assert_false(dumb_open(qts, 0, 0xa0));
+    g_assert_cmphex(qtest_readb(qts, KW_ISR) & KW_I2C_IRQ_STOP,
+                    ==, KW_I2C_IRQ_STOP);
+    g_assert_cmphex(qtest_readb(qts, KW_STATUS) & KW_I2C_STAT_BUSY, ==, 0);
+
+    /* Nothing is waiting for an address any more */
+    qtest_writeb(qts, KW_ISR, 0x0f);
+    qtest_writeb(qts, KW_DATA, HWCLOCK_ADDR8);
+    g_assert_cmphex(qtest_readb(qts, KW_ISR), ==, 0);
+
+    /* A channel that does not exist NAKs the same way */
+    g_assert_false(dumb_open(qts, 0x20, HWCLOCK_ADDR8));
+    g_assert_cmphex(qtest_readb(qts, KW_ISR) & KW_I2C_IRQ_STOP,
+                    ==, KW_I2C_IRQ_STOP);
+
+    qtest_quit(qts);
+}
+
+/* STOP, XADDR and a reset all end the wait for the address byte */
+static void test_dumb_wait_ends(void)
+{
+    QTestState *qts = qtest_init(KW_MACHINE_DUMB);
+
+    dumb_start(qts, 0);
+    qtest_writeb(qts, KW_CONTROL, KW_I2C_CTL_STOP);
+    i2c_wait_isr(qts, KW_I2C_IRQ_STOP);
+    qtest_writeb(qts, KW_ISR, 0x0f);
+    qtest_writeb(qts, KW_DATA, HWCLOCK_ADDR8);
+    g_assert_cmphex(qtest_readb(qts, KW_ISR), ==, 0);
+
+    /*
+     * After XADDR the data byte is payload: written to the register the
+     * subaddress names, not taken as an address
+     */
+    dumb_start(qts, 0);
+    i2c_write_sub(qts, HWCLOCK_ADDR8, HWCLOCK_REG, 0x3c);
+    g_assert_cmphex(i2c_read_sub(qts, HWCLOCK_ADDR8, HWCLOCK_REG), ==, 0x3c);
+
+    dumb_start(qts, 0);
+    qtest_system_reset(qts);
+    qtest_writeb(qts, KW_DATA, HWCLOCK_ADDR8);
+    g_assert_cmphex(qtest_readb(qts, KW_ISR), ==, 0);
+
+    qtest_quit(qts);
+}
+
+/*
+ * START with a transfer open ends it without a STOP interrupt, and the
+ * bus forgets the device: the next address goes out afresh.
+ */
+static void test_dumb_start_ends_transfer(void)
+{
+    QTestState *qts = qtest_init(KW_MACHINE_DUMB);
+
+    qtest_writeb(qts, KW_MODE, KW_I2C_MODE_STANDARD);
+    qtest_writeb(qts, KW_ADDR, HWCLOCK_ADDR8 & ~1);
+    qtest_writeb(qts, KW_CONTROL, KW_I2C_CTL_XADDR);
+    i2c_wait_isr(qts, KW_I2C_IRQ_ADDR);
+    qtest_writeb(qts, KW_ISR, 0x0f);
+
+    qtest_writeb(qts, KW_MODE, KW_I2C_MODE_DUMB);
+    qtest_writeb(qts, KW_CONTROL, KW_I2C_CTL_START);
+    g_assert_cmphex(qtest_readb(qts, KW_ISR), ==, KW_I2C_IRQ_START);
+    g_assert_cmphex(qtest_readb(qts, KW_STATUS) & KW_I2C_STAT_BUSY, ==, 0);
+
+    g_assert_false(dumb_open(qts, 0, 0xa0));
+
+    qtest_quit(qts);
+}
+
+/* One write with START and STOP: only START, as with XADDR and STOP */
+static void test_dumb_start_and_stop(void)
+{
+    QTestState *qts = qtest_init(KW_MACHINE_DUMB);
+
+    qtest_writeb(qts, KW_MODE, KW_I2C_MODE_DUMB);
+    qtest_writeb(qts, KW_CONTROL, KW_I2C_CTL_START | KW_I2C_CTL_STOP);
+    g_assert_cmphex(qtest_readb(qts, KW_ISR), ==, KW_I2C_IRQ_START);
+    qtest_writeb(qts, KW_ISR, 0x0f);
+    qtest_writeb(qts, KW_DATA, HWCLOCK_ADDR8 & ~1);
+    i2c_wait_isr(qts, KW_I2C_IRQ_DATA);
+    g_assert_cmphex(qtest_readb(qts, KW_STATUS) & KW_I2C_STAT_LAST_AAK,
+                    ==, KW_I2C_STAT_LAST_AAK);
+
+    qtest_quit(qts);
+}
+
+/* A manual read of the SPD on channel 1, with both switches on */
+static void test_dumb_spd(void)
+{
+    QTestState *qts = qtest_init(KW_MACHINE_DUMB_SPD);
+    uint8_t buf[SPD_LEN];
+
+    g_assert_true(dumb_open(qts, KW_CHAN1, SPD_ADDR8(0x50) | 1));
+    qtest_writeb(qts, KW_CONTROL, 0);
+    qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_DATA);
+    i2c_wait_isr(qts, KW_I2C_IRQ_DATA);
+    g_assert_cmphex(qtest_readb(qts, KW_DATA), ==, 128);
+    qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_DATA);
+    i2c_wait_isr(qts, KW_I2C_IRQ_STOP);
+    qtest_writeb(qts, KW_ISR, 0x0f);
+
+    /* ... and the ordinary combined reads are unchanged */
+    spd_read(qts, SPD_ADDR8(0x51), buf);
+    spd_assert_ddr(buf);
+
+    qtest_quit(qts);
+}
+
+/*
+ * A transfer is ended, and read from, on the channel it was opened on,
+ * even when the mode register has been rewritten to another channel in
+ * between.  Switch off: this is not about DUMB mode.
+ */
+static void test_transfer_keeps_its_channel(void)
+{
+    QTestState *qts = qtest_init(KW_MACHINE_SPD);
+
+    qtest_writeb(qts, KW_MODE, KW_I2C_MODE_COMBINED | KW_CHAN1);
+    qtest_writeb(qts, KW_ADDR, SPD_ADDR8(0x50) | 1);
+    qtest_writeb(qts, KW_SUBADDR, 0);
+    qtest_writeb(qts, KW_CONTROL, KW_I2C_CTL_AAK | KW_I2C_CTL_XADDR);
+    i2c_wait_isr(qts, KW_I2C_IRQ_ADDR);
+    qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_ADDR);
+    i2c_wait_isr(qts, KW_I2C_IRQ_DATA);
+    g_assert_cmphex(qtest_readb(qts, KW_DATA), ==, 128);
+
+    /* Channel 0 now, but the next byte still comes from the EEPROM */
+    qtest_writeb(qts, KW_MODE, KW_I2C_MODE_COMBINED);
+    qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_DATA);
+    i2c_wait_isr(qts, KW_I2C_IRQ_DATA);
+    g_assert_cmphex(qtest_readb(qts, KW_DATA), ==, 8);
+
+    /* STOP ends it on channel 1, so 7-bit 0x52 there is nobody */
+    qtest_writeb(qts, KW_CONTROL, KW_I2C_CTL_STOP);
+    i2c_wait_isr(qts, KW_I2C_IRQ_STOP);
+    qtest_writeb(qts, KW_ISR, 0x0f);
+    spd_assert_nak(qts, SPD_ADDR8(0x52));
+
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     unsigned i;
@@ -994,6 +1388,10 @@ int main(int argc, char **argv)
         path = g_strdup_printf("/keywest-i2c/spd-on/%s",
                                byte0_tests[i].name + strlen("/keywest-i2c/"));
         qtest_add_data_func(path, GUINT_TO_POINTER(i), test_byte0_with_spd);
+        g_free(path);
+        path = g_strdup_printf("/keywest-i2c/dumb-on/%s",
+                               byte0_tests[i].name + strlen("/keywest-i2c/"));
+        qtest_add_data_func(path, GUINT_TO_POINTER(i), test_byte0_with_dumb);
     }
     qtest_add_func("/keywest-i2c/mac99-has-no-i2c", test_mac99_has_no_i2c);
     qtest_add_func("/keywest-i2c/lane3-off-is-hole", test_lane3_off_is_hole);
@@ -1012,6 +1410,25 @@ int main(int argc, char **argv)
     qtest_add_func("/keywest-i2c/spd-other-addresses-nak",
                    test_spd_other_addresses_nak);
     qtest_add_func("/keywest-i2c/spd-smallest-ram", test_spd_smallest_ram);
+    qtest_add_func("/keywest-i2c/dumb-start-raises-isr",
+                   test_dumb_start_raises_isr);
+    qtest_add_func("/keywest-i2c/dumb-off-start-ignored",
+                   test_dumb_off_start_ignored);
+    qtest_add_func("/keywest-i2c/dumb-start-other-modes",
+                   test_dumb_start_other_modes);
+    qtest_add_func("/keywest-i2c/dumb-write-then-read",
+                   test_dumb_write_then_read);
+    qtest_add_func("/keywest-i2c/dumb-read-ack-all", test_dumb_read_ack_all);
+    qtest_add_func("/keywest-i2c/dumb-read-aak", test_dumb_read_aak);
+    qtest_add_func("/keywest-i2c/dumb-nak", test_dumb_nak);
+    qtest_add_func("/keywest-i2c/dumb-wait-ends", test_dumb_wait_ends);
+    qtest_add_func("/keywest-i2c/dumb-start-ends-transfer",
+                   test_dumb_start_ends_transfer);
+    qtest_add_func("/keywest-i2c/dumb-start-and-stop",
+                   test_dumb_start_and_stop);
+    qtest_add_func("/keywest-i2c/dumb-spd", test_dumb_spd);
+    qtest_add_func("/keywest-i2c/transfer-keeps-its-channel",
+                   test_transfer_keeps_its_channel);
 
     return g_test_run();
 }
