@@ -3075,7 +3075,13 @@ static inline bool ppc_interrupts_little_endian(PowerPCCPU *cpu, bool hv)
     CPUPPCState *env = &cpu->env;
     bool ile;
 
-    if (hv && env->has_hv_mode) {
+    /*
+     * A 970 strapped into hypervisor state has an HV mode too, but no
+     * little-endian mode, and bit 19 of its HID0 is not HILE (NetBSD calls
+     * it EX_TBEN); a PowerMac boot ROM sets it.  Leave the 970 to MSR[ILE],
+     * which it cannot set.
+     */
+    if (hv && env->has_hv_mode && env->excp_model != POWERPC_EXCP_970) {
         if (is_isa300(pcc)) {
             ile = !!(env->spr[SPR_HID0] & HID0_POWER9_HILE);
         } else {
