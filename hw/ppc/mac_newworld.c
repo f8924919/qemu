@@ -103,6 +103,9 @@ typedef struct Core99MachineState Core99MachineState;
 DECLARE_INSTANCE_CHECKER(Core99MachineState, CORE99_MACHINE,
                          TYPE_CORE99_MACHINE)
 
+#define U3_MEMCTL_BASE 0xf8002000
+#define U3_MEMCTL_SIZE 0x1000
+
 typedef enum {
     CORE99_VIA_CONFIG_CUDA = 0,
     CORE99_VIA_CONFIG_PMU,
@@ -131,7 +134,52 @@ struct Core99MachineState {
     bool u3_i2c_dumb;
     /* PowerMac7,3: DBDMA control writes set s0-s7 (x-dbdma-devstat) */
     bool dbdma_devstat;
+    /* PowerMac7,3: U3 registers at 0xf8002000 as storage (x-u3-memctl) */
+    bool u3_memctl;
+    MemoryRegion u3_memctl_mr;
+    uint8_t u3_memctl_regs[U3_MEMCTL_SIZE];
 };
+
+/*
+ * A real boot ROM writes U3 registers at 0xf8002000, seemingly to set
+ * up the memory banks, and reads some of them back.  Nothing here
+ * models what they mean: they only hold what was written.
+ */
+static uint64_t u3_memctl_read(void *opaque, hwaddr addr, unsigned size)
+{
+    Core99MachineState *cms = opaque;
+
+    return ldn_be_p(cms->u3_memctl_regs + addr, size);
+}
+
+static void u3_memctl_write(void *opaque, hwaddr addr, uint64_t val,
+                            unsigned size)
+{
+    Core99MachineState *cms = opaque;
+
+    stn_be_p(cms->u3_memctl_regs + addr, size, val);
+}
+
+static const MemoryRegionOps u3_memctl_ops = {
+    .read = u3_memctl_read,
+    .write = u3_memctl_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+};
+
+static void u3_memctl_reset(void *opaque)
+{
+    Core99MachineState *cms = opaque;
+
+    memset(cms->u3_memctl_regs, 0, sizeof(cms->u3_memctl_regs));
+}
 
 static void fw_cfg_boot_set(void *opaque, const char *boot_device,
                             Error **errp)
@@ -505,6 +553,17 @@ static void ppc_core99_init(MachineState *machine)
                                   spd_data_generate(DDR, dimm_size));
             smbus_eeprom_init_one(spd_bus, 0x51,
                                   spd_data_generate(DDR, dimm_size));
+        }
+
+        /* Plain map, for the same reason as the i2c above */
+        if (core99_machine->u3_memctl) {
+            memory_region_init_io(&core99_machine->u3_memctl_mr,
+                                  OBJECT(machine), &u3_memctl_ops,
+                                  core99_machine, "u3-memctl",
+                                  U3_MEMCTL_SIZE);
+            memory_region_add_subregion(get_system_memory(), U3_MEMCTL_BASE,
+                                        &core99_machine->u3_memctl_mr);
+            qemu_register_reset(u3_memctl_reset, core99_machine);
         }
     }
 
@@ -1181,6 +1240,16 @@ static bool powermac7_3_get_dbdma_devstat(Object *obj, Error **errp)
     return CORE99_MACHINE(obj)->dbdma_devstat;
 }
 
+static bool powermac7_3_get_u3_memctl(Object *obj, Error **errp)
+{
+    return CORE99_MACHINE(obj)->u3_memctl;
+}
+
+static void powermac7_3_set_u3_memctl(Object *obj, bool value, Error **errp)
+{
+    CORE99_MACHINE(obj)->u3_memctl = value;
+}
+
 static void powermac7_3_set_dbdma_devstat(Object *obj, bool value,
                                           Error **errp)
 {
@@ -1285,6 +1354,14 @@ static void powermac7_3_machine_class_init(ObjectClass *oc, const void *data)
                                           "the s0-s7 status bits, which a "
                                           "real boot ROM uses (off by "
                                           "default)");
+    object_class_property_add_bool(oc, "x-u3-memctl",
+                                   powermac7_3_get_u3_memctl,
+                                   powermac7_3_set_u3_memctl);
+    object_class_property_set_description(oc, "x-u3-memctl",
+                                          "Keep what is written to the U3 "
+                                          "registers at 0xf8002000, which "
+                                          "a real boot ROM reads back (off "
+                                          "by default)");
 }
 
 static void powermac7_3_instance_init(Object *obj)
@@ -1310,6 +1387,8 @@ static void powermac7_3_instance_init(Object *obj)
     cms->u3_i2c_dumb = false;
     /* Off: no guest driver was seen writing s0-s7 through control */
     cms->dbdma_devstat = false;
+    /* Off: no guest OS was seen touching 0xf8002000; Linux does not */
+    cms->u3_memctl = false;
 }
 
 static const TypeInfo powermac7_3_machine_info = {
