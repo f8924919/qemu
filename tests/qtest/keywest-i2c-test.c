@@ -1151,6 +1151,30 @@ static void test_dumb_start_other_modes(void)
 }
 
 /*
+ * XADDR in DUMB mode is still refused the way it was: an address phase of
+ * the controller's own has no meaning there, so it NAKs, and it opens
+ * nothing a later data byte could go to.
+ */
+static void test_dumb_xaddr_naks(void)
+{
+    QTestState *qts = qtest_init(KW_MACHINE_DUMB);
+
+    qtest_writeb(qts, KW_MODE, KW_I2C_MODE_DUMB);
+    qtest_writeb(qts, KW_ADDR, HWCLOCK_ADDR8 & ~1);
+    qtest_writeb(qts, KW_CONTROL, KW_I2C_CTL_XADDR);
+    g_assert_cmphex(qtest_readb(qts, KW_ISR), ==,
+                    KW_I2C_IRQ_ADDR | KW_I2C_IRQ_STOP);
+    g_assert_cmphex(qtest_readb(qts, KW_STATUS) &
+                    (KW_I2C_STAT_LAST_AAK | KW_I2C_STAT_BUSY), ==, 0);
+
+    qtest_writeb(qts, KW_ISR, 0x0f);
+    qtest_writeb(qts, KW_DATA, HWCLOCK_ADDR8 & ~1);
+    g_assert_cmphex(qtest_readb(qts, KW_ISR), ==, 0);
+
+    qtest_quit(qts);
+}
+
+/*
  * A manual write and a manual read of the clock chip.  An ordinary read
  * goes first, so that the manual read starts from the state a finished
  * transfer leaves behind (its last byte), as the ROM's does.
@@ -1416,6 +1440,7 @@ int main(int argc, char **argv)
                    test_dumb_off_start_ignored);
     qtest_add_func("/keywest-i2c/dumb-start-other-modes",
                    test_dumb_start_other_modes);
+    qtest_add_func("/keywest-i2c/dumb-xaddr-naks", test_dumb_xaddr_naks);
     qtest_add_func("/keywest-i2c/dumb-write-then-read",
                    test_dumb_write_then_read);
     qtest_add_func("/keywest-i2c/dumb-read-ack-all", test_dumb_read_ack_all);
