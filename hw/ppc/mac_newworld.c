@@ -140,6 +140,8 @@ struct Core99MachineState {
     bool u3_memctl;
     MemoryRegion u3_memctl_mr;
     uint8_t u3_memctl_regs[U3_MEMCTL_SIZE];
+    /* PowerMac7,3: the NMI line (GPIO 9) rests high (x-gpio9-idle-high) */
+    bool gpio9_idle_high;
 };
 
 /*
@@ -735,6 +737,10 @@ static void ppc_core99_init(MachineState *machine)
         }
     }
 
+    if (core99_machine->gpio9_idle_high) {
+        macio_newworld_set_gpio9_idle_high(NEWWORLD_MACIO(macio), true);
+    }
+
     /*
      * Only when on: left alone, the DBDMA keeps whatever -global set, so
      * the switch can be tried on the other machines too.
@@ -1267,6 +1273,17 @@ static void powermac7_3_set_u3_memctl(Object *obj, bool value, Error **errp)
     CORE99_MACHINE(obj)->u3_memctl = value;
 }
 
+static bool powermac7_3_get_gpio9_idle_high(Object *obj, Error **errp)
+{
+    return CORE99_MACHINE(obj)->gpio9_idle_high;
+}
+
+static void powermac7_3_set_gpio9_idle_high(Object *obj, bool value,
+                                            Error **errp)
+{
+    CORE99_MACHINE(obj)->gpio9_idle_high = value;
+}
+
 static void powermac7_3_set_dbdma_devstat(Object *obj, bool value,
                                           Error **errp)
 {
@@ -1387,6 +1404,14 @@ static void powermac7_3_machine_class_init(ObjectClass *oc, const void *data)
                                           "registers at 0xf8002000, which "
                                           "a real boot ROM reads back (off "
                                           "by default)");
+    object_class_property_add_bool(oc, "x-gpio9-idle-high",
+                                   powermac7_3_get_gpio9_idle_high,
+                                   powermac7_3_set_gpio9_idle_high);
+    object_class_property_set_description(oc, "x-gpio9-idle-high",
+                                          "Rest the NMI line (GPIO 9) high, "
+                                          "which a real boot ROM reads as a "
+                                          "released NMI button (off by "
+                                          "default)");
 }
 
 static void powermac7_3_instance_init(Object *obj)
@@ -1415,6 +1440,8 @@ static void powermac7_3_instance_init(Object *obj)
     cms->nvram_flash_id = false;
     /* Off: no guest OS was seen touching 0xf8002000; Linux does not */
     cms->u3_memctl = false;
+    /* Off: QEMU has always rested the NMI line low */
+    cms->gpio9_idle_high = false;
 }
 
 static const TypeInfo powermac7_3_machine_info = {

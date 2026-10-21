@@ -50,8 +50,10 @@ struct MacIOGPIOState {
     qemu_irq cpu_reset_irqs[MACIO_GPIO_RESET_CPU_CNT];
     uint8_t gpio_levels[8];
     uint8_t gpio_regs[36]; /* XXX Check count */
+    bool nmi_idle_high;
 };
 
 void macio_set_gpio(MacIOGPIOState *s, uint32_t gpio, bool state);
+void macio_gpio_set_nmi_idle_high(MacIOGPIOState *s, bool on);
 
 #endif

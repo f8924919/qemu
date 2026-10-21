@@ -102,8 +102,11 @@ void macio_set_gpio(MacIOGPIOState *s, uint32_t gpio, bool state)
         break;
 
     case 9:
-        /* Edge, triggered by NMI below */
-        if (state) {
+        /*
+         * Edge, triggered by NMI below.  The irq says "pressed": with
+         * nmi_idle_high the line rests high and goes low while pressed.
+         */
+        if (state != s->nmi_idle_high) {
             trace_macio_gpio_irq_assert(gpio);
             qemu_irq_raise(s->gpio_extirqs[gpio]);
         } else {
@@ -232,12 +235,33 @@ static void macio_gpio_reset(DeviceState *dev)
 
     /* GPIO 1 is up by default */
     macio_set_gpio(s, 1, true);
+
+    /*
+     * Released, as an input.  Written directly so that the irq is left
+     * alone whatever order the mpic and this block are reset in.
+     */
+    if (s->nmi_idle_high) {
+        s->gpio_regs[9] = IN_DATA;
+    }
 }
 
 static void macio_gpio_nmi(NMIState *n)
 {
-    macio_set_gpio(MACIO_GPIO(n), 9, true);
-    macio_set_gpio(MACIO_GPIO(n), 9, false);
+    MacIOGPIOState *s = MACIO_GPIO(n);
+
+    /* Press and release */
+    macio_set_gpio(s, 9, !s->nmi_idle_high);
+    macio_set_gpio(s, 9, s->nmi_idle_high);
+}
+
+/*
+ * Rest the NMI line (GPIO 9) high rather than low.  A machine setting,
+ * not a property: it has to be set before the block is realized.
+ */
+void macio_gpio_set_nmi_idle_high(MacIOGPIOState *s, bool on)
+{
+    assert(!DEVICE(s)->realized);
+    s->nmi_idle_high = on;
 }
 
 static void macio_gpio_class_init(ObjectClass *oc, const void *data)

@@ -146,7 +146,10 @@ struct NewWorldMacIOState {
     MemoryRegion pic_alias;
     MACIOIDEState ide[2];
     MacIOGPIOState gpio;
+    bool gpio9_idle_high;
 };
+
+void macio_newworld_set_gpio9_idle_high(NewWorldMacIOState *ns, bool on);
 
 /*
  * The K2 KeyLargo of a PowerMac7,3: a macio-newworld that reports the id

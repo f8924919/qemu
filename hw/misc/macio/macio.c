@@ -333,6 +333,7 @@ static void macio_newworld_realize(PCIDevice *d, Error **errp)
 
     if (ns->has_pmu) {
         /* GPIOs */
+        macio_gpio_set_nmi_idle_high(&ns->gpio, ns->gpio9_idle_high);
         if (!qdev_realize(DEVICE(&ns->gpio), BUS(&s->macio_bus), errp)) {
             return;
         }
@@ -380,6 +381,17 @@ static void macio_newworld_realize(PCIDevice *d, Error **errp)
         memory_region_add_subregion(&s->bar, 0x16000,
                                     sysbus_mmio_get_region(sbd, 0));
     }
+}
+
+/*
+ * Rest the GPIO 9 (NMI) line high.  For the machine, before realize; kept
+ * off the property list like the CPU reset lines above, so that the
+ * machine does not reach inside for the GPIO controller.
+ */
+void macio_newworld_set_gpio9_idle_high(NewWorldMacIOState *ns, bool on)
+{
+    assert(!DEVICE(ns)->realized);
+    ns->gpio9_idle_high = on;
 }
 
 static void macio_newworld_init(Object *obj)
