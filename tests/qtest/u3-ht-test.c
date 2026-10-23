@@ -124,13 +124,19 @@ static void cfg_writew(QTestState *qts, uint64_t addr, uint16_t val)
  * config cycles and downstream memory decoding by hand: bus numbers,
  * a memory window covering 0xfa000000-0xfaffffff and memory decoding.
  */
-static void k2_program_bridge_windows(QTestState *qts)
+static void k2_program_bridge_windows_at(QTestState *qts, uint16_t base,
+                                         uint16_t limit)
 {
     qtest_writeb(qts, U3_HT_CFG_BASE + CFA0(K2_DEVFN, 0x18), 0); /* primary */
     qtest_writeb(qts, U3_HT_CFG_BASE + CFA0(K2_DEVFN, 0x19), 1); /* secondary */
     qtest_writeb(qts, U3_HT_CFG_BASE + CFA0(K2_DEVFN, 0x1a), 1); /* subord. */
-    cfg_writew(qts, U3_HT_CFG_BASE + CFA0(K2_DEVFN, 0x20), 0xfa00);
-    cfg_writew(qts, U3_HT_CFG_BASE + CFA0(K2_DEVFN, 0x22), 0xfaf0);
+    cfg_writew(qts, U3_HT_CFG_BASE + CFA0(K2_DEVFN, 0x20), base);
+    cfg_writew(qts, U3_HT_CFG_BASE + CFA0(K2_DEVFN, 0x22), limit);
+}
+
+static void k2_program_bridge_windows(QTestState *qts)
+{
+    k2_program_bridge_windows_at(qts, 0xfa00, 0xfaf0);
 }
 
 static void k2_enable_bridge_decoding(QTestState *qts)
@@ -875,6 +881,250 @@ static void test_memctl_mac99(void)
     qtest_quit(qts);
 }
 
+/*
+ * x-ht-mmio-80000000: a real boot ROM puts the BARs of the devices on
+ * the HT bus at 0x8xxxxxxx and those of the AGP card from 0x90000000
+ * up.  With the switch on, 0x80000000-0x8fffffff is the HT bus memory
+ * (identity-mapped) and the AGP hole starts at 0x90000000.
+ */
+#define HT_LOW              0x80000000ULL
+#define HT_LOW_SIZE         0x10000000ULL
+#define HT_LOW_MACHINE      "-machine powermac7_3,x-ht-mmio-80000000=on "
+#define HT_TESTDEV          "-device pci-testdev,bus=ht.1,addr=8," \
+                            "membar=4096,membar-backed=true "
+#define HT_TESTDEV_DEVFN    (8 << 3)
+#define AGP_TESTDEV         "-device pci-testdev,bus=pci.1,addr=0x12," \
+                            "membar=4096,membar-backed=true "
+#define AGP_TESTDEV_DEV     0x12
+
+/* RAM-backed 64-bit BAR2 of the pci-testdev behind the K2 bridge */
+static void ht_testdev_place(QTestState *qts, uint64_t bar)
+{
+    cfg_writel(qts, U3_HT_CFG_BASE + CFA1(1, HT_TESTDEV_DEVFN, 0x18),
+               (uint32_t)bar);
+    cfg_writel(qts, U3_HT_CFG_BASE + CFA1(1, HT_TESTDEV_DEVFN, 0x1c), 0);
+    cfg_writew(qts, U3_HT_CFG_BASE + CFA1(1, HT_TESTDEV_DEVFN, 4),
+               PCI_COMMAND_MEMORY);
+}
+
+/* The same BAR of the pci-testdev on the AGP bus */
+static void agp_testdev_place(QTestState *qts, uint64_t bar)
+{
+    agp_cfg_writel(qts, AGP_TESTDEV_DEV, 0x18, (uint32_t)bar);
+    agp_cfg_writel(qts, AGP_TESTDEV_DEV, 0x1c, 0);
+    agp_cfg_writel(qts, AGP_TESTDEV_DEV, 4, PCI_COMMAND_MEMORY);
+}
+
+/* Two values, each through 4, 2 and 1 byte accesses */
+static void check_reaches(QTestState *qts, uint64_t addr)
+{
+    qtest_writel(qts, addr, 0x12345678);
+    g_assert_cmphex(qtest_readl(qts, addr), ==, 0x12345678);
+    qtest_writel(qts, addr, 0x9abcdef0);
+    g_assert_cmphex(qtest_readl(qts, addr), ==, 0x9abcdef0);
+    qtest_writew(qts, addr, 0x5aa5);
+    g_assert_cmphex(qtest_readw(qts, addr), ==, 0x5aa5);
+    g_assert_cmphex(qtest_readl(qts, addr), ==, 0x5aa5def0);
+    qtest_writeb(qts, addr + 3, 0x3c);
+    g_assert_cmphex(qtest_readb(qts, addr + 3), ==, 0x3c);
+    g_assert_cmphex(qtest_readl(qts, addr), ==, 0x5aa5de3c);
+}
+
+static void check_misses(QTestState *qts, uint64_t addr)
+{
+    qtest_writel(qts, addr, 0x12345678);
+    g_assert_cmphex(qtest_readl(qts, addr), !=, 0x12345678);
+    qtest_writel(qts, addr, 0x9abcdef0);
+    g_assert_cmphex(qtest_readl(qts, addr), !=, 0x9abcdef0);
+}
+
+/* Where the ROM put the OHCI behind the K2 bridge */
+static void test_ht_low_window(void)
+{
+    QTestState *qts = qtest_init(HT_LOW_MACHINE HT_TESTDEV);
+
+    k2_program_bridge_windows_at(qts, 0x8000, 0x8ff0);
+    k2_enable_bridge_decoding(qts);
+    ht_testdev_place(qts, HT_LOW + 0x100000);
+    check_reaches(qts, HT_LOW + 0x100000);
+    check_reaches(qts, HT_LOW + 0x100ffc);
+
+    qtest_quit(qts);
+}
+
+static void test_ht_low_end(void)
+{
+    QTestState *qts = qtest_init(HT_LOW_MACHINE HT_TESTDEV);
+    uint64_t bar = HT_LOW + HT_LOW_SIZE - 0x1000;
+
+    k2_program_bridge_windows_at(qts, 0x8000, 0x8ff0);
+    k2_enable_bridge_decoding(qts);
+    ht_testdev_place(qts, bar);
+    check_reaches(qts, bar);
+    check_reaches(qts, bar + 0xffc);
+
+    qtest_quit(qts);
+}
+
+/* The window stops at 256MB: the HT bus does not answer at 0x90000000 */
+static void test_ht_low_beyond(void)
+{
+    QTestState *qts = qtest_init(HT_LOW_MACHINE HT_TESTDEV);
+    uint64_t bar = HT_LOW + HT_LOW_SIZE;
+
+    k2_program_bridge_windows_at(qts, 0x8000, 0x9000);
+    k2_enable_bridge_decoding(qts);
+    ht_testdev_place(qts, bar);
+    check_misses(qts, bar);
+
+    qtest_quit(qts);
+}
+
+/* The shrunk AGP hole still reaches the AGP bus from 0x90000000 ... */
+static void test_ht_low_agp_above(void)
+{
+    QTestState *qts = qtest_init(HT_LOW_MACHINE AGP_TESTDEV);
+
+    agp_testdev_place(qts, 0x90000000);
+    check_reaches(qts, 0x90000000);
+    qtest_quit(qts);
+
+    qts = qtest_init(HT_LOW_MACHINE AGP_TESTDEV);
+    agp_testdev_place(qts, 0xa0000000);
+    check_reaches(qts, 0xa0000000);
+    qtest_quit(qts);
+
+    qts = qtest_init(HT_LOW_MACHINE AGP_TESTDEV);
+    agp_testdev_place(qts, 0xeffff000);
+    check_reaches(qts, 0xeffffffc);
+    qtest_quit(qts);
+}
+
+/* ... and no longer below it */
+static void test_ht_low_agp_below(void)
+{
+    QTestState *qts = qtest_init(HT_LOW_MACHINE AGP_TESTDEV);
+
+    agp_testdev_place(qts, 0x8ff00000);
+    check_misses(qts, 0x8ff00000);
+
+    qtest_quit(qts);
+}
+
+/* x-macio-80000000 stays on top; past the MacIO the HT bus answers */
+static void test_ht_low_with_macio_low(void)
+{
+    QTestState *qts = qtest_init(HT_LOW_MACHINE HT_TESTDEV
+                                 "-machine x-macio-80000000=on");
+
+    k2_program_bridge_windows_at(qts, 0x8000, 0x8ff0);
+    k2_enable_bridge_decoding(qts);
+    ht_testdev_place(qts, HT_LOW + 0x100000);
+
+    le_writel(qts, MACIO_LOW + MACIO_OFF_FCR1, 0x12345678);
+    g_assert_cmphex(le_readl(qts, MACIO_LOW + MACIO_OFF_FCR1), ==, 0x12345678);
+    check_reaches(qts, HT_LOW + 0x100000);
+
+    qtest_quit(qts);
+}
+
+/*
+ * Even with an HT bus BAR right at 0x80000000, the MacIO copy is what
+ * answers there: the ROM drives the MacIO at that address.
+ */
+static void test_ht_low_macio_on_top(void)
+{
+    QTestState *qts = qtest_init(HT_LOW_MACHINE HT_TESTDEV
+                                 "-machine x-macio-80000000=on");
+
+    k2_program_bridge_windows_at(qts, 0x8000, 0x8ff0);
+    k2_enable_bridge_decoding(qts);
+    ht_testdev_place(qts, HT_LOW);
+
+    le_writel(qts, MACIO_LOW + MACIO_OFF_FCR1, 0x12345678);
+    g_assert_cmphex(le_readl(qts, MACIO_LOW + MACIO_OFF_FCR1), ==, 0x12345678);
+    /* The testdev RAM below would keep any value; FCR1 is the MacIO's */
+    cfg_writew(qts, U3_HT_CFG_BASE + CFA1(1, HT_TESTDEV_DEVFN, 4), 0);
+    g_assert_cmphex(le_readl(qts, MACIO_LOW + MACIO_OFF_FCR1), ==, 0x12345678);
+
+    qtest_quit(qts);
+}
+
+static void test_ht_low_off(void)
+{
+    QTestState *qts = qtest_init("-machine powermac7_3 " HT_TESTDEV);
+
+    k2_program_bridge_windows_at(qts, 0x8000, 0x8ff0);
+    k2_enable_bridge_decoding(qts);
+    ht_testdev_place(qts, HT_LOW + 0x100000);
+    check_misses(qts, HT_LOW + 0x100000);
+
+    /* The same device answers once moved into the 0xfa000000 window */
+    k2_program_bridge_windows_at(qts, 0xfa00, 0xfaf0);
+    ht_testdev_place(qts, U3_HT_MEM_BASE + 0x100000);
+    check_reaches(qts, U3_HT_MEM_BASE + 0x100000);
+    g_assert_false(mtree_has(qts, "u3-ht-pci-mmio-80000000"));
+    g_assert_false(mtree_has(qts, "unin-pci-hole-90000000"));
+    g_assert_true(mtree_has(qts, "alias unin-pci-hole @"));
+
+    qtest_quit(qts);
+}
+
+/* Off, the AGP hole still starts at 0x80000000 */
+static void test_ht_low_off_agp(void)
+{
+    QTestState *qts = qtest_init("-machine powermac7_3 " AGP_TESTDEV);
+
+    agp_testdev_place(qts, HT_LOW + 0x100000);
+    check_reaches(qts, HT_LOW + 0x100000);
+
+    qtest_quit(qts);
+}
+
+/* The decode registers do not move with the switch */
+static void test_ht_low_decode_regs(void)
+{
+    const char *machines[] = { "-machine powermac7_3", HT_LOW_MACHINE };
+
+    for (int i = 0; i < ARRAY_SIZE(machines); i++) {
+        QTestState *qts = qtest_init(machines[i]);
+
+        g_assert_cmphex(qtest_readl(qts, U3_HT_SELF_BASE + 0x200), ==,
+                        0x08e00000);
+        qtest_writel(qts, U3_HT_SELF_BASE + 0x200, 0xffff001f);
+        g_assert_cmphex(qtest_readl(qts, U3_HT_SELF_BASE + 0x200), ==,
+                        0x08e00000);
+        g_assert_cmphex(agp_cfg_readl(qts, 11, 0x48), ==, 0x01000000);
+        agp_cfg_writel(qts, 11, 0x48, 0x07000000);
+        g_assert_cmphex(agp_cfg_readl(qts, 11, 0x48), ==, 0x07000000);
+        qtest_quit(qts);
+    }
+}
+
+static void test_ht_low_mtree(void)
+{
+    QTestState *qts = qtest_init(HT_LOW_MACHINE);
+
+    g_assert_true(mtree_has(qts, "u3-ht-pci-mmio-80000000"));
+    g_assert_true(mtree_has(qts, "unin-pci-hole-90000000"));
+    /* The full-size hole is gone rather than left underneath */
+    g_assert_false(mtree_has(qts, "alias unin-pci-hole @"));
+
+    qtest_quit(qts);
+}
+
+static void test_ht_low_mac99(void)
+{
+    QTestState *qts = qtest_init("-machine powermac7_3");
+
+    g_assert_true(machine_has_prop(qts, "x-ht-mmio-80000000"));
+    qtest_quit(qts);
+
+    qts = qtest_init("-machine mac99 -cpu 970fx");
+    g_assert_false(machine_has_prop(qts, "x-ht-mmio-80000000"));
+    qtest_quit(qts);
+}
+
 static void test_mac99_unmapped(void)
 {
     QTestState *qts = qtest_init("-machine mac99 -cpu 970fx");
@@ -941,6 +1191,18 @@ int main(int argc, char **argv)
     qtest_add_func("/u3-ht/memctl-off", test_memctl_off);
     qtest_add_func("/u3-ht/memctl-bounds", test_memctl_bounds);
     qtest_add_func("/u3-ht/memctl-mac99", test_memctl_mac99);
+    qtest_add_func("/u3-ht/ht-low-window", test_ht_low_window);
+    qtest_add_func("/u3-ht/ht-low-end", test_ht_low_end);
+    qtest_add_func("/u3-ht/ht-low-beyond", test_ht_low_beyond);
+    qtest_add_func("/u3-ht/ht-low-agp-above", test_ht_low_agp_above);
+    qtest_add_func("/u3-ht/ht-low-agp-below", test_ht_low_agp_below);
+    qtest_add_func("/u3-ht/ht-low-with-macio-low", test_ht_low_with_macio_low);
+    qtest_add_func("/u3-ht/ht-low-macio-on-top", test_ht_low_macio_on_top);
+    qtest_add_func("/u3-ht/ht-low-off", test_ht_low_off);
+    qtest_add_func("/u3-ht/ht-low-off-agp", test_ht_low_off_agp);
+    qtest_add_func("/u3-ht/ht-low-decode-regs", test_ht_low_decode_regs);
+    qtest_add_func("/u3-ht/ht-low-mtree", test_ht_low_mtree);
+    qtest_add_func("/u3-ht/ht-low-mac99", test_ht_low_mac99);
 
     return g_test_run();
 }
