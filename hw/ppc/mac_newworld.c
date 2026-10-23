@@ -126,6 +126,10 @@ struct Core99MachineState {
     /* PowerMac7,3: also show the MacIO at 0x80000000 (x-macio-80000000) */
     bool macio_low;
     MemoryRegion macio_low_alias;
+    /* PowerMac7,3: HT bus memory at 0x80000000 (x-ht-mmio-80000000) */
+    bool ht_mmio_low;
+    MemoryRegion ht_mmio_low_alias;
+    MemoryRegion agp_hole_high_alias;
     /* PowerMac7,3: U3 i2c also decodes byte 3 (x-u3-i2c-lane3) */
     bool u3_i2c_lane3;
     /* PowerMac7,3: memory SPD EEPROMs on U3 i2c channel 1 (x-u3-i2c-spd) */
@@ -622,9 +626,34 @@ static void ppc_core99_init(MachineState *machine)
         sysbus_realize_and_unref(s, &error_fatal);
         sysbus_mmio_map(s, 0, 0xf0800000);
         sysbus_mmio_map(s, 1, 0xf0c00000);
-        /* PCI hole */
-        memory_region_add_subregion(get_system_memory(), 0x80000000,
-                                    sysbus_mmio_get_region(s, 2));
+        if (u3_ht_dev && core99_machine->ht_mmio_low) {
+            MemoryRegion *agp_mmio =
+                &U3_AGP_HOST_BRIDGE(uninorth_pci_dev)->pci_mmio;
+            MemoryRegion *ht_mmio = &U3_HT_HOST_BRIDGE(u3_ht_dev)->pci_mmio;
+
+            /*
+             * A real boot ROM was seen putting the BARs of the HT bus
+             * devices at 0x8xxxxxxx and those of the AGP card from
+             * 0x90000000 up.  Give the first 256 MB of the AGP PCI hole
+             * to the HT bus, both identity-mapped, and leave the rest of
+             * the hole to the AGP bus.  The decode registers are not
+             * looked at.
+             */
+            memory_region_init_alias(&core99_machine->agp_hole_high_alias,
+                                     OBJECT(machine), "unin-pci-hole-90000000",
+                                     agp_mmio, 0x90000000ULL, 0x60000000ULL);
+            memory_region_add_subregion(get_system_memory(), 0x90000000,
+                                        &core99_machine->agp_hole_high_alias);
+            memory_region_init_alias(&core99_machine->ht_mmio_low_alias,
+                                     OBJECT(machine), "u3-ht-pci-mmio-80000000",
+                                     ht_mmio, 0x80000000ULL, 0x10000000ULL);
+            memory_region_add_subregion(get_system_memory(), 0x80000000,
+                                        &core99_machine->ht_mmio_low_alias);
+        } else {
+            /* PCI hole */
+            memory_region_add_subregion(get_system_memory(), 0x80000000,
+                                        sysbus_mmio_get_region(s, 2));
+        }
         /*
          * Register 8 MB of ISA IO space at the base of the AGP domain.
          * The domain is one 32 MB window: IO at +0, CONFIG_ADDR at
@@ -1216,6 +1245,16 @@ static void powermac7_3_set_macio_low(Object *obj, bool value, Error **errp)
     CORE99_MACHINE(obj)->macio_low = value;
 }
 
+static bool powermac7_3_get_ht_mmio_low(Object *obj, Error **errp)
+{
+    return CORE99_MACHINE(obj)->ht_mmio_low;
+}
+
+static void powermac7_3_set_ht_mmio_low(Object *obj, bool value, Error **errp)
+{
+    CORE99_MACHINE(obj)->ht_mmio_low = value;
+}
+
 static bool powermac7_3_get_u3_i2c_lane3(Object *obj, Error **errp)
 {
     return CORE99_MACHINE(obj)->u3_i2c_lane3;
@@ -1356,6 +1395,18 @@ static void powermac7_3_machine_class_init(ObjectClass *oc, const void *data)
                                           "default). It shadows part of "
                                           "the AGP PCI hole, so do not use "
                                           "it with OpenBIOS");
+    object_class_property_add_bool(oc, "x-ht-mmio-80000000",
+                                   powermac7_3_get_ht_mmio_low,
+                                   powermac7_3_set_ht_mmio_low);
+    object_class_property_set_description(oc, "x-ht-mmio-80000000",
+                                          "Show the HT bus memory at "
+                                          "0x80000000-0x8fffffff and start "
+                                          "the AGP PCI hole at 0x90000000, "
+                                          "for running a real boot ROM "
+                                          "with -bios (off by default). "
+                                          "OpenBIOS puts AGP BARs from "
+                                          "0x80000000, so do not use it "
+                                          "with OpenBIOS");
     object_class_property_add_bool(oc, "x-u3-i2c-lane3",
                                    powermac7_3_get_u3_i2c_lane3,
                                    powermac7_3_set_u3_i2c_lane3);
@@ -1429,6 +1480,8 @@ static void powermac7_3_instance_init(Object *obj)
     cms->dart = ON_OFF_AUTO_AUTO;
     /* Off: only a real boot ROM wants the MacIO at 0x80000000 */
     cms->macio_low = false;
+    /* Off: only a real boot ROM puts HT bus BARs at 0x8xxxxxxx */
+    cms->ht_mmio_low = false;
     /* Off: only a real boot ROM drives the U3 i2c at byte 3 */
     cms->u3_i2c_lane3 = false;
     /* Off: only a real boot ROM reads the SPD; OpenBIOS fills in memory */
