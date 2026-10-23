@@ -28,7 +28,6 @@
 #include "qemu/osdep.h"
 #include "hw/core/irq.h"
 #include "qapi/error.h"
-#include "qemu/log.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
 #include "hw/usb/usb.h"
@@ -1175,11 +1174,16 @@ static int ohci_service_ed_list(OHCIState *ohci, uint32_t head)
                 }
             }
 
+            /*
+             * Bound the work done on one ED in one pass over the list, so
+             * that a guest cannot make it loop forever.  A long chain is
+             * not an error: leave the rest for the next pass, as the ED
+             * is written back with its head where we stopped and the list
+             * stays active.
+             */
             if (ed_cnt++ > ED_LINK_LIMIT) {
-                qemu_log_mask(LOG_GUEST_ERROR,
-                              "ohci: Too many endpoint descriptors in loop\n");
-                ohci_die(ohci);
-                return 0;
+                trace_usb_ohci_ed_td_limit(cur, ed.head & OHCI_DPTR_MASK);
+                break;
             }
         }
 
