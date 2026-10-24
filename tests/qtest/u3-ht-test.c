@@ -1147,6 +1147,152 @@ static void test_mac99_unmapped(void)
     qtest_quit(qts);
 }
 
+/*
+ * x-ht-k2-layout moves the K2 HT-PCI bridge for the real ROM, which
+ * takes HT dev 1 to be a K2 bridge unless it is an AMD-8131.  The
+ * expected tables come from the design (vendor:device, class and
+ * interrupt pin of HT bus 0 dev 0..7), not from what the code does.
+ */
+#define HT_EMPTY          0xffffffff
+#define SUNGEM_IDS        ((0x0021 << 16) | 0x106b)
+#define K2_FN_IDS(n)      ((((uint32_t)(n)) << 16) | 0x106b)
+
+typedef struct HTSlot {
+    uint32_t ids;
+    uint16_t class;
+    uint8_t pin;
+} HTSlot;
+
+#define SLOT_EMPTY        { HT_EMPTY, 0xffff, 0xff }
+#define SLOT_HOST         { U3_HT_IDS, 0x0600, 0 }
+#define SLOT_NIC          { SUNGEM_IDS, 0x0200, 1 }
+#define SLOT_K2(n)        { K2_FN_IDS(n), 0x0604, 0 }
+
+static const HTSlot ht_dev3[8] = {
+    SLOT_HOST, SLOT_NIC, SLOT_EMPTY, SLOT_K2(0x45),
+    SLOT_EMPTY, SLOT_EMPTY, SLOT_EMPTY, SLOT_EMPTY,
+};
+static const HTSlot ht_dev1[8] = {
+    SLOT_HOST, SLOT_K2(0x45), SLOT_NIC, SLOT_EMPTY,
+    SLOT_EMPTY, SLOT_EMPTY, SLOT_EMPTY, SLOT_EMPTY,
+};
+static const HTSlot ht_dev1_5[8] = {
+    SLOT_HOST, SLOT_K2(0x45), SLOT_K2(0x46), SLOT_K2(0x47),
+    SLOT_K2(0x48), SLOT_K2(0x49), SLOT_NIC, SLOT_EMPTY,
+};
+
+static void check_ht_slots(const char *args, const HTSlot *want,
+                           int nic_dev)
+{
+    QTestState *qts = qtest_init(args);
+
+    for (int dev = 0; dev < 8; dev++) {
+        HTSlot w = want[dev];
+        uint64_t cfg = U3_HT_CFG_BASE + CFA0(dev << 3, 0);
+
+        if (dev == nic_dev) {
+            w = (HTSlot)SLOT_EMPTY;
+        }
+        g_assert_cmphex(cfg_readl(qts, cfg), ==, w.ids);
+        g_assert_cmphex(cfg_readl(qts, cfg + 0x08) >> 16, ==, w.class);
+        g_assert_cmphex(qtest_readb(qts, cfg + PCI_INTERRUPT_PIN), ==, w.pin);
+    }
+    qtest_quit(qts);
+}
+
+static void test_k2_layout_dev3(void)
+{
+    check_ht_slots("-machine powermac7_3", ht_dev3, -1);
+    check_ht_slots("-machine powermac7_3,x-ht-k2-layout=dev3", ht_dev3, -1);
+    check_ht_slots("-machine powermac7_3 -nic none", ht_dev3, 1);
+}
+
+static void test_k2_layout_dev1(void)
+{
+    check_ht_slots("-machine powermac7_3,x-ht-k2-layout=dev1", ht_dev1, -1);
+    check_ht_slots("-machine powermac7_3,x-ht-k2-layout=dev1 -nic none",
+                   ht_dev1, 2);
+}
+
+static void test_k2_layout_dev1_5(void)
+{
+    check_ht_slots("-machine powermac7_3,x-ht-k2-layout=dev1-5",
+                   ht_dev1_5, -1);
+    check_ht_slots("-machine powermac7_3,x-ht-k2-layout=dev1-5 -nic none",
+                   ht_dev1_5, 6);
+}
+
+/*
+ * The 0045 bridge keeps the ht.1 name and the macio behind it at dev 7,
+ * wherever the bridge sits; a device plugged on ht.1 shows up there too.
+ */
+static void test_k2_layout_secondary(void)
+{
+    static const char *args[] = {
+        "-machine powermac7_3,x-ht-k2-layout=dev1 "
+        "-device pci-testdev,bus=ht.1,addr=0xd",
+        "-machine powermac7_3,x-ht-k2-layout=dev1-5 "
+        "-device pci-testdev,bus=ht.1,addr=0xd",
+    };
+
+    for (int i = 0; i < ARRAY_SIZE(args); i++) {
+        QTestState *qts = qtest_init(args[i]);
+        uint64_t br = U3_HT_CFG_BASE + CFA0(1 << 3, 0);
+
+        qtest_writeb(qts, br + 0x18, 0);
+        qtest_writeb(qts, br + 0x19, 1);
+        qtest_writeb(qts, br + 0x1a, 1);
+        g_assert_cmphex(cfg_readl(qts, U3_HT_CFG_BASE +
+                                  CFA1(1, MACIO_DEVFN, 0)), ==, MACIO_IDS);
+        g_assert_cmphex(cfg_readl(qts, U3_HT_CFG_BASE +
+                                  CFA1(1, 0xd << 3, 0)), ==, TESTDEV_IDS);
+        qtest_quit(qts);
+    }
+}
+
+/*
+ * The setter refuses other values.  -machine with a bad value makes QEMU
+ * exit before the qtest socket is up, so go through qom-set instead.
+ */
+static void test_k2_layout_bad(void)
+{
+    QTestState *qts = qtest_init("-machine powermac7_3");
+    QDict *resp = qtest_qmp(qts, "{ 'execute': 'qom-set', 'arguments': "
+                            "{ 'path': '/machine', "
+                            "'property': 'x-ht-k2-layout', "
+                            "'value': 'dev2' } }");
+    QDict *err = qdict_get_qdict(resp, "error");
+
+    g_assert_nonnull(err);
+    g_assert_cmpstr(qdict_get_str(err, "desc"), ==,
+                    "Invalid x-ht-k2-layout value");
+    qobject_unref(resp);
+    qtest_quit(qts);
+}
+
+static void test_k2_layout_mac99(void)
+{
+    QTestState *qts = qtest_init("-machine powermac7_3");
+    QDict *resp = qtest_qmp(qts, "{ 'execute': 'qom-get', 'arguments': "
+                            "{ 'path': '/machine', "
+                            "'property': 'x-ht-k2-layout' } }");
+
+    g_assert_cmpstr(qdict_get_str(resp, "return"), ==, "dev3");
+    qobject_unref(resp);
+    qtest_quit(qts);
+
+    qts = qtest_init("-machine powermac7_3,x-ht-k2-layout=dev1-5");
+    resp = qtest_qmp(qts, "{ 'execute': 'qom-get', 'arguments': "
+                     "{ 'path': '/machine', 'property': 'x-ht-k2-layout' } }");
+    g_assert_cmpstr(qdict_get_str(resp, "return"), ==, "dev1-5");
+    qobject_unref(resp);
+    qtest_quit(qts);
+
+    qts = qtest_init("-machine mac99 -cpu 970fx");
+    g_assert_false(machine_has_prop(qts, "x-ht-k2-layout"));
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -1203,6 +1349,12 @@ int main(int argc, char **argv)
     qtest_add_func("/u3-ht/ht-low-decode-regs", test_ht_low_decode_regs);
     qtest_add_func("/u3-ht/ht-low-mtree", test_ht_low_mtree);
     qtest_add_func("/u3-ht/ht-low-mac99", test_ht_low_mac99);
+    qtest_add_func("/u3-ht/k2-layout-dev3", test_k2_layout_dev3);
+    qtest_add_func("/u3-ht/k2-layout-dev1", test_k2_layout_dev1);
+    qtest_add_func("/u3-ht/k2-layout-dev1-5", test_k2_layout_dev1_5);
+    qtest_add_func("/u3-ht/k2-layout-secondary", test_k2_layout_secondary);
+    qtest_add_func("/u3-ht/k2-layout-bad", test_k2_layout_bad);
+    qtest_add_func("/u3-ht/k2-layout-mac99", test_k2_layout_mac99);
 
     return g_test_run();
 }
