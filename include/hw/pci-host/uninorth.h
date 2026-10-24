@@ -26,6 +26,7 @@
 #define UNINORTH_H
 
 #include "hw/pci/pci_host.h"
+#include "hw/pci/pci_bridge.h"
 #include "qom/object.h"
 
 /* UniNorth version */
@@ -113,6 +114,15 @@ void u3_agp_set_gart_exit_as(UNINHostState *s, AddressSpace *as);
 
 /* K2 HT-PCI bridge: the P2P bridge carrying the MacIO on a real 7,3 */
 #define TYPE_U3_HT_PCI_BRIDGE "u3-ht-pci-bridge"
+#define U3_HT_PCI_BRIDGE_DEVICE_ID 0x0045
+
+struct U3HTPCIBridgeState {
+    PCIBridge parent_obj;
+
+    /* x-device-id: the other K2 HT-PCI functions are 0x0046..0x0049 */
+    uint16_t device_id;
+};
+OBJECT_DECLARE_SIMPLE_TYPE(U3HTPCIBridgeState, U3_HT_PCI_BRIDGE)
 
 struct UNINState {
     SysBusDevice parent_obj;

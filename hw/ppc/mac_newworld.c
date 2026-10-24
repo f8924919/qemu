@@ -112,6 +112,25 @@ typedef enum {
     CORE99_VIA_CONFIG_PMU_ADB
 } Core99ViaConfig;
 
+
+/*
+ * x-ht-k2-layout: dev3 is the layout QEMU has always had.  A real boot
+ * ROM takes HT dev 1 to be a K2 HT-PCI bridge unless it is an AMD-8131,
+ * so dev1 moves the bridge there, and dev1-5 also fills dev 2..5 with
+ * the other K2 functions (0x0046..0x0049) as bridges with nothing behind.
+ */
+enum {
+    HT_K2_LAYOUT_DEV3,
+    HT_K2_LAYOUT_DEV1,
+    HT_K2_LAYOUT_DEV1_5,
+};
+
+static const char *const ht_k2_layout_names[] = {
+    [HT_K2_LAYOUT_DEV3] = "dev3",
+    [HT_K2_LAYOUT_DEV1] = "dev1",
+    [HT_K2_LAYOUT_DEV1_5] = "dev1-5",
+};
+
 struct Core99MachineState {
     /*< private >*/
     MachineState parent;
@@ -146,6 +165,8 @@ struct Core99MachineState {
     uint8_t u3_memctl_regs[U3_MEMCTL_SIZE];
     /* PowerMac7,3: the NMI line (GPIO 9) rests high (x-gpio9-idle-high) */
     bool gpio9_idle_high;
+    /* PowerMac7,3: where the K2 HT-PCI bridge sits (x-ht-k2-layout) */
+    int ht_k2_layout;
 };
 
 /*
@@ -736,12 +757,29 @@ static void ppc_core99_init(MachineState *machine)
         /*
          * K2 HT-PCI bridge at dev 3, carrying the MacIO on its
          * secondary bus at dev 7 (both devfns match the real 7,3:
-         * 0001:00:03.0 / 0001:01:07.0).
+         * 0001:00:03.0 / 0001:01:07.0).  x-ht-k2-layout moves it to
+         * dev 1 for a real boot ROM; the secondary bus stays ht.1.
          */
-        br = pci_new(PCI_DEVFN(3, 0), TYPE_U3_HT_PCI_BRIDGE);
+        br = pci_new(PCI_DEVFN(core99_machine->ht_k2_layout ==
+                               HT_K2_LAYOUT_DEV3 ? 3 : 1, 0),
+                     TYPE_U3_HT_PCI_BRIDGE);
         pci_bridge_map_irq(PCI_BRIDGE(br), "ht.1", NULL);
         pci_realize_and_unref(br, ht_bus, &error_fatal);
         k2_bus = pci_bridge_get_sec_bus(PCI_BRIDGE(br));
+
+        if (core99_machine->ht_k2_layout == HT_K2_LAYOUT_DEV1_5) {
+            static const char *const names[] = {
+                "ht.2", "ht.3", "ht.4", "ht.5",
+            };
+
+            for (i = 0; i < ARRAY_SIZE(names); i++) {
+                br = pci_new(PCI_DEVFN(2 + i, 0), TYPE_U3_HT_PCI_BRIDGE);
+                qdev_prop_set_uint16(DEVICE(br), "x-device-id",
+                                     U3_HT_PCI_BRIDGE_DEVICE_ID + 1 + i);
+                pci_bridge_map_irq(PCI_BRIDGE(br), names[i], NULL);
+                pci_realize_and_unref(br, ht_bus, &error_fatal);
+            }
+        }
     }
 
     /* MacIO */
@@ -1329,6 +1367,26 @@ static void powermac7_3_set_dbdma_devstat(Object *obj, bool value,
     CORE99_MACHINE(obj)->dbdma_devstat = value;
 }
 
+static char *powermac7_3_get_ht_k2_layout(Object *obj, Error **errp)
+{
+    return g_strdup(ht_k2_layout_names[CORE99_MACHINE(obj)->ht_k2_layout]);
+}
+
+static void powermac7_3_set_ht_k2_layout(Object *obj, const char *value,
+                                         Error **errp)
+{
+    Core99MachineState *cms = CORE99_MACHINE(obj);
+
+    for (int i = 0; i < ARRAY_SIZE(ht_k2_layout_names); i++) {
+        if (!strcmp(value, ht_k2_layout_names[i])) {
+            cms->ht_k2_layout = i;
+            return;
+        }
+    }
+    error_setg(errp, "Invalid x-ht-k2-layout value");
+    error_append_hint(errp, "Valid values are dev3, dev1, dev1-5.\n");
+}
+
 static char *powermac7_3_get_dart(Object *obj, Error **errp)
 {
     return g_strdup(OnOffAuto_str(CORE99_MACHINE(obj)->dart));
@@ -1463,6 +1521,15 @@ static void powermac7_3_machine_class_init(ObjectClass *oc, const void *data)
                                           "which a real boot ROM reads as a "
                                           "released NMI button (off by "
                                           "default)");
+    object_class_property_add_str(oc, "x-ht-k2-layout",
+                                  powermac7_3_get_ht_k2_layout,
+                                  powermac7_3_set_ht_k2_layout);
+    object_class_property_set_description(oc, "x-ht-k2-layout",
+                                          "Where the K2 HT-PCI bridge sits "
+                                          "on the HT bus: dev3 (the "
+                                          "default), dev1, or dev1-5 (dev 1 "
+                                          "plus empty bridges 0046-0049 at "
+                                          "dev 2-5), for a real boot ROM");
 }
 
 static void powermac7_3_instance_init(Object *obj)
@@ -1495,6 +1562,8 @@ static void powermac7_3_instance_init(Object *obj)
     cms->u3_memctl = false;
     /* Off: QEMU has always rested the NMI line low */
     cms->gpio9_idle_high = false;
+    /* dev3: where QEMU has always put the K2 HT-PCI bridge */
+    cms->ht_k2_layout = HT_K2_LAYOUT_DEV3;
 }
 
 static const TypeInfo powermac7_3_machine_info = {

@@ -842,8 +842,16 @@ static const TypeInfo u3_ht_pci_host_info = {
  */
 static void u3_ht_pci_bridge_realize(PCIDevice *dev, Error **errp)
 {
+    U3HTPCIBridgeState *s = U3_HT_PCI_BRIDGE(dev);
+
     pci_bridge_initfn(dev, TYPE_PCI_BUS);
+    pci_config_set_device_id(dev->config, s->device_id);
 }
+
+static const Property u3_ht_pci_bridge_props[] = {
+    DEFINE_PROP_UINT16("x-device-id", U3HTPCIBridgeState, device_id,
+                       U3_HT_PCI_BRIDGE_DEVICE_ID),
+};
 
 static void u3_ht_pci_bridge_class_init(ObjectClass *klass, const void *data)
 {
@@ -853,18 +861,19 @@ static void u3_ht_pci_bridge_class_init(ObjectClass *klass, const void *data)
     k->realize = u3_ht_pci_bridge_realize;
     k->exit = pci_bridge_exitfn;
     k->vendor_id = PCI_VENDOR_ID_APPLE;
-    k->device_id = 0x0045; /* K2 HT-PCI bridge */
+    k->device_id = U3_HT_PCI_BRIDGE_DEVICE_ID;
     k->revision = 0x00;
     k->config_write = pci_bridge_write_config;
     set_bit(DEVICE_CATEGORY_BRIDGE, dc->categories);
     device_class_set_legacy_reset(dc, pci_bridge_reset);
     dc->vmsd = &vmstate_pci_device;
+    device_class_set_props(dc, u3_ht_pci_bridge_props);
 }
 
 static const TypeInfo u3_ht_pci_bridge_info = {
     .name          = TYPE_U3_HT_PCI_BRIDGE,
     .parent        = TYPE_PCI_BRIDGE,
-    .instance_size = sizeof(PCIBridge),
+    .instance_size = sizeof(U3HTPCIBridgeState),
     .class_init    = u3_ht_pci_bridge_class_init,
     .interfaces = (const InterfaceInfo[]) {
         { INTERFACE_CONVENTIONAL_PCI_DEVICE },
