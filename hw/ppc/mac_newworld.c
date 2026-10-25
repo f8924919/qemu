@@ -167,6 +167,9 @@ struct Core99MachineState {
     bool gpio9_idle_high;
     /* PowerMac7,3: where the K2 HT-PCI bridge sits (x-ht-k2-layout) */
     int ht_k2_layout;
+    /* PowerMac7,3: ht.1 INTx as a real boot ROM maps them (x-ht-k2-rom-irq) */
+    bool ht_k2_rom_irq;
+    qemu_irq ht_k2_rom_irqs[3];
 };
 
 /*
@@ -274,6 +277,36 @@ static void ppc_core99_cpu_reset_line(void *opaque, int n, int level)
 }
 
 /* PowerPC Mac99 hardware initialisation */
+/*
+ * x-ht-k2-rom-irq: a real boot ROM's /ht/pci@1 interrupt-map sends dev 8
+ * to mpic 0x1b and dev 9 to 0x1c, looking at the slot only (its mask
+ * drops the function and the pin).  ht.1 then gets an IRQ routing of its
+ * own instead of the swizzle up to the HT root: line 0 and 1 for dev 8
+ * and 9, line 2 for anything else, which goes nowhere.  This puts set_irq
+ * on a bus that is not a root bus, so pci_device_route_intx_to_irq(),
+ * which climbs to the root, does not see it; the U3 HT root has no
+ * route_intx_to_irq anyway.
+ */
+static int ht_k2_rom_irq_map(PCIDevice *pci_dev, int irq_num)
+{
+    switch (PCI_SLOT(pci_dev->devfn)) {
+    case 8:
+        return 0;
+    case 9:
+        return 1;
+    default:
+        return 2;
+    }
+}
+
+static void ht_k2_rom_irq_set(void *opaque, int irq_num, int level)
+{
+    Core99MachineState *cms = opaque;
+
+    trace_ht_k2_rom_irq(irq_num, level);
+    qemu_set_irq(cms->ht_k2_rom_irqs[irq_num], level);
+}
+
 static void ppc_core99_init(MachineState *machine)
 {
     Core99MachineState *core99_machine = CORE99_MACHINE(machine);
@@ -763,7 +796,9 @@ static void ppc_core99_init(MachineState *machine)
         br = pci_new(PCI_DEVFN(core99_machine->ht_k2_layout ==
                                HT_K2_LAYOUT_DEV3 ? 3 : 1, 0),
                      TYPE_U3_HT_PCI_BRIDGE);
-        pci_bridge_map_irq(PCI_BRIDGE(br), "ht.1", NULL);
+        pci_bridge_map_irq(PCI_BRIDGE(br), "ht.1",
+                           core99_machine->ht_k2_rom_irq ?
+                           ht_k2_rom_irq_map : NULL);
         pci_realize_and_unref(br, ht_bus, &error_fatal);
         k2_bus = pci_bridge_get_sec_bus(PCI_BRIDGE(br));
 
@@ -870,9 +905,20 @@ static void ppc_core99_init(MachineState *machine)
          */
         sysbus_mmio_map_overlap(SYS_BUS_DEVICE(pic_dev), 0, 0xf8040000, 0);
     }
-    for (i = 0; i < 4; i++) {
+    /*
+     * With x-ht-k2-rom-irq the AGP INTx stay unconnected: ht.1 dev 8 and
+     * 9 take 0x1b and 0x1c, and the boot ROM's AGP interrupt-map has the
+     * slot only.  The flag is never set on mac99.
+     */
+    for (i = 0; !core99_machine->ht_k2_rom_irq && i < 4; i++) {
         qdev_connect_gpio_out(uninorth_pci_dev, i,
                               qdev_get_gpio_in(pic_dev, 0x1b + i));
+    }
+    if (core99_machine->ht_k2_rom_irq && k2_bus) {
+        core99_machine->ht_k2_rom_irqs[0] = qdev_get_gpio_in(pic_dev, 0x1b);
+        core99_machine->ht_k2_rom_irqs[1] = qdev_get_gpio_in(pic_dev, 0x1c);
+        pci_bus_irqs(k2_bus, ht_k2_rom_irq_set, core99_machine,
+                     ARRAY_SIZE(core99_machine->ht_k2_rom_irqs));
     }
     if (core99_machine->has_u3_ht) {
         /* Must match the AGP slot entry of the firmware's interrupt-map */
@@ -1361,6 +1407,17 @@ static void powermac7_3_set_gpio9_idle_high(Object *obj, bool value,
     CORE99_MACHINE(obj)->gpio9_idle_high = value;
 }
 
+static bool powermac7_3_get_ht_k2_rom_irq(Object *obj, Error **errp)
+{
+    return CORE99_MACHINE(obj)->ht_k2_rom_irq;
+}
+
+static void powermac7_3_set_ht_k2_rom_irq(Object *obj, bool value,
+                                          Error **errp)
+{
+    CORE99_MACHINE(obj)->ht_k2_rom_irq = value;
+}
+
 static void powermac7_3_set_dbdma_devstat(Object *obj, bool value,
                                           Error **errp)
 {
@@ -1530,6 +1587,18 @@ static void powermac7_3_machine_class_init(ObjectClass *oc, const void *data)
                                           "default), dev1, or dev1-5 (dev 1 "
                                           "plus empty bridges 0046-0049 at "
                                           "dev 2-5), for a real boot ROM");
+    object_class_property_add_bool(oc, "x-ht-k2-rom-irq",
+                                   powermac7_3_get_ht_k2_rom_irq,
+                                   powermac7_3_set_ht_k2_rom_irq);
+    object_class_property_set_description(oc, "x-ht-k2-rom-irq",
+                                          "Route ht.1 dev 8 and 9 INTx to "
+                                          "mpic 0x1b and 0x1c as a real "
+                                          "boot ROM's interrupt-map does, "
+                                          "leave other ht.1 devices and "
+                                          "the AGP bus INTx unconnected "
+                                          "(off by default). For running a "
+                                          "real boot ROM with -bios; do not "
+                                          "use it with OpenBIOS");
 }
 
 static void powermac7_3_instance_init(Object *obj)
