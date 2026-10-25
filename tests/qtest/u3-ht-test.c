@@ -16,6 +16,7 @@
 #include "qemu/bswap.h"
 #include "libqtest.h"
 #include "qobject/qdict.h"
+#include "qobject/qlist.h"
 #include "hw/pci/pci_regs.h"
 
 #define U3_HT_SELF_BASE   0xf8070000ULL
@@ -1293,6 +1294,241 @@ static void test_k2_layout_mac99(void)
     qtest_quit(qts);
 }
 
+/*
+ * x-ht-k2-rom-irq: where a device's INTx lands on the mpic.  The device is
+ * a pci-ohci whose root hub status change interrupt the test raises and
+ * clears by register writes, so the level follows the test exactly.  The
+ * mpic inputs are intercepted, and every one of them is compared against
+ * the single input expected to move.
+ */
+#define OHCI_IRQ_BAR_HT     (U3_HT_MEM_BASE + 0x100000)
+#define OHCI_IRQ_BAR_HT2    (U3_HT_MEM_BASE + 0x900000)
+#define OHCI_IRQ_BAR_AGP    0x90000000ULL
+#define HC_INTR_STATUS      0x0c
+#define HC_INTR_ENABLE      0x10
+#define HC_RH_STATUS        0x50
+#define HC_INTR_MIE         (1u << 31)
+#define HC_INTR_RHSC        (1u << 6)
+#define HC_RHS_DRWE         (1u << 15)
+#define MPIC_WATCHED        0x40
+#define NO_IRQ              (-1)
+
+typedef enum {
+    ON_HT1,         /* behind the K2 bridge */
+    ON_HT2,         /* behind the first empty bridge of dev1-5 */
+    ON_HT_ROOT,
+    ON_AGP,
+} OhciBus;
+
+static void ohci_irq_intercept(QTestState *qts)
+{
+    QDict *resp = qtest_qmp(qts, "{ 'execute': 'qom-list', 'arguments': "
+                            "{ 'path': '/machine/unattached' } }");
+    QList *list = qdict_get_qlist(resp, "return");
+    const QListEntry *e;
+    g_autofree char *path = NULL;
+
+    QLIST_FOREACH_ENTRY(list, e) {
+        QDict *d = qobject_to(QDict, qlist_entry_obj(e));
+
+        if (!strcmp(qdict_get_str(d, "type"), "child<macio-k2>")) {
+            path = g_strdup_printf("/machine/unattached/%s/pic",
+                                   qdict_get_str(d, "name"));
+        }
+    }
+    qobject_unref(resp);
+    g_assert_nonnull(path);
+    qtest_irq_intercept_in(qts, path);
+}
+
+static uint64_t ohci_irq_setup(QTestState *qts, OhciBus bus, int k2_dev,
+                               int devfn)
+{
+    uint64_t k2 = U3_HT_CFG_BASE + CFA0(k2_dev << 3, 0);
+    uint64_t bar, cfg;
+
+    switch (bus) {
+    case ON_HT1:
+        qtest_writeb(qts, k2 + 0x18, 0);
+        qtest_writeb(qts, k2 + 0x19, 1);
+        qtest_writeb(qts, k2 + 0x1a, 1);
+        cfg_writew(qts, k2 + 0x20, 0xfa00);
+        cfg_writew(qts, k2 + 0x22, 0xfa70);
+        cfg_writew(qts, k2 + 4, PCI_COMMAND_MEMORY);
+        bar = OHCI_IRQ_BAR_HT;
+        cfg = U3_HT_CFG_BASE + CFA1(1, devfn, 0);
+        break;
+    case ON_HT2: {
+        uint64_t br = U3_HT_CFG_BASE + CFA0(2 << 3, 0);
+
+        qtest_writeb(qts, br + 0x18, 0);
+        qtest_writeb(qts, br + 0x19, 2);
+        qtest_writeb(qts, br + 0x1a, 2);
+        cfg_writew(qts, br + 0x20, 0xfa80);
+        cfg_writew(qts, br + 0x22, 0xfaf0);
+        cfg_writew(qts, br + 4, PCI_COMMAND_MEMORY);
+        bar = OHCI_IRQ_BAR_HT2;
+        cfg = U3_HT_CFG_BASE + CFA1(2, devfn, 0);
+        break;
+    }
+    case ON_HT_ROOT:
+        bar = OHCI_IRQ_BAR_HT;
+        cfg = U3_HT_CFG_BASE + CFA0(devfn, 0);
+        break;
+    case ON_AGP:
+        agp_cfg_writel(qts, devfn >> 3, PCI_BASE_ADDRESS_0, OHCI_IRQ_BAR_AGP);
+        agp_cfg_writel(qts, devfn >> 3, PCI_COMMAND, PCI_COMMAND_MEMORY);
+        return OHCI_IRQ_BAR_AGP;
+    default:
+        g_assert_not_reached();
+    }
+    cfg_writel(qts, cfg + PCI_BASE_ADDRESS_0, (uint32_t)bar);
+    cfg_writew(qts, cfg + PCI_COMMAND, PCI_COMMAND_MEMORY);
+    return bar;
+}
+
+static void check_mpic(QTestState *qts, int want, int level)
+{
+    for (int n = 0; n < MPIC_WATCHED; n++) {
+        g_assert_cmpint(qtest_get_irq(qts, n), ==, n == want ? level : 0);
+    }
+}
+
+/*
+ * Raise and clear the OHCI's INTx, with the mpic input that has to follow
+ * it (NO_IRQ: none may move).
+ */
+static void check_ohci_irq(const char *args, OhciBus bus, int k2_dev,
+                           int devfn, int want)
+{
+    QTestState *qts = qtest_init(args);
+    uint64_t bar;
+
+    ohci_irq_intercept(qts);
+    bar = ohci_irq_setup(qts, bus, k2_dev, devfn);
+    check_mpic(qts, NO_IRQ, 0);
+
+    qtest_writel(qts, bar + HC_INTR_ENABLE,
+                 bswap32(HC_INTR_MIE | HC_INTR_RHSC));
+    qtest_writel(qts, bar + HC_RH_STATUS, bswap32(HC_RHS_DRWE));
+    g_assert_cmphex(bswap32(qtest_readl(qts, bar + HC_INTR_STATUS)) &
+                    HC_INTR_RHSC, ==, HC_INTR_RHSC);
+    check_mpic(qts, want, 1);
+
+    qtest_writel(qts, bar + HC_INTR_STATUS, bswap32(HC_INTR_RHSC));
+    check_mpic(qts, NO_IRQ, 0);
+
+    qtest_quit(qts);
+}
+
+#define ROM_IRQ_ARGS(layout, rom, dev) \
+    "-machine powermac7_3,usb=off,x-ht-k2-layout=" layout \
+    ",x-ht-k2-rom-irq=" rom " -vga none " dev
+
+/* Off: the swizzle and the HT root's (pin + dev) & 3 onto 0x1f + line */
+static void test_k2_rom_irq_off(void)
+{
+    /* dev3: K2 at HT dev 3 */
+    check_ohci_irq(ROM_IRQ_ARGS("dev3", "off",
+                                "-device pci-ohci,bus=ht.1,addr=8"),
+                   ON_HT1, 3, 8 << 3, 0x22);
+    check_ohci_irq(ROM_IRQ_ARGS("dev3", "off",
+                                "-device pci-ohci,bus=ht.1,addr=9"),
+                   ON_HT1, 3, 9 << 3, 0x1f);
+    /* dev1-5: K2 at HT dev 1 */
+    check_ohci_irq(ROM_IRQ_ARGS("dev1-5", "off",
+                                "-device pci-ohci,bus=ht.1,addr=8"),
+                   ON_HT1, 1, 8 << 3, 0x20);
+    check_ohci_irq(ROM_IRQ_ARGS("dev1-5", "off",
+                                "-device pci-ohci,bus=ht.1,addr=9"),
+                   ON_HT1, 1, 9 << 3, 0x21);
+    check_ohci_irq(ROM_IRQ_ARGS("dev1-5", "off",
+                                "-device pci-ohci,bus=ht.1,addr=0xd"),
+                   ON_HT1, 1, 0xd << 3, 0x21);
+    /* the AGP bus: (pin + dev) & 3 onto 0x1b + line */
+    check_ohci_irq(ROM_IRQ_ARGS("dev1-5", "off",
+                                "-device pci-ohci,bus=pci.1,addr=0x12"),
+                   ON_AGP, 1, 0x12 << 3, 0x1d);
+}
+
+/*
+ * On: ht.1 dev 8 and 9 go where the boot ROM's /ht/pci@1 interrupt-map
+ * sends them, whatever the function; other ht.1 devices and the AGP bus
+ * are left unconnected; the HT root, ht.2 and the AGP slot are untouched.
+ */
+static void test_k2_rom_irq_on(void)
+{
+    static const char *const layouts[] = { "dev3", "dev1", "dev1-5" };
+
+    for (int i = 0; i < ARRAY_SIZE(layouts); i++) {
+        int k2_dev = strcmp(layouts[i], "dev3") ? 1 : 3;
+        g_autofree char *a8 = g_strdup_printf(
+            "-machine powermac7_3,usb=off,x-ht-k2-layout=%s,"
+            "x-ht-k2-rom-irq=on -vga none -device pci-ohci,bus=ht.1,addr=8",
+            layouts[i]);
+        g_autofree char *a9 = g_strdup_printf(
+            "-machine powermac7_3,usb=off,x-ht-k2-layout=%s,"
+            "x-ht-k2-rom-irq=on -vga none -device pci-ohci,bus=ht.1,addr=9",
+            layouts[i]);
+
+        check_ohci_irq(a8, ON_HT1, k2_dev, 8 << 3, 0x1b);
+        check_ohci_irq(a9, ON_HT1, k2_dev, 9 << 3, 0x1c);
+    }
+    check_ohci_irq(ROM_IRQ_ARGS("dev1-5", "on",
+                                "-device pci-ohci,bus=ht.1,addr=8.0,"
+                                "multifunction=on "
+                                "-device pci-ohci,bus=ht.1,addr=8.1"),
+                   ON_HT1, 1, (8 << 3) | 1, 0x1b);
+    check_ohci_irq(ROM_IRQ_ARGS("dev1-5", "on",
+                                "-device pci-ohci,bus=ht.1,addr=0xd"),
+                   ON_HT1, 1, 0xd << 3, NO_IRQ);
+    check_ohci_irq(ROM_IRQ_ARGS("dev1-5", "on",
+                                "-device pci-ohci,bus=pci.1,addr=0x12"),
+                   ON_AGP, 1, 0x12 << 3, NO_IRQ);
+    check_ohci_irq(ROM_IRQ_ARGS("dev1-5", "on",
+                                "-device pci-ohci,bus=pci.1,addr=0x10"),
+                   ON_AGP, 1, 0x10 << 3, 0x30);
+    check_ohci_irq(ROM_IRQ_ARGS("dev1-5", "on",
+                                "-device pci-ohci,bus=pci.0,addr=0x12"),
+                   ON_HT_ROOT, 1, 0x12 << 3, 0x21);
+    check_ohci_irq(ROM_IRQ_ARGS("dev1-5", "on",
+                                "-device pci-ohci,bus=ht.2,addr=1"),
+                   ON_HT2, 1, 1 << 3, 0x22);
+}
+
+/* The default usb=on controller sits on the AGP bus with nothing behind */
+static void test_k2_rom_irq_agp_usb(void)
+{
+    check_ohci_irq("-machine powermac7_3,x-ht-k2-layout=dev1-5,"
+                   "x-ht-k2-rom-irq=on -vga none",
+                   ON_AGP, 1, 0xc << 3, NO_IRQ);
+    check_ohci_irq("-machine powermac7_3,x-ht-k2-layout=dev1-5 -vga none",
+                   ON_AGP, 1, 0xc << 3, 0x1b);
+}
+
+static void test_k2_rom_irq_prop(void)
+{
+    QTestState *qts = qtest_init("-machine powermac7_3");
+    QDict *resp = qtest_qmp(qts, "{ 'execute': 'qom-get', 'arguments': "
+                            "{ 'path': '/machine', "
+                            "'property': 'x-ht-k2-rom-irq' } }");
+
+    g_assert_false(qdict_get_bool(resp, "return"));
+    qobject_unref(resp);
+    qtest_quit(qts);
+
+    qts = qtest_init("-machine powermac7_3,x-ht-k2-rom-irq=on");
+    resp = qtest_qmp(qts, "{ 'execute': 'qom-get', 'arguments': "
+                     "{ 'path': '/machine', 'property': 'x-ht-k2-rom-irq' } }");
+    g_assert_true(qdict_get_bool(resp, "return"));
+    qobject_unref(resp);
+    qtest_quit(qts);
+
+    qts = qtest_init("-machine mac99 -cpu 970fx");
+    g_assert_false(machine_has_prop(qts, "x-ht-k2-rom-irq"));
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -1355,6 +1591,10 @@ int main(int argc, char **argv)
     qtest_add_func("/u3-ht/k2-layout-secondary", test_k2_layout_secondary);
     qtest_add_func("/u3-ht/k2-layout-bad", test_k2_layout_bad);
     qtest_add_func("/u3-ht/k2-layout-mac99", test_k2_layout_mac99);
+    qtest_add_func("/u3-ht/k2-rom-irq-off", test_k2_rom_irq_off);
+    qtest_add_func("/u3-ht/k2-rom-irq-on", test_k2_rom_irq_on);
+    qtest_add_func("/u3-ht/k2-rom-irq-agp-usb", test_k2_rom_irq_agp_usb);
+    qtest_add_func("/u3-ht/k2-rom-irq-prop", test_k2_rom_irq_prop);
 
     return g_test_run();
 }
