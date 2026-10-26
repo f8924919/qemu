@@ -1529,6 +1529,101 @@ static void test_k2_rom_irq_prop(void)
     qtest_quit(qts);
 }
 
+/*
+ * x-u3-reg60-nonzero=on makes the U3 register at +0x60 read 1.  A real
+ * boot ROM sends a CPU to sleep when it reads 0 there.  The other U3
+ * registers must read the same with the switch on and off.
+ */
+#define UNIN_OFF_REG50      0x50
+#define UNIN_OFF_REG60      0x60
+#define UNIN_OFF_REG70      0x70
+
+static void unin_regs(const char *args, uint32_t *ver, uint32_t *r50,
+                      uint32_t *r60, uint32_t *r70)
+{
+    QTestState *qts = qtest_init(args);
+
+    *ver = qtest_readl(qts, UNIN_BASE);
+    *r50 = qtest_readl(qts, UNIN_BASE + UNIN_OFF_REG50);
+    *r60 = qtest_readl(qts, UNIN_BASE + UNIN_OFF_REG60);
+    *r70 = qtest_readl(qts, UNIN_BASE + UNIN_OFF_REG70);
+    qtest_quit(qts);
+}
+
+static void test_reg60_off(void)
+{
+    uint32_t ver, r50, r60, r70;
+
+    unin_regs("-machine powermac7_3", &ver, &r50, &r60, &r70);
+    g_assert_cmphex(ver, ==, UNIN_VERSION_U3);
+    g_assert_cmphex(r50, ==, 0);
+    g_assert_cmphex(r60, ==, 0);
+    g_assert_cmphex(r70, ==, 0);
+}
+
+static void test_reg60_on(void)
+{
+    uint32_t ver, r50, r60, r70;
+    uint32_t over, o50, o60, o70;
+
+    unin_regs("-machine powermac7_3", &over, &o50, &o60, &o70);
+    unin_regs("-machine powermac7_3,x-u3-reg60-nonzero=on",
+              &ver, &r50, &r60, &r70);
+    g_assert_cmphex(r60, ==, 1);
+    g_assert_cmphex(ver, ==, over);
+    g_assert_cmphex(r50, ==, o50);
+    g_assert_cmphex(r70, ==, o70);
+}
+
+static void test_reg60_write(void)
+{
+    QTestState *qts = qtest_init("-machine powermac7_3,"
+                                 "x-u3-reg60-nonzero=on");
+
+    /* Writes are still dropped: the register keeps reading 1 */
+    qtest_writel(qts, UNIN_BASE + UNIN_OFF_REG60, 0);
+    g_assert_cmphex(qtest_readl(qts, UNIN_BASE + UNIN_OFF_REG60), ==, 1);
+    qtest_writel(qts, UNIN_BASE + UNIN_OFF_REG60, 0x12345678);
+    g_assert_cmphex(qtest_readl(qts, UNIN_BASE + UNIN_OFF_REG60), ==, 1);
+    qtest_quit(qts);
+}
+
+static void test_reg60_smp2(void)
+{
+    QTestState *qts = qtest_init("-machine powermac7_3,"
+                                 "x-u3-reg60-nonzero=on -smp 2");
+
+    /* The value does not depend on which CPU reads it */
+    g_assert_cmphex(qtest_readl(qts, UNIN_BASE + UNIN_OFF_REG60), ==, 1);
+    qtest_quit(qts);
+}
+
+static void test_reg60_prop(void)
+{
+    QTestState *qts = qtest_init("-machine powermac7_3");
+    QDict *resp = qtest_qmp(qts, "{ 'execute': 'qom-get', 'arguments': "
+                            "{ 'path': '/machine', "
+                            "'property': 'x-u3-reg60-nonzero' } }");
+
+    g_assert_false(qdict_get_bool(resp, "return"));
+    qobject_unref(resp);
+    qtest_quit(qts);
+
+    qts = qtest_init("-machine powermac7_3,x-u3-reg60-nonzero=on");
+    resp = qtest_qmp(qts, "{ 'execute': 'qom-get', 'arguments': "
+                     "{ 'path': '/machine', "
+                     "'property': 'x-u3-reg60-nonzero' } }");
+    g_assert_true(qdict_get_bool(resp, "return"));
+    qobject_unref(resp);
+    qtest_quit(qts);
+
+    qts = qtest_init("-machine mac99 -cpu 970fx");
+    g_assert_false(machine_has_prop(qts, "x-u3-reg60-nonzero"));
+    /* mac99's UniNorth keeps reading 0 there */
+    g_assert_cmphex(qtest_readl(qts, UNIN_BASE + UNIN_OFF_REG60), ==, 0);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -1595,6 +1690,11 @@ int main(int argc, char **argv)
     qtest_add_func("/u3-ht/k2-rom-irq-on", test_k2_rom_irq_on);
     qtest_add_func("/u3-ht/k2-rom-irq-agp-usb", test_k2_rom_irq_agp_usb);
     qtest_add_func("/u3-ht/k2-rom-irq-prop", test_k2_rom_irq_prop);
+    qtest_add_func("/u3-ht/reg60-off", test_reg60_off);
+    qtest_add_func("/u3-ht/reg60-on", test_reg60_on);
+    qtest_add_func("/u3-ht/reg60-write", test_reg60_write);
+    qtest_add_func("/u3-ht/reg60-smp2", test_reg60_smp2);
+    qtest_add_func("/u3-ht/reg60-prop", test_reg60_prop);
 
     return g_test_run();
 }
