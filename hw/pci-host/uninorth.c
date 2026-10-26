@@ -1056,6 +1056,13 @@ static uint64_t unin_read(void *opaque, hwaddr addr, unsigned size)
     case 0:
         value = s->version;
         break;
+    case 0x60:
+        /*
+         * A real boot ROM puts the CPU to sleep when this reads 0.  What
+         * the register means is unknown: it is not in Linux's uninorth.h.
+         */
+        value = s->reg60_nonzero ? 1 : 0;
+        break;
     default:
         value = 0;
     }
@@ -1088,6 +1095,7 @@ static void unin_init(Object *obj)
  */
 static const Property unin_properties[] = {
     DEFINE_PROP_UINT32("version", UNINState, version, UNINORTH_VERSION_10A),
+    DEFINE_PROP_BOOL("x-reg60-nonzero", UNINState, reg60_nonzero, false),
 };
 
 static void unin_class_init(ObjectClass *klass, const void *data)

@@ -172,6 +172,8 @@ struct Core99MachineState {
     qemu_irq ht_k2_rom_irqs[3];
     /* PowerMac7,3: leave the MacIO GPIO CPU reset lines unconnected */
     bool no_gpio_cpu_reset;
+    /* PowerMac7,3: the U3 register at +0x60 reads 1 (x-u3-reg60-nonzero) */
+    bool u3_reg60_nonzero;
 };
 
 /*
@@ -561,6 +563,8 @@ static void ppc_core99_init(MachineState *machine)
          * "thread_invoke: preemption_level 1".
          */
         qdev_prop_set_uint32(dev, "version", UNINORTH_VERSION_U3);
+        qdev_prop_set_bit(dev, "x-reg60-nonzero",
+                          core99_machine->u3_reg60_nonzero);
     }
     s = SYS_BUS_DEVICE(dev);
     sysbus_realize_and_unref(s, &error_fatal);
@@ -1435,6 +1439,17 @@ static void powermac7_3_set_no_gpio_cpu_reset(Object *obj, bool value,
     CORE99_MACHINE(obj)->no_gpio_cpu_reset = value;
 }
 
+static bool powermac7_3_get_u3_reg60_nonzero(Object *obj, Error **errp)
+{
+    return CORE99_MACHINE(obj)->u3_reg60_nonzero;
+}
+
+static void powermac7_3_set_u3_reg60_nonzero(Object *obj, bool value,
+                                             Error **errp)
+{
+    CORE99_MACHINE(obj)->u3_reg60_nonzero = value;
+}
+
 static void powermac7_3_set_dbdma_devstat(Object *obj, bool value,
                                           Error **errp)
 {
@@ -1628,6 +1643,16 @@ static void powermac7_3_machine_class_init(ObjectClass *oc, const void *data)
                                           "-bios; do not use it with "
                                           "OpenBIOS, which then cannot start "
                                           "the second CPU");
+    object_class_property_add_bool(oc, "x-u3-reg60-nonzero",
+                                   powermac7_3_get_u3_reg60_nonzero,
+                                   powermac7_3_set_u3_reg60_nonzero);
+    object_class_property_set_description(oc, "x-u3-reg60-nonzero",
+                                          "Let the U3 register at +0x60 "
+                                          "read 1 instead of 0; a real boot "
+                                          "ROM puts the CPU to sleep when "
+                                          "it reads 0 (off by default). "
+                                          "Every CPU reads the same value; "
+                                          "only tested with -smp 1");
 }
 
 static void powermac7_3_instance_init(Object *obj)
@@ -1664,6 +1689,8 @@ static void powermac7_3_instance_init(Object *obj)
     cms->ht_k2_layout = HT_K2_LAYOUT_DEV3;
     /* Off: OpenBIOS and Linux start the second CPU through these lines */
     cms->no_gpio_cpu_reset = false;
+    /* Off: QEMU has always read 0 there */
+    cms->u3_reg60_nonzero = false;
 }
 
 static const TypeInfo powermac7_3_machine_info = {

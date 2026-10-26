@@ -128,6 +128,8 @@ struct UNINState {
     SysBusDevice parent_obj;
 
     uint32_t version;
+    /* x-reg60-nonzero: +0x60 reads 1, which a real boot ROM wants */
+    bool reg60_nonzero;
     MemoryRegion mem;
 };
 
