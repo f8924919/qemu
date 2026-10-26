@@ -170,6 +170,8 @@ struct Core99MachineState {
     /* PowerMac7,3: ht.1 INTx as a real boot ROM maps them (x-ht-k2-rom-irq) */
     bool ht_k2_rom_irq;
     qemu_irq ht_k2_rom_irqs[3];
+    /* PowerMac7,3: leave the MacIO GPIO CPU reset lines unconnected */
+    bool no_gpio_cpu_reset;
 };
 
 /*
@@ -879,9 +881,13 @@ static void ppc_core99_init(MachineState *machine)
     /*
      * Hook the KeyLargo CPU reset lines up to the processors they name.
      * MacIO only grows them when it has a PMU, which is what carries the
-     * GPIO controller.
+     * GPIO controller.  These are Linux's KL_GPIO_RESET_CPUn, which the
+     * soft-reset property OpenBIOS writes points at.  A real PowerMac G5
+     * boot ROM names GPIO 3 and 4 codec-input-data-mux and
+     * line-input-detect and Mac OS X drives them as such, so with
+     * x-no-gpio-cpu-reset they stay plain registers.
      */
-    if (has_pmu) {
+    if (has_pmu && !core99_machine->no_gpio_cpu_reset) {
         CPUState *cs;
 
         CPU_FOREACH(cs) {
@@ -1418,6 +1424,17 @@ static void powermac7_3_set_ht_k2_rom_irq(Object *obj, bool value,
     CORE99_MACHINE(obj)->ht_k2_rom_irq = value;
 }
 
+static bool powermac7_3_get_no_gpio_cpu_reset(Object *obj, Error **errp)
+{
+    return CORE99_MACHINE(obj)->no_gpio_cpu_reset;
+}
+
+static void powermac7_3_set_no_gpio_cpu_reset(Object *obj, bool value,
+                                              Error **errp)
+{
+    CORE99_MACHINE(obj)->no_gpio_cpu_reset = value;
+}
+
 static void powermac7_3_set_dbdma_devstat(Object *obj, bool value,
                                           Error **errp)
 {
@@ -1599,6 +1616,18 @@ static void powermac7_3_machine_class_init(ObjectClass *oc, const void *data)
                                           "(off by default). For running a "
                                           "real boot ROM with -bios; do not "
                                           "use it with OpenBIOS");
+    object_class_property_add_bool(oc, "x-no-gpio-cpu-reset",
+                                   powermac7_3_get_no_gpio_cpu_reset,
+                                   powermac7_3_set_no_gpio_cpu_reset);
+    object_class_property_set_description(oc, "x-no-gpio-cpu-reset",
+                                          "Leave the MacIO GPIO CPU reset "
+                                          "lines (GPIO 3 and 4) unconnected, "
+                                          "as a real boot ROM's tree uses "
+                                          "them for audio (off by default). "
+                                          "For running a real boot ROM with "
+                                          "-bios; do not use it with "
+                                          "OpenBIOS, which then cannot start "
+                                          "the second CPU");
 }
 
 static void powermac7_3_instance_init(Object *obj)
@@ -1633,6 +1662,8 @@ static void powermac7_3_instance_init(Object *obj)
     cms->gpio9_idle_high = false;
     /* dev3: where QEMU has always put the K2 HT-PCI bridge */
     cms->ht_k2_layout = HT_K2_LAYOUT_DEV3;
+    /* Off: OpenBIOS and Linux start the second CPU through these lines */
+    cms->no_gpio_cpu_reset = false;
 }
 
 static const TypeInfo powermac7_3_machine_info = {
