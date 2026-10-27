@@ -11,7 +11,9 @@
  *    rather than through a timer.
  *  - Darwin's AppleI2C (PPCI2CInterface) drives the same registers for
  *    MacRISC4CPU::enableCPUTimeBase(), which read-modify-writes register
- *    0x2e of the clock chip at 8-bit address 0xd2.
+ *    0x2e of the clock chip at 8-bit address 0xd2 -- or, when the device
+ *    tree names a CY28508 as a real PowerMac7,2 Boot ROM does, register
+ *    0x81 at 8-bit address 0xd0 (x-rom-smp puts a chip there).
  *
  * The failure mode that matters is a hang, not a wrong value: if a read
  * never completes, Darwin's MacRISC4CPU::startCPU() spins forever waiting
@@ -52,6 +54,7 @@ static uint64_t kw_base = KW_I2C_BASE;
 #define KW_MACHINE_DUMB   "-machine powermac7_3,x-u3-i2c-dumb=on"
 #define KW_MACHINE_DUMB_SPD \
     "-machine powermac7_3,x-u3-i2c-dumb=on,x-u3-i2c-spd=on"
+#define KW_MACHINE_ROM_SMP "-machine powermac7_3,x-rom-smp=on"
 static const char *kw_machine = KW_MACHINE;
 
 /*
@@ -99,6 +102,16 @@ static uint8_t kw_chan;
  */
 #define HWCLOCK_ADDR8     0xd2
 #define HWCLOCK_REG       0x2e
+
+/*
+ * The CY28508 that a PowerMac7,2 Boot ROM describes at the same node.
+ * Darwin's and Linux's drivers both ignore the node's reg for it and use
+ * 8-bit 0xd0, register 0x81, mask 0x0c: 0x0c lets the timebase run, 0x00
+ * stops it.
+ */
+#define CYPRESS_ADDR8     0xd0
+#define CYPRESS_REG       0x81
+#define CYPRESS_MASK      0x0c
 
 /*
  * Both guests only ever read-modify-write this register, so the reset value
@@ -253,15 +266,15 @@ static void test_hwclock_roundtrip(void)
 
     orig = i2c_read_sub(qts, HWCLOCK_ADDR8, HWCLOCK_REG);
 
-    /* Pulsar: mask 0x77, freeze 0x22 -- the value Linux and Darwin write. */
-    i2c_write_sub(qts, HWCLOCK_ADDR8, HWCLOCK_REG, (orig & ~0x77) | 0x22);
-    val = i2c_read_sub(qts, HWCLOCK_ADDR8, HWCLOCK_REG);
-    g_assert_cmphex(val & 0x77, ==, 0x22);
-
-    /* ... and unfreeze, which is what leaves the chip running. */
-    i2c_write_sub(qts, HWCLOCK_ADDR8, HWCLOCK_REG, (val & ~0x77) | 0x11);
+    /* Pulsar: mask 0x77, 0x11 stops the timebase -- what both guests write */
+    i2c_write_sub(qts, HWCLOCK_ADDR8, HWCLOCK_REG, (orig & ~0x77) | 0x11);
     val = i2c_read_sub(qts, HWCLOCK_ADDR8, HWCLOCK_REG);
     g_assert_cmphex(val & 0x77, ==, 0x11);
+
+    /* ... and 0x22 lets it run again, which is what the chip is left at. */
+    i2c_write_sub(qts, HWCLOCK_ADDR8, HWCLOCK_REG, (val & ~0x77) | 0x22);
+    val = i2c_read_sub(qts, HWCLOCK_ADDR8, HWCLOCK_REG);
+    g_assert_cmphex(val & 0x77, ==, 0x22);
 
     qtest_quit(qts);
 }
@@ -795,6 +808,108 @@ static const struct {
     { "/keywest-i2c/darwin-multi-byte-read", test_darwin_multi_byte_read },
 };
 
+/*
+ * Whether anything answers the 8-bit write address `addr8` on the channel
+ * in `chan` (already shifted into the mode register's top nibble).
+ */
+static bool i2c_addr_acked(QTestState *qts, uint8_t chan, uint8_t addr8)
+{
+    bool acked;
+
+    qtest_writeb(qts, KW_STATUS, 0);
+    qtest_writeb(qts, KW_MODE, KW_I2C_MODE_STANDARD | chan);
+    qtest_writeb(qts, KW_ADDR, addr8 & ~1);
+    qtest_writeb(qts, KW_CONTROL, KW_I2C_CTL_XADDR);
+
+    i2c_wait_isr(qts, KW_I2C_IRQ_ADDR);
+    acked = qtest_readb(qts, KW_STATUS) & KW_I2C_STAT_LAST_AAK;
+
+    qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_ADDR);
+    qtest_writeb(qts, KW_CONTROL, KW_I2C_CTL_STOP);
+    i2c_wait_isr(qts, KW_I2C_IRQ_STOP);
+    qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_STOP);
+    return acked;
+}
+
+/*
+ * x-rom-smp: Darwin brings the second CPU up only once the CY28508 has
+ * answered both of its read-modify-writes, so the round trip is the
+ * contract.  Done the way MacRISC4CPU::enableCPUTimeBase() does it: a
+ * combined-mode read, then a standard-sub write to the same register.
+ */
+static void test_rom_smp_cypress_roundtrip(void)
+{
+    QTestState *qts = qtest_init(KW_MACHINE_ROM_SMP);
+    uint8_t orig, val;
+
+    orig = i2c_read_sub(qts, CYPRESS_ADDR8, CYPRESS_REG);
+    i2c_write_sub(qts, CYPRESS_ADDR8, CYPRESS_REG, orig & ~CYPRESS_MASK);
+    val = i2c_read_sub(qts, CYPRESS_ADDR8, CYPRESS_REG);
+    g_assert_cmphex(val & CYPRESS_MASK, ==, 0x00);
+
+    i2c_write_sub(qts, CYPRESS_ADDR8, CYPRESS_REG,
+                  (val & ~CYPRESS_MASK) | 0x0c);
+    val = i2c_read_sub(qts, CYPRESS_ADDR8, CYPRESS_REG);
+    g_assert_cmphex(val & CYPRESS_MASK, ==, 0x0c);
+    qtest_quit(qts);
+}
+
+/* The two clock chips are two devices, not one answering twice */
+static void test_rom_smp_clocks_independent(void)
+{
+    QTestState *qts = qtest_init(KW_MACHINE_ROM_SMP);
+    uint8_t pulsar = i2c_read_sub(qts, HWCLOCK_ADDR8, HWCLOCK_REG);
+    uint8_t cypress = i2c_read_sub(qts, CYPRESS_ADDR8, CYPRESS_REG);
+
+    i2c_write_sub(qts, CYPRESS_ADDR8, HWCLOCK_REG, pulsar ^ 0x5a);
+    g_assert_cmphex(i2c_read_sub(qts, HWCLOCK_ADDR8, HWCLOCK_REG), ==, pulsar);
+    i2c_write_sub(qts, HWCLOCK_ADDR8, CYPRESS_REG, cypress ^ 0xa5);
+    g_assert_cmphex(i2c_read_sub(qts, CYPRESS_ADDR8, CYPRESS_REG), ==,
+                    cypress);
+    g_assert_cmphex(i2c_read_sub(qts, CYPRESS_ADDR8, HWCLOCK_REG), ==,
+                    pulsar ^ 0x5a);
+    qtest_quit(qts);
+}
+
+/*
+ * Only 0xd0 on channel 0 is added: the RackMac3,1 pulsar address next to
+ * it and the same address on channel 1 stay empty.  -smp 2 so that this
+ * also covers a machine with a second CPU; the other tests run with one.
+ */
+static void test_rom_smp_neighbours_nak(void)
+{
+    QTestState *qts = qtest_init(KW_MACHINE_ROM_SMP " -smp 2");
+
+    g_assert_true(i2c_addr_acked(qts, 0x00, CYPRESS_ADDR8));
+    g_assert_false(i2c_addr_acked(qts, 0x00, 0xd4));
+    g_assert_false(i2c_addr_acked(qts, 0x10, CYPRESS_ADDR8));
+    g_assert_true(i2c_addr_acked(qts, 0x00, HWCLOCK_ADDR8));
+    qtest_quit(qts);
+}
+
+/* Without the switch nothing answers at 0xd0, as before */
+static void test_rom_smp_off_cypress_naks(void)
+{
+    QTestState *qts = qtest_init(KW_MACHINE);
+
+    g_assert_false(i2c_addr_acked(qts, 0x00, CYPRESS_ADDR8));
+    g_assert_true(i2c_addr_acked(qts, 0x00, HWCLOCK_ADDR8));
+    qtest_quit(qts);
+}
+
+/* With the SPD EEPROMs on channel 1 too, neither side moves */
+static void test_rom_smp_with_spd(void)
+{
+    QTestState *qts = qtest_init(
+        "-machine powermac7_3,x-rom-smp=on,x-u3-i2c-spd=on");
+
+    g_assert_true(i2c_addr_acked(qts, 0x00, CYPRESS_ADDR8));
+    g_assert_false(i2c_addr_acked(qts, 0x10, CYPRESS_ADDR8));
+    g_assert_true(i2c_addr_acked(qts, 0x10, 0xa0));
+    g_assert_false(i2c_addr_acked(qts, 0x00, 0xa0));
+    qtest_quit(qts);
+}
+
 /* Run one of the byte-0 tests with the lane3 switch on. */
 static void test_byte0_with_lane3(gconstpointer data)
 {
@@ -822,6 +937,18 @@ static void test_byte0_with_spd(gconstpointer data)
 static void test_byte0_with_dumb(gconstpointer data)
 {
     kw_machine = KW_MACHINE_DUMB;
+    byte0_tests[GPOINTER_TO_UINT(data)].fn();
+    kw_machine = KW_MACHINE;
+}
+
+/*
+ * ... and with x-rom-smp on.  The second clock chip sits at 0xd0, which
+ * none of the byte-0 tests addresses, so the pulsar at 0xd2 and every NAK
+ * they expect must be unchanged.
+ */
+static void test_byte0_with_rom_smp(gconstpointer data)
+{
+    kw_machine = KW_MACHINE_ROM_SMP;
     byte0_tests[GPOINTER_TO_UINT(data)].fn();
     kw_machine = KW_MACHINE;
 }
@@ -1416,6 +1543,11 @@ int main(int argc, char **argv)
         path = g_strdup_printf("/keywest-i2c/dumb-on/%s",
                                byte0_tests[i].name + strlen("/keywest-i2c/"));
         qtest_add_data_func(path, GUINT_TO_POINTER(i), test_byte0_with_dumb);
+        g_free(path);
+        path = g_strdup_printf("/keywest-i2c/rom-smp-on/%s",
+                               byte0_tests[i].name + strlen("/keywest-i2c/"));
+        qtest_add_data_func(path, GUINT_TO_POINTER(i),
+                            test_byte0_with_rom_smp);
     }
     qtest_add_func("/keywest-i2c/mac99-has-no-i2c", test_mac99_has_no_i2c);
     qtest_add_func("/keywest-i2c/lane3-off-is-hole", test_lane3_off_is_hole);
@@ -1454,6 +1586,15 @@ int main(int argc, char **argv)
     qtest_add_func("/keywest-i2c/dumb-spd", test_dumb_spd);
     qtest_add_func("/keywest-i2c/transfer-keeps-its-channel",
                    test_transfer_keeps_its_channel);
+    qtest_add_func("/keywest-i2c/rom-smp-cypress-roundtrip",
+                   test_rom_smp_cypress_roundtrip);
+    qtest_add_func("/keywest-i2c/rom-smp-clocks-independent",
+                   test_rom_smp_clocks_independent);
+    qtest_add_func("/keywest-i2c/rom-smp-neighbours-nak",
+                   test_rom_smp_neighbours_nak);
+    qtest_add_func("/keywest-i2c/rom-smp-off-cypress-naks",
+                   test_rom_smp_off_cypress_naks);
+    qtest_add_func("/keywest-i2c/rom-smp-with-spd", test_rom_smp_with_spd);
 
     return g_test_run();
 }
