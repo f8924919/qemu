@@ -352,6 +352,7 @@ static void macio_newworld_realize(PCIDevice *d, Error **errp)
          * GPIO controller.
          */
         qdev_pass_gpios(DEVICE(&ns->gpio), DEVICE(s), "cpu-reset");
+        qdev_pass_gpios(DEVICE(&ns->gpio), DEVICE(s), "sreset");
 
         /* PMU */
         object_initialize_child(OBJECT(s), "pmu", &s->pmu, TYPE_VIA_PMU);

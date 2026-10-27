@@ -50,6 +50,13 @@ enum MacioGPIORegisterBits {
 static const int cpu_reset_gpio[MACIO_GPIO_RESET_CPU_CNT] = { 3, 4, 15, 16 };
 
 /*
+ * ~sreset0 and ~sreset1, as gpio_regs[] indices: mac-io byte 0x71 and 0x72,
+ * which is where a real PowerMac G5 boot ROM expects the processor soft
+ * resets.  The board only wires them up for x-rom-smp.
+ */
+static const int sreset_gpio[MACIO_GPIO_SRESET_CNT] = { 25, 26 };
+
+/*
  * A CPU reset line is active low: the guest drives it low to hold the
  * processor in reset and lets it float back high to release it.  Driving
  * low means enabling the output with a zero data bit, which is exactly what
@@ -120,6 +127,17 @@ void macio_set_gpio(MacIOGPIOState *s, uint32_t gpio, bool state)
     }
 }
 
+/* Tell the board about a reset line that actually moved */
+static void gpio_update_line(qemu_irq irq, uint8_t old, uint8_t new)
+{
+    bool old_level = gpio_reset_level(old);
+    bool new_level = gpio_reset_level(new);
+
+    if (irq && old_level != new_level) {
+        qemu_set_irq(irq, new_level);
+    }
+}
+
 static void macio_gpio_write(void *opaque, hwaddr addr, uint64_t value,
                              unsigned size)
 {
@@ -152,18 +170,16 @@ static void macio_gpio_write(void *opaque, hwaddr addr, uint64_t value,
          * wrote is the whole state.
          */
         for (i = 0; i < MACIO_GPIO_RESET_CPU_CNT; i++) {
-            bool old_level, new_level;
-
-            if (cpu_reset_gpio[i] != addr || !s->cpu_reset_irqs[i]) {
-                continue;
+            if (cpu_reset_gpio[i] == addr) {
+                gpio_update_line(s->cpu_reset_irqs[i], s->gpio_regs[addr],
+                                 value | ibit);
             }
-
-            old_level = gpio_reset_level(s->gpio_regs[addr]);
-            new_level = gpio_reset_level(value | ibit);
-            if (old_level != new_level) {
-                qemu_set_irq(s->cpu_reset_irqs[i], new_level);
+        }
+        for (i = 0; i < MACIO_GPIO_SRESET_CNT; i++) {
+            if (sreset_gpio[i] == addr) {
+                gpio_update_line(s->sreset_irqs[i], s->gpio_regs[addr],
+                                 value | ibit);
             }
-            break;
         }
 
         s->gpio_regs[addr] = value | ibit;
@@ -212,6 +228,8 @@ static void macio_gpio_init(Object *obj)
 
     qdev_init_gpio_out_named(DEVICE(obj), s->cpu_reset_irqs, "cpu-reset",
                              MACIO_GPIO_RESET_CPU_CNT);
+    qdev_init_gpio_out_named(DEVICE(obj), s->sreset_irqs, "sreset",
+                             MACIO_GPIO_SRESET_CNT);
 
     memory_region_init_io(&s->gpiomem, OBJECT(s), &macio_gpio_ops, obj,
                           "gpio", 0x30);

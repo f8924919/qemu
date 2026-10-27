@@ -40,6 +40,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(MacIOGPIOState, MACIO_GPIO)
  */
 #define MACIO_GPIO_RESET_CPU_CNT KEYLARGO_MAX_CPU
 
+/* The boot ROM's ~sreset0 and ~sreset1, wired up only for x-rom-smp */
+#define MACIO_GPIO_SRESET_CNT 2
+
 struct MacIOGPIOState {
     /*< private >*/
     SysBusDevice parent;
@@ -48,6 +51,7 @@ struct MacIOGPIOState {
     MemoryRegion gpiomem;
     qemu_irq gpio_extirqs[10];
     qemu_irq cpu_reset_irqs[MACIO_GPIO_RESET_CPU_CNT];
+    qemu_irq sreset_irqs[MACIO_GPIO_SRESET_CNT];
     uint8_t gpio_levels[8];
     uint8_t gpio_regs[36]; /* XXX Check count */
     bool nmi_idle_high;
