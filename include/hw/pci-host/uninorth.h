@@ -130,6 +130,8 @@ struct UNINState {
     uint32_t version;
     /* x-reg60-nonzero: +0x60 reads 1, which a real boot ROM wants */
     bool reg60_nonzero;
+    /* x-cpu-number: +0x50 is the reading CPU's number, +0x60 is 0 off CPU 0 */
+    bool cpu_number;
     MemoryRegion mem;
 };
 

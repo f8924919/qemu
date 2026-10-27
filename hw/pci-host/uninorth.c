@@ -24,6 +24,7 @@
 
 #include "qemu/osdep.h"
 #include "hw/core/irq.h"
+#include "hw/core/cpu.h"
 #include "hw/core/qdev-properties.h"
 #include "qemu/module.h"
 #include "hw/pci/pci_device.h"
@@ -1050,18 +1051,31 @@ static void unin_write(void *opaque, hwaddr addr, uint64_t value,
 static uint64_t unin_read(void *opaque, hwaddr addr, unsigned size)
 {
     UNINState *s = opaque;
+    /* An access without a CPU (qtest, DMA) reads as CPU 0 */
+    int cpu = current_cpu ? current_cpu->cpu_index : 0;
     uint32_t value;
 
     switch (addr) {
     case 0:
         value = s->version;
         break;
+    case 0x50:
+        /*
+         * Linux's uninorth.h calls this UNI_N_CPU_NUMBER.  A real boot ROM
+         * reads it to pick the flag in +0x70 it waits on, so with
+         * x-cpu-number each CPU sees its own number.
+         */
+        value = s->cpu_number ? cpu : 0;
+        break;
     case 0x60:
         /*
          * A real boot ROM puts the CPU to sleep when this reads 0.  What
          * the register means is unknown: it is not in Linux's uninorth.h.
+         * With x-cpu-number only CPU 0 can read non-zero, so the other
+         * CPU goes to the ROM's wait loop rather than booting a second
+         * time.
          */
-        value = s->reg60_nonzero ? 1 : 0;
+        value = s->reg60_nonzero && (!s->cpu_number || cpu == 0) ? 1 : 0;
         break;
     default:
         value = 0;
@@ -1096,6 +1110,7 @@ static void unin_init(Object *obj)
 static const Property unin_properties[] = {
     DEFINE_PROP_UINT32("version", UNINState, version, UNINORTH_VERSION_10A),
     DEFINE_PROP_BOOL("x-reg60-nonzero", UNINState, reg60_nonzero, false),
+    DEFINE_PROP_BOOL("x-cpu-number", UNINState, cpu_number, false),
 };
 
 static void unin_class_init(ObjectClass *klass, const void *data)
