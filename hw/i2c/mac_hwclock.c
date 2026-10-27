@@ -2,23 +2,24 @@
  * Apple i2c clock generator (Pulsar / Cypress), as used for MP timebase sync
  *
  * PowerMac7,2/7,3 and RackMac3,1 hang a clock generator off the UniNorth/U3
- * i2c bus and freeze the timebase through it while the second CPU is
- * brought up.  Both guests drive the same register:
+ * i2c bus and stop the timebase through it while the second CPU is
+ * brought up.  Linux (arch/powerpc/platforms/powermac/smp.c) and Darwin
+ * (MacRISC4CPU::enableCPUTimeBase() in AppleMacRISC4PE) drive the same
+ * one-byte read-modify-write:
  *
- *  - Linux arch/powerpc/platforms/powermac/smp.c reads register 0x2e,
- *    masks with 0x77 and writes 0x22 to freeze / 0x11 to thaw
- *  - Darwin's MacRISC4CPU::enableCPUTimeBase() does the identical
- *    read-modify-write (the constants live in _pulsarD2 inside
- *    AppleMacRISC4PE)
+ *  - Pulsar, at 8-bit address 0xd2: register 0x2e, mask 0x77, 0x11 to
+ *    stop the timebase and 0x22 to let it run
+ *  - Cypress CY28508, the PowerMac7,2 chip, at 8-bit address 0xd0 even
+ *    though the device tree node says 0xd2: register 0x81, mask 0x0c,
+ *    0x00 to stop and 0x0c to run
  *
- * The two derivations were made independently -- one from GPL source, one
- * from a disassembly -- and agree on every value including the 8-bit bus
- * address 0xd2.
+ * The values were derived independently from GPL source and from a
+ * disassembly, and agree.
  *
- * Freezing is not modelled as an effect on the timebase: every vCPU in
- * QEMU already shares one, so there is nothing to pull back into step.
- * The device therefore only has to hold the value it is given, which is
- * what both guests read back.
+ * Stopping is not modelled as an effect on the timebase: every vCPU's
+ * timebase counts from the same clock, and only moves apart when the
+ * guest writes one.  The device therefore only has to hold the value it
+ * is given, which is what both guests read back.
  *
  * Copyright (c) 2026 qemu-g5 contributors
  *
@@ -83,12 +84,12 @@ static int mac_hwclock_send(I2CSlave *i2c, uint8_t data)
     if (!s->have_ptr) {
         s->ptr = data;
         s->have_ptr = true;
-        trace_mac_hwclock_set_ptr(data);
+        trace_mac_hwclock_set_ptr(i2c->address, data);
         return 0;
     }
 
     s->regs[s->ptr] = data;
-    trace_mac_hwclock_write(s->ptr, data);
+    trace_mac_hwclock_write(i2c->address, s->ptr, data);
     s->ptr++;
     return 0;
 }
@@ -98,7 +99,7 @@ static uint8_t mac_hwclock_recv(I2CSlave *i2c)
     MacHwclockState *s = MAC_HWCLOCK(i2c);
     uint8_t val = s->regs[s->ptr];
 
-    trace_mac_hwclock_read(s->ptr, val);
+    trace_mac_hwclock_read(i2c->address, s->ptr, val);
     s->ptr++;
     return val;
 }

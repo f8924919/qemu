@@ -636,6 +636,20 @@ static void ppc_core99_init(MachineState *machine)
                                 "mac-hwclock", 0xd2 >> 1);
 
         /*
+         * A real PowerMac7,2 Boot ROM names that node a CY28508, and for a
+         * CY28508 Darwin and Linux address 8-bit 0xd0 instead, ignoring the
+         * node's reg.  Without a chip there Darwin's startCPU() waits
+         * forever for the timebase handshake.  Create it after the 0x69 one:
+         * both share the "mac-hwclock" vmstate section and are told apart
+         * by instance number in creation order.
+         */
+        if (core99_machine->rom_smp) {
+            i2c_slave_create_simple(
+                I2C_BUS(qdev_get_child_bus(i2c_dev, "i2c0")),
+                "mac-hwclock", 0xd0 >> 1);
+        }
+
+        /*
          * A real boot ROM addresses channel 1 at 7-bit 0x50, 0x52, 0x54
          * and 0x56, where memory SPD EEPROMs usually sit, and with this
          * pair in place reads bytes from 0x50 and 0x51; what it does with
@@ -1724,8 +1738,11 @@ static void powermac7_3_machine_class_init(ObjectClass *oc, const void *data)
                                           "real boot ROM does: CPU 1 runs "
                                           "the ROM from power-on, mac-io "
                                           "byte 0x72 soft-resets it into "
-                                          "ROM, and the U3 register at "
-                                          "+0x50 reads the CPU number (off by "
+                                          "ROM, the U3 register at +0x50 "
+                                          "reads the CPU number, and a "
+                                          "CY28508 clock chip answers at "
+                                          "8-bit 0xd0 on U3 i2c channel 0 "
+                                          "(off by "
                                           "default). For running a real "
                                           "boot ROM with -bios");
 }

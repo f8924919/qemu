@@ -70,6 +70,6 @@ keywest_i2c_nak(uint8_t addr, uint8_t mode) "addr 0x%02x mode 0x%02x"
 keywest_i2c_dumb_start(uint8_t mode, uint8_t isr) "mode 0x%02x isr 0x%02x"
 
 # mac_hwclock.c
-mac_hwclock_set_ptr(uint8_t ptr) "ptr 0x%02x"
-mac_hwclock_read(uint8_t reg, uint8_t val) "reg 0x%02x -> 0x%02x"
-mac_hwclock_write(uint8_t reg, uint8_t val) "reg 0x%02x <- 0x%02x"
+mac_hwclock_set_ptr(uint8_t addr, uint8_t ptr) "addr 0x%02x ptr 0x%02x"
+mac_hwclock_read(uint8_t addr, uint8_t reg, uint8_t val) "addr 0x%02x reg 0x%02x -> 0x%02x"
+mac_hwclock_write(uint8_t addr, uint8_t reg, uint8_t val) "addr 0x%02x reg 0x%02x <- 0x%02x"
