@@ -288,8 +288,9 @@ static void ppc_core99_cpu_reset_line(void *opaque, int n, int level)
  * vector CPU 0 starts from.  Deliver it as a system reset interrupt rather
  * than cpu_reset(): the ROM's reset vector looks at HID0 to tell a wakeup
  * from its wait loop apart from a fresh start, so the registers have to
- * survive.  A CPU that has never run is still in its machine reset state,
- * which makes the first release a plain start.
+ * survive.  CPU 1 has been running the ROM since power-on, so by the time
+ * the ROM probes for it, it is parked in that loop with the HID0 bit set
+ * and the vector sends it on to the trampoline the ROM left in RAM.
  */
 static void ppc_core99_rom_sreset_work(CPUState *cs, run_on_cpu_data arg)
 {
@@ -396,8 +397,13 @@ static void ppc_core99_init(MachineState *machine)
          * Only the boot processor runs the firmware.  The rest wait for the
          * OS to release them through the KeyLargo reset GPIO, which is how
          * the hardware does it.
+         *
+         * With x-rom-smp the second processor runs the ROM from power-on
+         * as well.  The ROM parks it in a wait loop, and only a processor
+         * woken from that loop goes on to the trampoline the ROM probes
+         * for it with; one that starts fresh on ~sreset1 parks again.
          */
-        if (i != 0) {
+        if (i != 0 && !core99_machine->rom_smp) {
             object_property_set_bool(cpuobj, "start-powered-off", true,
                                      &error_fatal);
         }
@@ -1715,10 +1721,11 @@ static void powermac7_3_machine_class_init(ObjectClass *oc, const void *data)
                                    powermac7_3_set_rom_smp);
     object_class_property_set_description(oc, "x-rom-smp",
                                           "Start the second CPU the way a "
-                                          "real boot ROM does: mac-io byte "
-                                          "0x72 soft-resets CPU 1 into ROM, "
-                                          "and the U3 register at +0x50 "
-                                          "reads the CPU number (off by "
+                                          "real boot ROM does: CPU 1 runs "
+                                          "the ROM from power-on, mac-io "
+                                          "byte 0x72 soft-resets it into "
+                                          "ROM, and the U3 register at "
+                                          "+0x50 reads the CPU number (off by "
                                           "default). For running a real "
                                           "boot ROM with -bios");
 }
