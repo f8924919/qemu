@@ -174,6 +174,8 @@ struct Core99MachineState {
     bool no_gpio_cpu_reset;
     /* PowerMac7,3: the U3 register at +0x60 reads 1 (x-u3-reg60-nonzero) */
     bool u3_reg60_nonzero;
+    /* PowerMac7,3: start CPU 1 the way a real boot ROM does (x-rom-smp) */
+    bool rom_smp;
 };
 
 /*
@@ -278,6 +280,34 @@ static void ppc_core99_cpu_reset_line(void *opaque, int n, int level)
      * let it happen exclusively on the CPU being reset.
      */
     async_safe_run_on_cpu(cs, ppc_core99_cpu_reset_work, RUN_ON_CPU_NULL);
+}
+
+/*
+ * x-rom-smp: a real boot ROM starts the second processor through mac-io
+ * byte 0x72 (~sreset1) and expects it to come out in ROM, at the same
+ * vector CPU 0 starts from.  Deliver it as a system reset interrupt rather
+ * than cpu_reset(): the ROM's reset vector looks at HID0 to tell a wakeup
+ * from its wait loop apart from a fresh start, so the registers have to
+ * survive.  A CPU that has never run is still in its machine reset state,
+ * which makes the first release a plain start.
+ */
+static void ppc_core99_rom_sreset_work(CPUState *cs, run_on_cpu_data arg)
+{
+    PowerPCCPU *cpu = POWERPC_CPU(cs);
+
+    ppc_cpu_do_system_reset(cs);
+    cpu->env.nip = PROM_BASE + 0x100;
+}
+
+static void ppc_core99_rom_sreset_line(void *opaque, int n, int level)
+{
+    CPUState *cs = opaque;
+
+    /* Active low, as the KeyLargo reset GPIOs above */
+    if (!level) {
+        return;
+    }
+    async_safe_run_on_cpu(cs, ppc_core99_rom_sreset_work, RUN_ON_CPU_NULL);
 }
 
 /* PowerPC Mac99 hardware initialisation */
@@ -565,6 +595,7 @@ static void ppc_core99_init(MachineState *machine)
         qdev_prop_set_uint32(dev, "version", UNINORTH_VERSION_U3);
         qdev_prop_set_bit(dev, "x-reg60-nonzero",
                           core99_machine->u3_reg60_nonzero);
+        qdev_prop_set_bit(dev, "x-cpu-number", core99_machine->rom_smp);
     }
     s = SYS_BUS_DEVICE(dev);
     sysbus_realize_and_unref(s, &error_fatal);
@@ -902,6 +933,22 @@ static void ppc_core99_init(MachineState *machine)
                                         cs->cpu_index,
                                         qemu_allocate_irq(
                                             ppc_core99_cpu_reset_line, cs, 0));
+        }
+    }
+
+    /*
+     * x-rom-smp: only ~sreset1, for CPU 1.  ~sreset0 would reset CPU 0,
+     * which the boot ROM never needs and x-no-gpio-cpu-reset is there to
+     * avoid.
+     */
+    if (has_pmu && core99_machine->rom_smp) {
+        CPUState *cs1 = qemu_get_cpu(1);
+
+        if (cs1) {
+            qdev_connect_gpio_out_named(DEVICE(macio), "sreset", 1,
+                                        qemu_allocate_irq(
+                                            ppc_core99_rom_sreset_line,
+                                            cs1, 0));
         }
     }
 
@@ -1439,6 +1486,16 @@ static void powermac7_3_set_no_gpio_cpu_reset(Object *obj, bool value,
     CORE99_MACHINE(obj)->no_gpio_cpu_reset = value;
 }
 
+static bool powermac7_3_get_rom_smp(Object *obj, Error **errp)
+{
+    return CORE99_MACHINE(obj)->rom_smp;
+}
+
+static void powermac7_3_set_rom_smp(Object *obj, bool value, Error **errp)
+{
+    CORE99_MACHINE(obj)->rom_smp = value;
+}
+
 static bool powermac7_3_get_u3_reg60_nonzero(Object *obj, Error **errp)
 {
     return CORE99_MACHINE(obj)->u3_reg60_nonzero;
@@ -1651,8 +1708,19 @@ static void powermac7_3_machine_class_init(ObjectClass *oc, const void *data)
                                           "read 1 instead of 0; a real boot "
                                           "ROM puts the CPU to sleep when "
                                           "it reads 0 (off by default). "
-                                          "Every CPU reads the same value; "
-                                          "only tested with -smp 1");
+                                          "Every CPU reads the same value "
+                                          "unless x-rom-smp is on");
+    object_class_property_add_bool(oc, "x-rom-smp",
+                                   powermac7_3_get_rom_smp,
+                                   powermac7_3_set_rom_smp);
+    object_class_property_set_description(oc, "x-rom-smp",
+                                          "Start the second CPU the way a "
+                                          "real boot ROM does: mac-io byte "
+                                          "0x72 soft-resets CPU 1 into ROM, "
+                                          "and the U3 register at +0x50 "
+                                          "reads the CPU number (off by "
+                                          "default). For running a real "
+                                          "boot ROM with -bios");
 }
 
 static void powermac7_3_instance_init(Object *obj)
@@ -1691,6 +1759,8 @@ static void powermac7_3_instance_init(Object *obj)
     cms->no_gpio_cpu_reset = false;
     /* Off: QEMU has always read 0 there */
     cms->u3_reg60_nonzero = false;
+    /* Off: CPU 1 only starts through the KeyLargo reset GPIOs */
+    cms->rom_smp = false;
 }
 
 static const TypeInfo powermac7_3_machine_info = {
