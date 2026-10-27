@@ -9,7 +9,10 @@
  * plain register.
  *
  * Nothing runs under qtest, so a reset is read off the NIP and SRR0 of the
- * CPU in "info registers -a".  CPU 1 starts powered off at 0x100.  The
+ * CPU in "info registers -a".  With the switch on CPU 1 runs the ROM from
+ * power-on, like CPU 0, so it starts at the firmware's vector with SRR0
+ * clear, and a release shows as that vector landing in SRR0.  Without it
+ * CPU 1 starts powered off at 0x100.  The
  * per-CPU U3 values need a CPU to do the read and cannot be checked here;
  * a qtest access has none and reads as CPU 0.
  *
@@ -194,37 +197,64 @@ static bool sreset_connected(QTestState *qts, int n)
     return connected;
 }
 
-/* Holding the line does nothing; letting it go starts CPU 1 in ROM */
+/* CPU 1 comes up in ROM next to CPU 0 */
+static void test_start_on(void)
+{
+    QTestState *qts = k2_init(MACHINE_ON);
+
+    g_assert_cmphex(cpu_reg(qts, 0, "NIP"), ==, NIP_FIRMWARE);
+    g_assert_cmphex(cpu_reg(qts, 1, "NIP"), ==, NIP_FIRMWARE);
+    g_assert_cmphex(cpu_reg(qts, 1, "SRR0"), ==, 0);
+    qtest_quit(qts);
+}
+
+/* Without the switch CPU 1 waits powered off at 0x100 */
+static void test_start_off(void)
+{
+    QTestState *qts = k2_init(MACHINE_OFF);
+
+    g_assert_cmphex(cpu_reg(qts, 1, "NIP"), ==, NIP_RESET);
+    qtest_quit(qts);
+}
+
+/* Holding the line does nothing; letting it go resets CPU 1 into ROM */
 static void test_release_on(void)
 {
     QTestState *qts = k2_init(MACHINE_ON);
 
-    g_assert_cmphex(cpu_reg(qts, 1, "NIP"), ==, NIP_RESET);
+    g_assert_cmphex(cpu_reg(qts, 1, "NIP"), ==, NIP_FIRMWARE);
     hold(qts, SRESET1);
-    g_assert_cmphex(reg_after_wait(qts, 1, "NIP", false, 0), ==, NIP_RESET);
+    g_assert_cmphex(reg_after_wait(qts, 1, "SRR0", false, 0), ==, 0);
     release(qts, SRESET1);
-    g_assert_cmphex(reg_after_wait(qts, 1, "NIP", true, NIP_FIRMWARE), ==,
-                    NIP_FIRMWARE);
     /* A system reset interrupt: SRR0 keeps where CPU 1 was */
-    g_assert_cmphex(cpu_reg(qts, 1, "SRR0"), ==, NIP_RESET);
+    g_assert_cmphex(reg_after_wait(qts, 1, "SRR0", true, NIP_FIRMWARE), ==,
+                    NIP_FIRMWARE);
+    g_assert_cmphex(cpu_reg(qts, 1, "NIP"), ==, NIP_FIRMWARE);
     g_assert_cmphex(cpu_reg(qts, 0, "NIP"), ==, NIP_FIRMWARE);
     g_assert_cmphex(cpu_reg(qts, 0, "SRR0"), ==, 0);
     qtest_quit(qts);
 }
 
-/* Every release resets CPU 1 again, even once it has started */
+/*
+ * Every release resets CPU 1 again.  GPIO 4 moves it to 0x100 in between
+ * so that the second release leaves a different SRR0 from the first.
+ */
 static void test_again_on(void)
 {
     QTestState *qts = k2_init(MACHINE_ON);
 
     hold(qts, SRESET1);
     release(qts, SRESET1);
-    g_assert_cmphex(reg_after_wait(qts, 1, "SRR0", true, NIP_RESET), ==,
+    g_assert_cmphex(reg_after_wait(qts, 1, "SRR0", true, NIP_FIRMWARE), ==,
+                    NIP_FIRMWARE);
+    qtest_writeb(qts, K2_MACIO_BAR + GPIO4, GPIO_OUT_ENABLE);
+    qtest_writeb(qts, K2_MACIO_BAR + GPIO4, GPIO_OUT_ENABLE | GPIO_OUT_DATA);
+    g_assert_cmphex(reg_after_wait(qts, 1, "NIP", true, NIP_RESET), ==,
                     NIP_RESET);
     hold(qts, SRESET1);
     release(qts, SRESET1);
-    g_assert_cmphex(reg_after_wait(qts, 1, "SRR0", true, NIP_FIRMWARE), ==,
-                    NIP_FIRMWARE);
+    g_assert_cmphex(reg_after_wait(qts, 1, "SRR0", true, NIP_RESET), ==,
+                    NIP_RESET);
     g_assert_cmphex(cpu_reg(qts, 1, "NIP"), ==, NIP_FIRMWARE);
     qtest_quit(qts);
 }
@@ -249,7 +279,8 @@ static void test_sreset0_on(void)
 
     hold(qts, SRESET0);
     release(qts, SRESET0);
-    g_assert_cmphex(reg_after_wait(qts, 1, "NIP", false, 0), ==, NIP_RESET);
+    g_assert_cmphex(reg_after_wait(qts, 1, "SRR0", false, 0), ==, 0);
+    g_assert_cmphex(cpu_reg(qts, 1, "NIP"), ==, NIP_FIRMWARE);
     g_assert_cmphex(cpu_reg(qts, 0, "NIP"), ==, NIP_FIRMWARE);
     g_assert_cmphex(cpu_reg(qts, 0, "SRR0"), ==, 0);
     qtest_quit(qts);
@@ -275,10 +306,10 @@ static void test_gpio3_rom(void)
     qtest_writeb(qts, K2_MACIO_BAR + GPIO3, GPIO_OUT_ENABLE | GPIO_OUT_DATA);
     g_assert_cmphex(reg_after_wait(qts, 0, "NIP", false, 0), ==,
                     NIP_FIRMWARE);
-    /* ...while 0x72 still starts CPU 1 */
+    /* ...while 0x72 still resets CPU 1 */
     hold(qts, SRESET1);
     release(qts, SRESET1);
-    g_assert_cmphex(reg_after_wait(qts, 1, "NIP", true, NIP_FIRMWARE), ==,
+    g_assert_cmphex(reg_after_wait(qts, 1, "SRR0", true, NIP_FIRMWARE), ==,
                     NIP_FIRMWARE);
     qtest_quit(qts);
 }
@@ -290,7 +321,7 @@ static void test_gpio4_on(void)
 
     hold(qts, SRESET1);
     release(qts, SRESET1);
-    g_assert_cmphex(reg_after_wait(qts, 1, "NIP", true, NIP_FIRMWARE), ==,
+    g_assert_cmphex(reg_after_wait(qts, 1, "SRR0", true, NIP_FIRMWARE), ==,
                     NIP_FIRMWARE);
     qtest_writeb(qts, K2_MACIO_BAR + GPIO4, GPIO_OUT_ENABLE);
     qtest_writeb(qts, K2_MACIO_BAR + GPIO4, GPIO_OUT_ENABLE | GPIO_OUT_DATA);
@@ -299,7 +330,7 @@ static void test_gpio4_on(void)
     qtest_quit(qts);
 }
 
-/* A machine reset puts CPU 1 back to powered off at 0x100 */
+/* A machine reset puts CPU 1 back in ROM with SRR0 clear */
 static void test_system_reset_on(void)
 {
     QTestState *qts = k2_init(MACHINE_ON);
@@ -307,14 +338,14 @@ static void test_system_reset_on(void)
 
     hold(qts, SRESET1);
     release(qts, SRESET1);
-    g_assert_cmphex(reg_after_wait(qts, 1, "NIP", true, NIP_FIRMWARE), ==,
+    g_assert_cmphex(reg_after_wait(qts, 1, "SRR0", true, NIP_FIRMWARE), ==,
                     NIP_FIRMWARE);
     resp = qtest_qmp(qts, "{ 'execute': 'system_reset' }");
     g_assert(qdict_haskey(resp, "return"));
     qobject_unref(resp);
     qtest_qmp_eventwait(qts, "RESET");
-    g_assert_cmphex(reg_after_wait(qts, 1, "NIP", true, NIP_RESET), ==,
-                    NIP_RESET);
+    g_assert_cmphex(reg_after_wait(qts, 1, "SRR0", true, 0), ==, 0);
+    g_assert_cmphex(cpu_reg(qts, 1, "NIP"), ==, NIP_FIRMWARE);
     g_assert_cmphex(cpu_reg(qts, 0, "NIP"), ==, NIP_FIRMWARE);
     qtest_quit(qts);
 }
@@ -414,6 +445,8 @@ int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
 
+    qtest_add_func("/macio-rom-smp/start/on", test_start_on);
+    qtest_add_func("/macio-rom-smp/start/off", test_start_off);
     qtest_add_func("/macio-rom-smp/release/on", test_release_on);
     qtest_add_func("/macio-rom-smp/again/on", test_again_on);
     qtest_add_func("/macio-rom-smp/release/off", test_release_off);
