@@ -208,6 +208,7 @@ qtests_ppc64 = \
   (config_all_devices.has_key('CONFIG_MAC_NEWWORLD') ? ['macio-gpio-nmi-test'] : []) + \
   (config_all_devices.has_key('CONFIG_MAC_NEWWORLD') ? ['macio-gpio-cpu-reset-test'] : []) + \
   (config_all_devices.has_key('CONFIG_MAC_NEWWORLD') ? ['macio-rom-smp-test'] : []) + \
+  (config_all_devices.has_key('CONFIG_MAC_NEWWORLD') ? ['real-rom-switch-test'] : []) + \
   qtests_pci + ['migration-test', 'cpu-plug-test', 'drive_del-test']
 
 qtests_sh4 = (config_all_devices.has_key('CONFIG_ISA_TESTDEV') ? ['endianness-test'] : [])
