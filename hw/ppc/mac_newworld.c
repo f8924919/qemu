@@ -176,7 +176,90 @@ struct Core99MachineState {
     bool u3_reg60_nonzero;
     /* PowerMac7,3: start CPU 1 the way a real boot ROM does (x-rom-smp) */
     bool rom_smp;
+    /* PowerMac7,3: the switches above default to what a real ROM wants */
+    bool real_rom;
+    /* Which of them were given, as BIT(RealRomSwitch) */
+    uint32_t real_rom_given;
 };
+
+/*
+ * The switches x-real-rom covers.  A switch that was given keeps its
+ * value: the keys of one -machine option reach their setters in the
+ * order of their hash, not as written, so the defaults are only filled
+ * in once the machine is built.
+ */
+typedef enum RealRomSwitch {
+    REAL_ROM_MACIO_LOW,
+    REAL_ROM_HT_MMIO_LOW,
+    REAL_ROM_U3_I2C_LANE3,
+    REAL_ROM_U3_I2C_SPD,
+    REAL_ROM_U3_I2C_DUMB,
+    REAL_ROM_DBDMA_DEVSTAT,
+    REAL_ROM_NVRAM_FLASH_ID,
+    REAL_ROM_U3_MEMCTL,
+    REAL_ROM_HT_K2_ROM_IRQ,
+    REAL_ROM_NO_GPIO_CPU_RESET,
+    REAL_ROM_U3_REG60_NONZERO,
+    REAL_ROM_ROM_SMP,
+    REAL_ROM_DART,
+    REAL_ROM_HT_K2_LAYOUT,
+} RealRomSwitch;
+
+/* Whether x-real-rom sets this one: on, and the switch was not given */
+static bool real_rom_fills(Core99MachineState *cms, RealRomSwitch sw)
+{
+    return cms->real_rom && !(cms->real_rom_given & BIT(sw));
+}
+
+/*
+ * Outside TARGET_PPC64 with ppc_core99_init(): on the other machines
+ * real_rom stays false and nothing changes.
+ */
+static void core99_resolve_real_rom(Core99MachineState *cms)
+{
+    if (real_rom_fills(cms, REAL_ROM_MACIO_LOW)) {
+        cms->macio_low = true;
+    }
+    if (real_rom_fills(cms, REAL_ROM_HT_MMIO_LOW)) {
+        cms->ht_mmio_low = true;
+    }
+    if (real_rom_fills(cms, REAL_ROM_U3_I2C_LANE3)) {
+        cms->u3_i2c_lane3 = true;
+    }
+    if (real_rom_fills(cms, REAL_ROM_U3_I2C_SPD)) {
+        cms->u3_i2c_spd = true;
+    }
+    if (real_rom_fills(cms, REAL_ROM_U3_I2C_DUMB)) {
+        cms->u3_i2c_dumb = true;
+    }
+    if (real_rom_fills(cms, REAL_ROM_DBDMA_DEVSTAT)) {
+        cms->dbdma_devstat = true;
+    }
+    if (real_rom_fills(cms, REAL_ROM_NVRAM_FLASH_ID)) {
+        cms->nvram_flash_id = true;
+    }
+    if (real_rom_fills(cms, REAL_ROM_U3_MEMCTL)) {
+        cms->u3_memctl = true;
+    }
+    if (real_rom_fills(cms, REAL_ROM_HT_K2_ROM_IRQ)) {
+        cms->ht_k2_rom_irq = true;
+    }
+    if (real_rom_fills(cms, REAL_ROM_NO_GPIO_CPU_RESET)) {
+        cms->no_gpio_cpu_reset = true;
+    }
+    if (real_rom_fills(cms, REAL_ROM_U3_REG60_NONZERO)) {
+        cms->u3_reg60_nonzero = true;
+    }
+    if (real_rom_fills(cms, REAL_ROM_ROM_SMP)) {
+        cms->rom_smp = true;
+    }
+    if (real_rom_fills(cms, REAL_ROM_DART)) {
+        cms->dart = ON_OFF_AUTO_ON;
+    }
+    if (real_rom_fills(cms, REAL_ROM_HT_K2_LAYOUT)) {
+        cms->ht_k2_layout = HT_K2_LAYOUT_DEV1_5;
+    }
+}
 
 /*
  * A real boot ROM writes U3 registers at 0xf8002000, seemingly to set
@@ -373,6 +456,9 @@ static void ppc_core99_init(MachineState *machine)
     DeviceState *uninorth_internal_dev = NULL, *uninorth_agp_dev = NULL;
     hwaddr nvram_addr = 0xFFF04000;
     uint64_t tbfreq = kvm_enabled() ? kvmppc_get_tbfreq() : TBFREQ;
+
+    /* Before anything reads the switches x-real-rom covers */
+    core99_resolve_real_rom(core99_machine);
 
     /* init CPUs */
     for (i = 0; i < machine->smp.cpus; i++) {
@@ -1386,6 +1472,12 @@ static const TypeInfo powerbook3_2_machine_info = {
 
 #ifdef TARGET_PPC64
 
+/* A switch given on the command line or with qom-set keeps its value */
+static void real_rom_give(Object *obj, RealRomSwitch sw)
+{
+    CORE99_MACHINE(obj)->real_rom_given |= BIT(sw);
+}
+
 static bool powermac7_3_get_highmem(Object *obj, Error **errp)
 {
     return CORE99_MACHINE(obj)->highmem;
@@ -1403,6 +1495,7 @@ static bool powermac7_3_get_macio_low(Object *obj, Error **errp)
 
 static void powermac7_3_set_macio_low(Object *obj, bool value, Error **errp)
 {
+    real_rom_give(obj, REAL_ROM_MACIO_LOW);
     CORE99_MACHINE(obj)->macio_low = value;
 }
 
@@ -1413,6 +1506,7 @@ static bool powermac7_3_get_ht_mmio_low(Object *obj, Error **errp)
 
 static void powermac7_3_set_ht_mmio_low(Object *obj, bool value, Error **errp)
 {
+    real_rom_give(obj, REAL_ROM_HT_MMIO_LOW);
     CORE99_MACHINE(obj)->ht_mmio_low = value;
 }
 
@@ -1424,6 +1518,7 @@ static bool powermac7_3_get_u3_i2c_lane3(Object *obj, Error **errp)
 static void powermac7_3_set_u3_i2c_lane3(Object *obj, bool value,
                                          Error **errp)
 {
+    real_rom_give(obj, REAL_ROM_U3_I2C_LANE3);
     CORE99_MACHINE(obj)->u3_i2c_lane3 = value;
 }
 
@@ -1434,6 +1529,7 @@ static bool powermac7_3_get_u3_i2c_spd(Object *obj, Error **errp)
 
 static void powermac7_3_set_u3_i2c_spd(Object *obj, bool value, Error **errp)
 {
+    real_rom_give(obj, REAL_ROM_U3_I2C_SPD);
     CORE99_MACHINE(obj)->u3_i2c_spd = value;
 }
 
@@ -1444,6 +1540,7 @@ static bool powermac7_3_get_u3_i2c_dumb(Object *obj, Error **errp)
 
 static void powermac7_3_set_u3_i2c_dumb(Object *obj, bool value, Error **errp)
 {
+    real_rom_give(obj, REAL_ROM_U3_I2C_DUMB);
     CORE99_MACHINE(obj)->u3_i2c_dumb = value;
 }
 
@@ -1460,6 +1557,7 @@ static bool powermac7_3_get_nvram_flash_id(Object *obj, Error **errp)
 static void powermac7_3_set_nvram_flash_id(Object *obj, bool value,
                                            Error **errp)
 {
+    real_rom_give(obj, REAL_ROM_NVRAM_FLASH_ID);
     CORE99_MACHINE(obj)->nvram_flash_id = value;
 }
 
@@ -1470,6 +1568,7 @@ static bool powermac7_3_get_u3_memctl(Object *obj, Error **errp)
 
 static void powermac7_3_set_u3_memctl(Object *obj, bool value, Error **errp)
 {
+    real_rom_give(obj, REAL_ROM_U3_MEMCTL);
     CORE99_MACHINE(obj)->u3_memctl = value;
 }
 
@@ -1492,6 +1591,7 @@ static bool powermac7_3_get_ht_k2_rom_irq(Object *obj, Error **errp)
 static void powermac7_3_set_ht_k2_rom_irq(Object *obj, bool value,
                                           Error **errp)
 {
+    real_rom_give(obj, REAL_ROM_HT_K2_ROM_IRQ);
     CORE99_MACHINE(obj)->ht_k2_rom_irq = value;
 }
 
@@ -1503,6 +1603,7 @@ static bool powermac7_3_get_no_gpio_cpu_reset(Object *obj, Error **errp)
 static void powermac7_3_set_no_gpio_cpu_reset(Object *obj, bool value,
                                               Error **errp)
 {
+    real_rom_give(obj, REAL_ROM_NO_GPIO_CPU_RESET);
     CORE99_MACHINE(obj)->no_gpio_cpu_reset = value;
 }
 
@@ -1513,6 +1614,7 @@ static bool powermac7_3_get_rom_smp(Object *obj, Error **errp)
 
 static void powermac7_3_set_rom_smp(Object *obj, bool value, Error **errp)
 {
+    real_rom_give(obj, REAL_ROM_ROM_SMP);
     CORE99_MACHINE(obj)->rom_smp = value;
 }
 
@@ -1524,12 +1626,14 @@ static bool powermac7_3_get_u3_reg60_nonzero(Object *obj, Error **errp)
 static void powermac7_3_set_u3_reg60_nonzero(Object *obj, bool value,
                                              Error **errp)
 {
+    real_rom_give(obj, REAL_ROM_U3_REG60_NONZERO);
     CORE99_MACHINE(obj)->u3_reg60_nonzero = value;
 }
 
 static void powermac7_3_set_dbdma_devstat(Object *obj, bool value,
                                           Error **errp)
 {
+    real_rom_give(obj, REAL_ROM_DBDMA_DEVSTAT);
     CORE99_MACHINE(obj)->dbdma_devstat = value;
 }
 
@@ -1546,6 +1650,7 @@ static void powermac7_3_set_ht_k2_layout(Object *obj, const char *value,
     for (int i = 0; i < ARRAY_SIZE(ht_k2_layout_names); i++) {
         if (!strcmp(value, ht_k2_layout_names[i])) {
             cms->ht_k2_layout = i;
+            real_rom_give(obj, REAL_ROM_HT_K2_LAYOUT);
             return;
         }
     }
@@ -1571,7 +1676,19 @@ static void powermac7_3_set_dart(Object *obj, const char *value, Error **errp)
     } else {
         error_setg(errp, "Invalid x-dart value");
         error_append_hint(errp, "Valid values are auto, on, off.\n");
+        return;
     }
+    real_rom_give(obj, REAL_ROM_DART);
+}
+
+static bool powermac7_3_get_real_rom(Object *obj, Error **errp)
+{
+    return CORE99_MACHINE(obj)->real_rom;
+}
+
+static void powermac7_3_set_real_rom(Object *obj, bool value, Error **errp)
+{
+    CORE99_MACHINE(obj)->real_rom = value;
 }
 
 static void powermac7_3_machine_class_init(ObjectClass *oc, const void *data)
@@ -1745,6 +1862,28 @@ static void powermac7_3_machine_class_init(ObjectClass *oc, const void *data)
                                           "(off by "
                                           "default). For running a real "
                                           "boot ROM with -bios");
+    object_class_property_add_bool(oc, "x-real-rom",
+                                   powermac7_3_get_real_rom,
+                                   powermac7_3_set_real_rom);
+    object_class_property_set_description(oc, "x-real-rom",
+                                          "Default the switches a real boot "
+                                          "ROM run with -bios needs to what "
+                                          "it wants (off by default): "
+                                          "x-dart=on, x-ht-k2-layout=dev1-5, "
+                                          "and on for x-macio-80000000, "
+                                          "x-ht-mmio-80000000, "
+                                          "x-u3-i2c-lane3, x-u3-i2c-spd, "
+                                          "x-u3-i2c-dumb, x-dbdma-devstat, "
+                                          "x-nvram-flash-id, x-u3-memctl, "
+                                          "x-ht-k2-rom-irq, "
+                                          "x-no-gpio-cpu-reset, "
+                                          "x-u3-reg60-nonzero and "
+                                          "x-rom-smp. A switch given on its "
+                                          "own keeps its value. "
+                                          "x-gpio9-idle-high and highmem are "
+                                          "left alone. QEMU does not tell the "
+                                          "ROM apart, so do not use it with "
+                                          "OpenBIOS");
 }
 
 static void powermac7_3_instance_init(Object *obj)
@@ -1785,6 +1924,9 @@ static void powermac7_3_instance_init(Object *obj)
     cms->u3_reg60_nonzero = false;
     /* Off: CPU 1 only starts through the KeyLargo reset GPIOs */
     cms->rom_smp = false;
+    /* Off: the switches above keep the defaults set here */
+    cms->real_rom = false;
+    cms->real_rom_given = 0;
 }
 
 static const TypeInfo powermac7_3_machine_info = {
