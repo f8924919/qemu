@@ -204,6 +204,37 @@ static void i2c_write_sub(QTestState *qts, uint8_t addr8, uint8_t sub,
 }
 
 /*
+ * The same write as i2c_write_sub(), but with the mode left at COMBINED
+ * the way the shipped xnu leaves it after the read half of its
+ * read-modify-write (MacRISC4CPU::enableCPUTimeBase).  Bit 0 of the address
+ * is clear, so this is a write: subaddress, data, STOP, and no repeated
+ * start.
+ */
+static void i2c_write_combined(QTestState *qts, uint8_t addr8, uint8_t sub,
+                               uint8_t val)
+{
+    qtest_writeb(qts, KW_STATUS, 0);
+    qtest_writeb(qts, KW_MODE,
+                 KW_I2C_MODE_COMBINED | KW_I2C_MODE_100KHZ | kw_chan);
+    qtest_writeb(qts, KW_ADDR, addr8 & ~1);
+    qtest_writeb(qts, KW_SUBADDR, sub);
+    qtest_writeb(qts, KW_CONTROL, KW_I2C_CTL_XADDR);
+
+    i2c_wait_isr(qts, KW_I2C_IRQ_ADDR);
+    g_assert_cmphex(qtest_readb(qts, KW_STATUS) & KW_I2C_STAT_LAST_AAK,
+                    ==, KW_I2C_STAT_LAST_AAK);
+    qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_ADDR);
+
+    qtest_writeb(qts, KW_DATA, val);
+    i2c_wait_isr(qts, KW_I2C_IRQ_DATA);
+    qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_DATA);
+
+    qtest_writeb(qts, KW_CONTROL, KW_I2C_CTL_STOP);
+    i2c_wait_isr(qts, KW_I2C_IRQ_STOP);
+    qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_STOP);
+}
+
+/*
  * The registers must be one step apart.  Getting the stride wrong makes
  * every register alias register 0, which still "works" for a while: the
  * guest writes mode, reads it back as status, and only fails later in a
@@ -783,6 +814,128 @@ static void test_lane3_other_bytes_are_holes(void)
     qtest_quit(qts);
 }
 
+/*
+ * The read-modify-write as the shipped xnu does it: the mode stays at
+ * COMBINED for the write half.  A controller that turns every COMBINED
+ * transfer into a read accepts the data byte and drops it.
+ */
+static void test_combined_write_roundtrip(void)
+{
+    QTestState *qts = qtest_init(kw_machine);
+    uint8_t orig, val;
+
+    orig = i2c_read_sub(qts, HWCLOCK_ADDR8, HWCLOCK_REG);
+    i2c_write_combined(qts, HWCLOCK_ADDR8, HWCLOCK_REG, (orig & ~0x77) | 0x11);
+    val = i2c_read_sub(qts, HWCLOCK_ADDR8, HWCLOCK_REG);
+    g_assert_cmphex(val & 0x77, ==, 0x11);
+
+    i2c_write_combined(qts, HWCLOCK_ADDR8, HWCLOCK_REG, (val & ~0x77) | 0x22);
+    val = i2c_read_sub(qts, HWCLOCK_ADDR8, HWCLOCK_REG);
+    g_assert_cmphex(val & 0x77, ==, 0x22);
+
+    qtest_quit(qts);
+}
+
+/*
+ * Darwin drives a COMBINED write with the same interrupt handler as a
+ * STANDARDSUB one (PPCI2CInterface::i2cStandardSubModeInterrupts), so the
+ * two have to look the same from the guest: run one write in each mode on
+ * a fresh machine and compare ISR and STATUS after every step.
+ */
+static void combined_write_trace(uint8_t mode, uint8_t trace[8])
+{
+    QTestState *qts = qtest_init(kw_machine);
+
+    qtest_writeb(qts, KW_STATUS, 0);
+    qtest_writeb(qts, KW_MODE, mode);
+    qtest_writeb(qts, KW_ADDR, HWCLOCK_ADDR8 & ~1);
+    qtest_writeb(qts, KW_SUBADDR, HWCLOCK_REG);
+    qtest_writeb(qts, KW_CONTROL, KW_I2C_CTL_XADDR);
+    trace[0] = qtest_readb(qts, KW_ISR);
+    trace[1] = qtest_readb(qts, KW_STATUS);
+
+    qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_ADDR);
+    trace[2] = qtest_readb(qts, KW_ISR);
+    trace[3] = qtest_readb(qts, KW_STATUS);
+
+    qtest_writeb(qts, KW_DATA, 0x5a);
+    trace[4] = qtest_readb(qts, KW_ISR);
+    trace[5] = qtest_readb(qts, KW_STATUS);
+
+    qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_DATA);
+    qtest_writeb(qts, KW_CONTROL, KW_I2C_CTL_STOP);
+    trace[6] = qtest_readb(qts, KW_ISR);
+    trace[7] = qtest_readb(qts, KW_STATUS);
+    qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_STOP);
+
+    g_assert_cmphex(i2c_read_sub(qts, HWCLOCK_ADDR8, HWCLOCK_REG), ==, 0x5a);
+    qtest_quit(qts);
+}
+
+static void test_combined_write_matches_standardsub(void)
+{
+    uint8_t stdsub[8], combined[8];
+    int i;
+
+    combined_write_trace(KW_I2C_MODE_STANDARDSUB, stdsub);
+    combined_write_trace(KW_I2C_MODE_COMBINED, combined);
+    for (i = 0; i < 8; i++) {
+        g_assert_cmphex(combined[i], ==, stdsub[i]);
+    }
+    /* ... and the shape is the write one: no data byte after ADDR */
+    g_assert_cmphex(combined[2] & KW_I2C_IRQ_DATA, ==, 0);
+    g_assert_cmphex(combined[4] & KW_I2C_IRQ_DATA, ==, KW_I2C_IRQ_DATA);
+    g_assert_cmphex(combined[6] & KW_I2C_IRQ_STOP, ==, KW_I2C_IRQ_STOP);
+}
+
+/* Two bytes in one COMBINED write land in consecutive registers */
+static void test_combined_multi_byte_write(void)
+{
+    QTestState *qts = qtest_init(kw_machine);
+
+    qtest_writeb(qts, KW_STATUS, 0);
+    qtest_writeb(qts, KW_MODE, KW_I2C_MODE_COMBINED);
+    qtest_writeb(qts, KW_ADDR, HWCLOCK_ADDR8 & ~1);
+    qtest_writeb(qts, KW_SUBADDR, HWCLOCK_REG);
+    qtest_writeb(qts, KW_CONTROL, KW_I2C_CTL_XADDR);
+    i2c_wait_isr(qts, KW_I2C_IRQ_ADDR);
+
+    qtest_writeb(qts, KW_DATA, 0x33);
+    qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_ADDR);
+    i2c_wait_isr(qts, KW_I2C_IRQ_DATA);
+    qtest_writeb(qts, KW_DATA, 0x44);
+    qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_DATA);
+    i2c_wait_isr(qts, KW_I2C_IRQ_DATA);
+    qtest_writeb(qts, KW_CONTROL, KW_I2C_CTL_STOP);
+    i2c_wait_isr(qts, KW_I2C_IRQ_STOP);
+
+    g_assert_cmphex(i2c_read_sub(qts, HWCLOCK_ADDR8, HWCLOCK_REG), ==, 0x33);
+    g_assert_cmphex(i2c_read_sub(qts, HWCLOCK_ADDR8, HWCLOCK_REG + 1),
+                    ==, 0x44);
+
+    qtest_quit(qts);
+}
+
+/* A COMBINED write to an address nobody answers is a NAK with STOP */
+static void test_combined_write_unanswered_naks(void)
+{
+    QTestState *qts = qtest_init(kw_machine);
+
+    qtest_writeb(qts, KW_STATUS, 0);
+    qtest_writeb(qts, KW_MODE, KW_I2C_MODE_COMBINED);
+    qtest_writeb(qts, KW_ADDR, 0xa0);          /* nothing at 7-bit 0x50 */
+    qtest_writeb(qts, KW_SUBADDR, 0);
+    qtest_writeb(qts, KW_CONTROL, KW_I2C_CTL_XADDR);
+
+    i2c_wait_isr(qts, KW_I2C_IRQ_ADDR);
+    g_assert_cmphex(qtest_readb(qts, KW_STATUS) & KW_I2C_STAT_LAST_AAK,
+                    ==, 0);
+    g_assert_cmphex(qtest_readb(qts, KW_ISR) & KW_I2C_IRQ_STOP,
+                    ==, KW_I2C_IRQ_STOP);
+
+    qtest_quit(qts);
+}
+
 static const struct {
     const char *name;
     void (*fn)(void);
@@ -806,6 +959,13 @@ static const struct {
       test_control_start_bit_self_clears },
     { "/keywest-i2c/darwin-write-stop-rmw", test_darwin_write_stop_rmw },
     { "/keywest-i2c/darwin-multi-byte-read", test_darwin_multi_byte_read },
+    { "/keywest-i2c/combined-write-roundtrip", test_combined_write_roundtrip },
+    { "/keywest-i2c/combined-write-matches-standardsub",
+      test_combined_write_matches_standardsub },
+    { "/keywest-i2c/combined-multi-byte-write",
+      test_combined_multi_byte_write },
+    { "/keywest-i2c/combined-write-unanswered-naks",
+      test_combined_write_unanswered_naks },
 };
 
 /*
@@ -834,8 +994,9 @@ static bool i2c_addr_acked(QTestState *qts, uint8_t chan, uint8_t addr8)
 /*
  * x-rom-smp: Darwin brings the second CPU up only once the CY28508 has
  * answered both of its read-modify-writes, so the round trip is the
- * contract.  Done the way MacRISC4CPU::enableCPUTimeBase() does it: a
- * combined-mode read, then a standard-sub write to the same register.
+ * contract.  This one follows Apple's published MacRISC4CPU.cpp, which
+ * switches to standard-sub mode before the write; the shipped xnu keeps
+ * the mode at combined instead (see rom-smp-cypress-combined-roundtrip).
  */
 static void test_rom_smp_cypress_roundtrip(void)
 {
@@ -849,6 +1010,24 @@ static void test_rom_smp_cypress_roundtrip(void)
 
     i2c_write_sub(qts, CYPRESS_ADDR8, CYPRESS_REG,
                   (val & ~CYPRESS_MASK) | 0x0c);
+    val = i2c_read_sub(qts, CYPRESS_ADDR8, CYPRESS_REG);
+    g_assert_cmphex(val & CYPRESS_MASK, ==, 0x0c);
+    qtest_quit(qts);
+}
+
+/* The same round trip with the write left in combined mode, as xnu does */
+static void test_rom_smp_cypress_combined_roundtrip(void)
+{
+    QTestState *qts = qtest_init(KW_MACHINE_ROM_SMP);
+    uint8_t orig, val;
+
+    orig = i2c_read_sub(qts, CYPRESS_ADDR8, CYPRESS_REG);
+    i2c_write_combined(qts, CYPRESS_ADDR8, CYPRESS_REG, orig & ~CYPRESS_MASK);
+    val = i2c_read_sub(qts, CYPRESS_ADDR8, CYPRESS_REG);
+    g_assert_cmphex(val & CYPRESS_MASK, ==, 0x00);
+
+    i2c_write_combined(qts, CYPRESS_ADDR8, CYPRESS_REG,
+                       (val & ~CYPRESS_MASK) | 0x0c);
     val = i2c_read_sub(qts, CYPRESS_ADDR8, CYPRESS_REG);
     g_assert_cmphex(val & CYPRESS_MASK, ==, 0x0c);
     qtest_quit(qts);
@@ -1074,6 +1253,28 @@ static void test_spd_multi_byte_read(void)
 }
 
 /* Through byte 3, the way the real Boot ROM drives it, the bytes match. */
+/*
+ * A COMBINED write must not restart the bus into a read.  The clock chip
+ * cannot tell (it ignores I2C_START_RECV), but an SMBus EEPROM can: a
+ * repeated start in the middle of a write turns it into a read and the
+ * data bytes after it are dropped.  So write one SPD byte in combined mode
+ * and read it back.
+ */
+static void test_spd_combined_write(void)
+{
+    QTestState *qts = qtest_init(KW_MACHINE_SPD);
+    uint8_t before;
+
+    kw_chan = KW_CHAN1;
+    before = i2c_read_sub(qts, SPD_ADDR8(0x50), 0x7e);
+    i2c_write_combined(qts, SPD_ADDR8(0x50), 0x7e, before ^ 0xa5);
+    g_assert_cmphex(i2c_read_sub(qts, SPD_ADDR8(0x50), 0x7e), ==,
+                    before ^ 0xa5);
+    kw_chan = 0;
+
+    qtest_quit(qts);
+}
+
 static void test_spd_lane3(void)
 {
     QTestState *qts =
@@ -1560,6 +1761,7 @@ int main(int argc, char **argv)
                    test_lane3_other_bytes_are_holes);
     qtest_add_func("/keywest-i2c/spd-off-is-empty", test_spd_off_is_empty);
     qtest_add_func("/keywest-i2c/spd-pair", test_spd_pair);
+    qtest_add_func("/keywest-i2c/spd-combined-write", test_spd_combined_write);
     qtest_add_func("/keywest-i2c/spd-multi-byte-read",
                    test_spd_multi_byte_read);
     qtest_add_func("/keywest-i2c/spd-lane3", test_spd_lane3);
@@ -1588,6 +1790,8 @@ int main(int argc, char **argv)
                    test_transfer_keeps_its_channel);
     qtest_add_func("/keywest-i2c/rom-smp-cypress-roundtrip",
                    test_rom_smp_cypress_roundtrip);
+    qtest_add_func("/keywest-i2c/rom-smp-cypress-combined-roundtrip",
+                   test_rom_smp_cypress_combined_roundtrip);
     qtest_add_func("/keywest-i2c/rom-smp-clocks-independent",
                    test_rom_smp_clocks_independent);
     qtest_add_func("/keywest-i2c/rom-smp-neighbours-nak",
