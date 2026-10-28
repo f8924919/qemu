@@ -197,10 +197,13 @@ static void keywest_i2c_raise(KeywestI2CState *s, uint8_t bits)
  * Start a transfer.  Both guests kick this off by writing XADDR to the
  * control register after loading mode/addr/subaddr.
  *
- * COMBINED is the awkward one: the address register already holds the read
- * address (bit 0 set), but the first phase still addresses the slave for
- * writing so that the subaddress can be sent, and only then is the bus
- * restarted for reading.
+ * STANDARDSUB and COMBINED are handled alike: the slave is addressed for
+ * writing so that the subaddress can be sent, and only when bit 0 of the
+ * address register asks for a read is the bus restarted for reading.
+ * COMBINED with bit 0 clear is a write -- the shipped xnu leaves the mode
+ * at COMBINED for the write half of its clock-chip read-modify-write, and
+ * Darwin's PPCI2CInterface and Linux's low_i2c.c both run such a transfer
+ * as a write.
  */
 static void keywest_i2c_start(KeywestI2CState *s)
 {
@@ -231,22 +234,13 @@ static void keywest_i2c_start(KeywestI2CState *s)
         break;
 
     case KW_MODE_STANDARDSUB:
+    case KW_MODE_COMBINED:
         nak = i2c_start_send(bus, saddr) != 0;
         if (!nak) {
             nak = i2c_send(bus, s->subaddr) != 0;
         }
         if (!nak && s->xfer_recv) {
             /* Repeated start into the read phase */
-            nak = i2c_start_recv(bus, saddr) != 0;
-        }
-        break;
-
-    case KW_MODE_COMBINED:
-        nak = i2c_start_send(bus, saddr) != 0;
-        if (!nak) {
-            nak = i2c_send(bus, s->subaddr) != 0;
-        }
-        if (!nak) {
             nak = i2c_start_recv(bus, saddr) != 0;
         }
         break;
@@ -280,9 +274,6 @@ done:
     } else {
         s->status |= KW_STAT_LAST_AAK;
         s->xfer_active = true;
-        if (xmode == KW_MODE_COMBINED) {
-            s->xfer_recv = true;
-        }
         s->status |= KW_STAT_BUSY;
     }
     keywest_i2c_raise(s, KW_IRQ_ADDR);
