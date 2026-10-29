@@ -219,6 +219,7 @@ static void test_gpio9_switch_off(void)
 #define MACIO_LOW       0x80000000ULL
 #define GPIO9           0x61
 #define GPIO_IN_DATA    0x02
+#define GPIO_OUT_ENABLE 0x04
 
 static void run_gpio9(const char *opts, bool high)
 {
@@ -226,6 +227,10 @@ static void run_gpio9(const char *opts, bool high)
 
     g_assert_cmpint(!!(qtest_readb(qts, MACIO_LOW + GPIO9) & GPIO_IN_DATA),
                     ==, high);
+    /* A low level reads as 0 from nothing too: check the byte is there */
+    qtest_writeb(qts, MACIO_LOW + GPIO9, GPIO_OUT_ENABLE);
+    g_assert_cmphex(qtest_readb(qts, MACIO_LOW + GPIO9) & GPIO_OUT_ENABLE, ==,
+                    GPIO_OUT_ENABLE);
     qtest_quit(qts);
 }
 
