@@ -1,7 +1,7 @@
 /*
  * The x-real-rom switch of powermac7_3
  *
- * Running a real PowerMac G5 boot ROM with -bios takes fourteen x-
+ * Running a real PowerMac G5 boot ROM with -bios takes fifteen x-
  * switches on powermac7_3.  x-real-rom turns them all to what the ROM
  * wants, and a switch given on its own keeps the value it was given,
  * whichever came first.  The properties are read back with qom-get
@@ -45,6 +45,7 @@ static const RomProp rom_props[] = {
     { "x-no-gpio-cpu-reset" },
     { "x-u3-reg60-nonzero" },
     { "x-rom-smp" },
+    { "x-gpio9-idle-high" },
     { "x-dart", "auto", "on" },
     { "x-ht-k2-layout", "dev3", "dev1-5" },
 };
@@ -192,6 +193,52 @@ static void test_single(void)
     run_machine(",x-u3-memctl=on", false, "x-u3-memctl=on");
 }
 
+/* x-gpio9-idle-high=off is how a real ROM run stops at the prompt */
+static void test_gpio9_off(void)
+{
+    run_machine("," SWITCH "=on,x-gpio9-idle-high=off", true,
+                "x-gpio9-idle-high=off");
+}
+
+static void test_gpio9_single(void)
+{
+    run_machine(",x-gpio9-idle-high=on", false, "x-gpio9-idle-high=on");
+}
+
+static void test_gpio9_switch_off(void)
+{
+    run_machine("," SWITCH "=off,x-gpio9-idle-high=on", false,
+                "x-gpio9-idle-high=on");
+}
+
+/*
+ * Where GPIO 9 rests after reset.  x-macio-80000000 is on with the
+ * switch, so the MacIO is at 0x80000000 without placing a BAR; the
+ * level is bit 1 of the GPIO 9 byte.
+ */
+#define MACIO_LOW       0x80000000ULL
+#define GPIO9           0x61
+#define GPIO_IN_DATA    0x02
+
+static void run_gpio9(const char *opts, bool high)
+{
+    QTestState *qts = qtest_initf("-machine powermac7_3%s " RAM, opts);
+
+    g_assert_cmpint(!!(qtest_readb(qts, MACIO_LOW + GPIO9) & GPIO_IN_DATA),
+                    ==, high);
+    qtest_quit(qts);
+}
+
+static void test_gpio9_rest_on(void)
+{
+    run_gpio9("," SWITCH "=on", true);
+}
+
+static void test_gpio9_rest_off(void)
+{
+    run_gpio9("," SWITCH "=on,x-gpio9-idle-high=off", false);
+}
+
 /* Find the n-th device of @type under /machine/unattached */
 static char *find_type(QTestState *qts, const char *type, int n)
 {
@@ -279,7 +326,8 @@ static void test_children_override(void)
  * Set the switch and the individual ones through qom-set before the
  * machine is built, the switch first or last.
  */
-#define PRE_OVER    "x-rom-smp=off,x-u3-reg60-nonzero=off,x-ht-k2-layout=dev3"
+#define PRE_OVER    "x-rom-smp=off,x-u3-reg60-nonzero=off," \
+                    "x-ht-k2-layout=dev3,x-gpio9-idle-high=off"
 
 static void run_preconfig(bool switch_first)
 {
@@ -355,6 +403,12 @@ int main(int argc, char **argv)
     qtest_add_func("/real-rom-switch/override-after", test_override_after);
     qtest_add_func("/real-rom-switch/override-before", test_override_before);
     qtest_add_func("/real-rom-switch/single", test_single);
+    qtest_add_func("/real-rom-switch/gpio9-off", test_gpio9_off);
+    qtest_add_func("/real-rom-switch/gpio9-single", test_gpio9_single);
+    qtest_add_func("/real-rom-switch/gpio9-switch-off",
+                   test_gpio9_switch_off);
+    qtest_add_func("/real-rom-switch/gpio9-rest-on", test_gpio9_rest_on);
+    qtest_add_func("/real-rom-switch/gpio9-rest-off", test_gpio9_rest_off);
     qtest_add_func("/real-rom-switch/children-default",
                    test_children_default);
     qtest_add_func("/real-rom-switch/children-on", test_children_on);
