@@ -201,6 +201,7 @@ typedef enum RealRomSwitch {
     REAL_ROM_NO_GPIO_CPU_RESET,
     REAL_ROM_U3_REG60_NONZERO,
     REAL_ROM_ROM_SMP,
+    REAL_ROM_GPIO9_IDLE_HIGH,
     REAL_ROM_DART,
     REAL_ROM_HT_K2_LAYOUT,
 } RealRomSwitch;
@@ -252,6 +253,9 @@ static void core99_resolve_real_rom(Core99MachineState *cms)
     }
     if (real_rom_fills(cms, REAL_ROM_ROM_SMP)) {
         cms->rom_smp = true;
+    }
+    if (real_rom_fills(cms, REAL_ROM_GPIO9_IDLE_HIGH)) {
+        cms->gpio9_idle_high = true;
     }
     if (real_rom_fills(cms, REAL_ROM_DART)) {
         cms->dart = ON_OFF_AUTO_ON;
@@ -1580,6 +1584,7 @@ static bool powermac7_3_get_gpio9_idle_high(Object *obj, Error **errp)
 static void powermac7_3_set_gpio9_idle_high(Object *obj, bool value,
                                             Error **errp)
 {
+    real_rom_give(obj, REAL_ROM_GPIO9_IDLE_HIGH);
     CORE99_MACHINE(obj)->gpio9_idle_high = value;
 }
 
@@ -1877,13 +1882,16 @@ static void powermac7_3_machine_class_init(ObjectClass *oc, const void *data)
                                           "x-nvram-flash-id, x-u3-memctl, "
                                           "x-ht-k2-rom-irq, "
                                           "x-no-gpio-cpu-reset, "
-                                          "x-u3-reg60-nonzero and "
-                                          "x-rom-smp. A switch given on its "
-                                          "own keeps its value. "
-                                          "x-gpio9-idle-high and highmem are "
-                                          "left alone. QEMU does not tell the "
-                                          "ROM apart, so do not use it with "
-                                          "OpenBIOS");
+                                          "x-u3-reg60-nonzero, x-rom-smp and "
+                                          "x-gpio9-idle-high, so that the ROM "
+                                          "boots without stopping at its "
+                                          "prompt; give boot-device and "
+                                          "boot-args with -prom-env. A switch "
+                                          "given on its own keeps its value: "
+                                          "x-gpio9-idle-high=off stops at the "
+                                          "prompt. highmem is left alone. "
+                                          "QEMU does not tell the ROM apart, "
+                                          "so do not use it with OpenBIOS");
 }
 
 static void powermac7_3_instance_init(Object *obj)
