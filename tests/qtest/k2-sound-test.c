@@ -604,8 +604,8 @@ static void fan_tach_counts(const char *extra)
                     FAN_TACH_RATE);
 
     /* What the guest writes does not move the count */
-    le_writel(qts, K2_FAN_TACH_B, 0);
-    le_writel(qts, K2_FAN_TACH_A, 0);
+    le_writel(qts, K2_FAN_TACH_B, 0x12345678);
+    le_writel(qts, K2_FAN_TACH_A, 0x9abcdef0);
     g_assert_cmphex(le_readl(qts, K2_FAN_TACH_B), ==, one);
     g_assert_cmphex(le_readl(qts, K2_FAN_TACH_A), ==, one);
 
