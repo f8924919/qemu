@@ -71,6 +71,14 @@
 #define K2_FCR1           (MACIO_BAR + 0x3c)
 #define K2_FCR1_I2S0_BITS 0x00003400   /* cell enable, clock enable, enable */
 
+/* The fans' TACH counts a real ROM reads (docs/arch/macio-k2-sound.md) */
+#define K2_FAN_TACH_A     (MACIO_BAR + 0x2c)
+#define K2_FAN_TACH_B     (MACIO_BAR + 0x34)
+#define K2_FAN_PWM_A      (MACIO_BAR + 0x30)
+#define K2_FAN_PWM_B      (MACIO_BAR + 0x4c)
+#define FAN_TACH_RATE     1000
+#define NS_PER_SEC        1000000000LL
+
 /* DBDMA channels of I2S-a */
 #define DBDMA_BASE        (MACIO_BAR + 0x8000)
 #define DBDMA_CH(n)       (DBDMA_BASE + ((n) << 7))
@@ -564,6 +572,91 @@ static void test_i2c_dumb_not_on_k2(void)
     qtest_quit(qts);
 }
 
+/* Off, the TACH registers are plain storage like the other FCRs */
+static void test_fan_tach_off(void)
+{
+    QTestState *qts = k2_init("");
+
+    le_writel(qts, K2_FAN_TACH_A, 0x12345678);
+    le_writel(qts, K2_FAN_TACH_B, 0x9abcdef0);
+    qtest_clock_step(qts, NS_PER_SEC);
+    g_assert_cmphex(le_readl(qts, K2_FAN_TACH_A), ==, 0x12345678);
+    g_assert_cmphex(le_readl(qts, K2_FAN_TACH_B), ==, 0x9abcdef0);
+
+    qtest_quit(qts);
+}
+
+/*
+ * On, both halves of both registers count with the virtual clock, which
+ * qtest starts at zero and moves only on clock_step.
+ */
+static void fan_tach_counts(const char *extra)
+{
+    QTestState *qts = k2_init(extra);
+    uint32_t one = FAN_TACH_RATE * 0x10001;
+
+    g_assert_cmphex(le_readl(qts, K2_FAN_TACH_B), ==, 0);
+    qtest_clock_step(qts, NS_PER_SEC);
+    g_assert_cmphex(le_readl(qts, K2_FAN_TACH_B), ==, one);
+    g_assert_cmphex(le_readl(qts, K2_FAN_TACH_A), ==, one);
+    /* A two-byte read of the upper half reaches the same register */
+    g_assert_cmphex(bswap16(qtest_readw(qts, K2_FAN_TACH_B + 2)), ==,
+                    FAN_TACH_RATE);
+
+    /* What the guest writes does not move the count */
+    le_writel(qts, K2_FAN_TACH_B, 0);
+    le_writel(qts, K2_FAN_TACH_A, 0);
+    g_assert_cmphex(le_readl(qts, K2_FAN_TACH_B), ==, one);
+    g_assert_cmphex(le_readl(qts, K2_FAN_TACH_A), ==, one);
+
+    /* The PWM registers next to them still read back */
+    le_writel(qts, K2_FAN_PWM_A, 0x01010101);
+    le_writel(qts, K2_FAN_PWM_B, 0x02020202);
+    g_assert_cmphex(le_readl(qts, K2_FAN_PWM_A), ==, 0x01010101);
+    g_assert_cmphex(le_readl(qts, K2_FAN_PWM_B), ==, 0x02020202);
+
+    qtest_quit(qts);
+}
+
+static void test_fan_tach_on(void)
+{
+    fan_tach_counts("-machine powermac7_3,x-k2-fan-tach=on");
+}
+
+/* The machine leaves the device alone when off, so -global works too */
+static void test_fan_tach_global(void)
+{
+    fan_tach_counts("-global k2-i2s.x-fan-tach=on");
+}
+
+/*
+ * Across the 16-bit wrap a second still moves the count by the rate once
+ * the 0x10000 AppleK2Fan adds back is taken into account.
+ */
+static void test_fan_tach_wraps(void)
+{
+    QTestState *qts = k2_init("-machine powermac7_3,x-k2-fan-tach=on");
+    uint32_t a, b;
+
+    qtest_clock_step(qts, 65 * NS_PER_SEC + NS_PER_SEC / 2);
+    a = le_readl(qts, K2_FAN_TACH_B) & 0xffff;
+    qtest_clock_step(qts, NS_PER_SEC);
+    b = le_readl(qts, K2_FAN_TACH_B) & 0xffff;
+    g_assert_cmpuint(b, <, a);
+    g_assert_cmpuint((b - a + 0x10000) & 0xffff, ==, FAN_TACH_RATE);
+
+    qtest_quit(qts);
+}
+
+/* Without a K2 (a G4 CPU) the switch has nothing to reach */
+static void test_fan_tach_no_k2(void)
+{
+    QTestState *qts = qtest_init("-machine powermac7_3,x-k2-fan-tach=on "
+                                 "-cpu 7447a");
+
+    qtest_quit(qts);
+}
+
 /*
  * The real ROM's sequence on channel 0: clear, select s0 for the branch,
  * run, then set s0 from the control register.  The loop ends and the
@@ -716,6 +809,11 @@ int main(int argc, char **argv)
     qtest_add_func("/k2-sound/i2c-lane3-not-on-k2", test_i2c_lane3_not_on_k2);
     qtest_add_func("/k2-sound/i2c-dumb-not-on-k2", test_i2c_dumb_not_on_k2);
     qtest_add_func("/k2-sound/fcr-reads-back", test_fcr_reads_back);
+    qtest_add_func("/k2-sound/fan-tach-off", test_fan_tach_off);
+    qtest_add_func("/k2-sound/fan-tach-on", test_fan_tach_on);
+    qtest_add_func("/k2-sound/fan-tach-global", test_fan_tach_global);
+    qtest_add_func("/k2-sound/fan-tach-wraps", test_fan_tach_wraps);
+    qtest_add_func("/k2-sound/fan-tach-no-k2", test_fan_tach_no_k2);
     qtest_add_func("/k2-sound/dma-out-retires", test_dma_out_retires);
     qtest_add_func("/k2-sound/dma-in-retires", test_dma_in_retires);
     qtest_add_func("/k2-sound/dma-out-starts-on-time",

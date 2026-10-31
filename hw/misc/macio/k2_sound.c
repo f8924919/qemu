@@ -22,6 +22,8 @@
 #include "system/dma.h"
 #include "qemu/bswap.h"
 #include "qemu/module.h"
+#include "qemu/host-utils.h"
+#include "qemu/timer.h"
 #include "trace.h"
 
 #define I2S_REG_INT_CTL             0x00
@@ -63,12 +65,31 @@ static void k2_i2s_update_clocks(K2I2SState *s)
     }
 }
 
+/*
+ * Both halves carry the same count, so the value moves on every read
+ * whichever half and byte order the guest uses.  Nothing is kept: what
+ * the guest writes there stays in fcr[] but is not read back.
+ */
+static uint32_t k2_fan_tach(void)
+{
+    uint16_t n = muldiv64(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                          K2_FAN_TACH_RATE, NANOSECONDS_PER_SECOND);
+
+    return n * 0x10001;
+}
+
 static uint64_t k2_fcr_read(void *opaque, hwaddr addr, unsigned size)
 {
     K2I2SState *s = opaque;
-    uint32_t val = s->fcr[addr >> 2];
+    unsigned i = addr >> 2;
+    uint32_t val = s->fcr[i];
 
     trace_k2_fcr_read(K2_FCR_BASE + addr, val);
+    if (s->fan_tach && (i == (K2_FAN_TACH_A - K2_FCR_BASE) >> 2 ||
+                        i == (K2_FAN_TACH_B - K2_FCR_BASE) >> 2)) {
+        val = k2_fan_tach();
+        trace_k2_fcr_tach(K2_FCR_BASE + (i << 2), val);
+    }
     return val;
 }
 
@@ -618,6 +639,7 @@ static const Property k2_i2s_properties[] = {
     DEFINE_AUDIO_PROPERTIES(K2I2SState, audio_be),
     DEFINE_PROP_LINK("codec", K2I2SState, codec, TYPE_I2C_SLAVE, I2CSlave *),
     DEFINE_PROP_LINK("dbdma", K2I2SState, dbdma, TYPE_MAC_DBDMA, Object *),
+    DEFINE_PROP_BOOL("x-fan-tach", K2I2SState, fan_tach, false),
 };
 
 static void k2_i2s_class_init(ObjectClass *oc, const void *data)

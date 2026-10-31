@@ -277,9 +277,11 @@ static void check_children(QTestState *qts, const ChildWant *w)
     g_autofree char *unin = find_type(qts, "uni-north", 0);
     g_autofree char *cpu1 = find_type(qts, "-powerpc64-cpu", 1);
     g_autofree char *dbdma = NULL;
+    g_autofree char *i2s = NULL;
 
     g_assert(i2c && macio && nvram && unin && cpu1);
     dbdma = g_strdup_printf("%s/dbdma", macio);
+    i2s = g_strdup_printf("%s/i2s", macio);
     g_assert_cmpint(get_bool(qts, i2c, "x-lane3"), ==, w->lane3);
     g_assert_cmpint(get_bool(qts, i2c, "x-dumb"), ==, w->dumb);
     g_assert_cmpint(get_bool(qts, dbdma, "x-devstat"), ==, w->devstat);
@@ -288,6 +290,8 @@ static void check_children(QTestState *qts, const ChildWant *w)
     g_assert_cmpint(get_bool(qts, unin, "x-cpu-number"), ==, w->cpu_number);
     g_assert_cmpint(get_bool(qts, cpu1, "start-powered-off"), ==,
                     w->cpu1_off);
+    /* Not one of them: the fan count is its own switch */
+    g_assert_false(get_bool(qts, i2s, "x-fan-tach"));
 }
 
 static void run_children(const char *opts, const ChildWant *w)

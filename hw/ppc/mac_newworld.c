@@ -157,6 +157,8 @@ struct Core99MachineState {
     bool u3_i2c_dumb;
     /* PowerMac7,3: DBDMA control writes set s0-s7 (x-dbdma-devstat) */
     bool dbdma_devstat;
+    /* PowerMac7,3: the fans' TACH counts move (x-k2-fan-tach) */
+    bool k2_fan_tach;
     /* PowerMac7,3: NVRAM flash answers Read Identifier (x-nvram-flash-id) */
     bool nvram_flash_id;
     /* PowerMac7,3: U3 registers at 0xf8002000 as storage (x-u3-memctl) */
@@ -984,6 +986,16 @@ static void ppc_core99_init(MachineState *machine)
         if (machine->audiodev) {
             qdev_prop_set_string(dev, "audiodev", machine->audiodev);
         }
+        /*
+         * Only when on, as with x-dbdma-devstat, and only here: the K2
+         * and its i2s child exist with a 970 CPU only.
+         */
+        if (core99_machine->k2_fan_tach) {
+            DeviceState *i2s = DEVICE(object_resolve_path_component(
+                                      OBJECT(dev), "i2s"));
+
+            qdev_prop_set_bit(i2s, "x-fan-tach", true);
+        }
     }
 
     if (core99_machine->gpio9_idle_high) {
@@ -1553,6 +1565,17 @@ static bool powermac7_3_get_dbdma_devstat(Object *obj, Error **errp)
     return CORE99_MACHINE(obj)->dbdma_devstat;
 }
 
+static bool powermac7_3_get_k2_fan_tach(Object *obj, Error **errp)
+{
+    return CORE99_MACHINE(obj)->k2_fan_tach;
+}
+
+static void powermac7_3_set_k2_fan_tach(Object *obj, bool value,
+                                        Error **errp)
+{
+    CORE99_MACHINE(obj)->k2_fan_tach = value;
+}
+
 static bool powermac7_3_get_nvram_flash_id(Object *obj, Error **errp)
 {
     return CORE99_MACHINE(obj)->nvram_flash_id;
@@ -1785,6 +1808,15 @@ static void powermac7_3_machine_class_init(ObjectClass *oc, const void *data)
                                           "the s0-s7 status bits, which a "
                                           "real boot ROM uses (off by "
                                           "default)");
+    object_class_property_add_bool(oc, "x-k2-fan-tach",
+                                   powermac7_3_get_k2_fan_tach,
+                                   powermac7_3_set_k2_fan_tach);
+    object_class_property_set_description(oc, "x-k2-fan-tach",
+                                          "Let the fans' TACH counts that "
+                                          "a real boot ROM reads move with "
+                                          "the virtual clock, so that "
+                                          "AppleK2Fan sees them turning "
+                                          "(off by default)");
     object_class_property_add_bool(oc, "x-nvram-flash-id",
                                    powermac7_3_get_nvram_flash_id,
                                    powermac7_3_set_nvram_flash_id);

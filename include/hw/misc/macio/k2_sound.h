@@ -21,6 +21,15 @@ OBJECT_DECLARE_SIMPLE_TYPE(K2I2SState, K2_I2S)
 #define K2_FCR_COUNT                11
 #define K2_FCR1                     0x3c
 
+/*
+ * A real boot ROM's fans node reads its four TACH counts from 0x2c and
+ * 0x34, sixteen bits each, and AppleK2Fan reports a failure once a count
+ * stops moving.  With x-fan-tach they count with the virtual clock.
+ */
+#define K2_FAN_TACH_A               0x2c
+#define K2_FAN_TACH_B               0x34
+#define K2_FAN_TACH_RATE            1000    /* counts a second, made up */
+
 #define K2_FCR1_I2S0_CELL_ENABLE    0x00000400
 #define K2_FCR1_I2S0_RESET          0x00000800
 #define K2_FCR1_I2S0_CLK_ENABLE     0x00001000
@@ -60,6 +69,7 @@ struct K2I2SState {
     qemu_irq irq[2];            /* 0 out, 1 in: to the pic */
     qemu_irq dma_irq[2];        /* handed to the DBDMA, forwarded to irq[] */
     uint32_t fcr[K2_FCR_COUNT];
+    bool fan_tach;
 
     uint32_t intr_ctl;
     uint32_t serial_format;
