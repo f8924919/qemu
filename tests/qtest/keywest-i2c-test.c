@@ -1252,7 +1252,6 @@ static void test_spd_multi_byte_read(void)
     qtest_quit(qts);
 }
 
-/* Through byte 3, the way the real Boot ROM drives it, the bytes match. */
 /*
  * A COMBINED write must not restart the bus into a read.  The clock chip
  * cannot tell (it ignores I2C_START_RECV), but an SMBus EEPROM can: a
@@ -1275,6 +1274,7 @@ static void test_spd_combined_write(void)
     qtest_quit(qts);
 }
 
+/* Through byte 3, the way the real Boot ROM drives it, the bytes match. */
 static void test_spd_lane3(void)
 {
     QTestState *qts =

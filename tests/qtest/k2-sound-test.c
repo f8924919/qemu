@@ -333,11 +333,6 @@ static uint16_t dma_xfer_status(QTestState *qts)
 }
 
 /*
- * Descriptors retire at the pace the audio would play, from a timer.
- * Without an audiodev the cell stays silent but must still retire them:
- * a guest whose output DMA never completes blocks its sound server.
- */
-/*
  * A program that loops on itself until the branch condition holds, then
  * stops: a NOP that branches back to itself while the condition is clear,
  * and a STOP after it.
@@ -386,6 +381,11 @@ static void dbdma_fill_unimplemented(QTestState *qts, int ch)
     }
 }
 
+/*
+ * Descriptors retire at the pace the audio would play, from a timer.
+ * Without an audiodev the cell stays silent but must still retire them:
+ * a guest whose output DMA never completes blocks its sound server.
+ */
 static void dma_retires_after(int ch, uint16_t cmd, int irq, bool fill)
 {
     QTestState *qts = k2_init("");
