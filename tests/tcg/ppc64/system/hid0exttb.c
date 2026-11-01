@@ -2,11 +2,12 @@
  * HID0 bit 19 and interrupts in hypervisor state on a 970.
  *
  * On the 970, bit 19 of the 64-bit HID0 makes the timebase run from the
- * external clock, and a PowerMac7,2 boot ROM sets it.  The same bit is
- * HILE on POWER8: there it makes interrupts taken in hypervisor state run
- * little-endian.  The 970 has no little-endian mode at all, so with the
- * bit set an interrupt still has to arrive big-endian, in a handler that
- * can run and return.
+ * external clock according to NetBSD, which calls it HID0_64_EX_TBEN (not
+ * checked against IBM's 970FX manual), and a PowerMac7,2 boot ROM sets it.
+ * The same bit is HILE on POWER8: there it makes interrupts taken in
+ * hypervisor state run little-endian.  The 970 has no little-endian mode at
+ * all, so with the bit set an interrupt still has to arrive big-endian, in a
+ * handler that can run and return.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
