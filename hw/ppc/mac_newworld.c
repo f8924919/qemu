@@ -127,12 +127,6 @@ enum {
     HT_K2_LAYOUT_DEV1_5,
 };
 
-static const char *const ht_k2_layout_names[] = {
-    [HT_K2_LAYOUT_DEV3] = "dev3",
-    [HT_K2_LAYOUT_DEV1] = "dev1",
-    [HT_K2_LAYOUT_DEV1_5] = "dev1-5",
-};
-
 struct Core99MachineState {
     /*< private >*/
     MachineState parent;
@@ -1775,6 +1769,12 @@ static void powermac7_3_set_dbdma_devstat(Object *obj, bool value,
     real_rom_give(obj, REAL_ROM_DBDMA_DEVSTAT);
     CORE99_MACHINE(obj)->dbdma_devstat = value;
 }
+
+static const char *const ht_k2_layout_names[] = {
+    [HT_K2_LAYOUT_DEV3] = "dev3",
+    [HT_K2_LAYOUT_DEV1] = "dev1",
+    [HT_K2_LAYOUT_DEV1_5] = "dev1-5",
+};
 
 static char *powermac7_3_get_ht_k2_layout(Object *obj, Error **errp)
 {
