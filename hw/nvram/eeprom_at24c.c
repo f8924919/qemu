@@ -66,6 +66,13 @@ int at24c_eeprom_event(I2CSlave *s, enum i2c_event event)
     switch (event) {
     case I2C_START_SEND:
     case I2C_FINISH:
+        /*
+         * A transfer that ended after only part of the address leaves cur
+         * unreduced; recv() reads mem[cur] once haveaddr is back to 0.
+         */
+        if (ee->haveaddr > 0 && ee->haveaddr < ee->asize) {
+            ee->cur %= ee->rsize;
+        }
         ee->haveaddr = 0;
         /* fallthrough */
     case I2C_START_RECV:
