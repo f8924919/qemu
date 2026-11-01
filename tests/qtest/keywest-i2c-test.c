@@ -1979,6 +1979,12 @@ static void test_thermal_negative_values(void)
     g_assert_cmphex(i2c_read_sub(qts, MAX6690_0_ADDR8, 0x10), ==, 0x00);
     therm_set(qts, AD7417_PATH, "temperature", -250);
     g_assert_cmphex(therm_read2(qts, AD7417_ADDR8, 0), ==, 0xffc0);
+    /* Between steps, a negative value rounds down, not toward zero */
+    therm_set(qts, MAX6690_0_PATH, "temperature0", -400);
+    g_assert_cmphex(i2c_read_sub(qts, MAX6690_0_ADDR8, 0x00), ==, 0xff);
+    g_assert_cmphex(i2c_read_sub(qts, MAX6690_0_ADDR8, 0x11), ==, 0x80);
+    therm_set(qts, AD7417_PATH, "temperature", -100);
+    g_assert_cmphex(therm_read2(qts, AD7417_ADDR8, 0), ==, 0xffc0);
     qtest_quit(qts);
 }
 
