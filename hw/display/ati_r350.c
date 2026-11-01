@@ -5575,11 +5575,12 @@ static void ati_r350_agp_attach(ATIR350State *s)
 }
 
 /*
- * qemu_edid_generate() describes a digital (DisplayPort) monitor. The ATI
- * Mac OS X driver then treats the head as single-link TMDS and drops every
- * mode above 165MHz, which leaves 1920x1200 out even when it is the
- * preferred mode. Present the same timings as an analog RGB monitor, the
- * way the fixed EDID does, so the DAC's limit applies instead.
+ * qemu_edid_generate() describes a digital (DisplayPort) monitor. With it
+ * Mac OS X listed only modes up to 162MHz, which leaves 1920x1200 out even
+ * when it is the preferred mode. Presented as an analog RGB monitor, the way
+ * the fixed EDID does, the same timings also list 1920x1200@75 at 241MHz.
+ * The driver seems to treat a digital head as single-link TMDS with a 165MHz
+ * limit, but that is a guess: nobody has looked inside it.
  */
 static void ati_r350_edid_analog(uint8_t *edid)
 {
@@ -6782,8 +6783,9 @@ static void ati_r350_class_init(ObjectClass *klass, const void *data)
         "only)");
     object_class_property_set_description(klass, "guest_hwcursor",
         "Draw the guest's hardware cursor into the display surface instead "
-        "of handing it to the UI, which draws it offset as the registers "
-        "carry no hot spot");
+        "of handing it to the UI. A UI that puts the hot spot under its own "
+        "pointer, like VNC, draws it offset as the registers carry no hot "
+        "spot");
     rc->phases.hold = ati_r350_reset_hold;
     set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
 }
