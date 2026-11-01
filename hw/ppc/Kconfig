@@ -154,6 +154,7 @@ config MAC_NEWWORLD
     select TMP105
     select MAX6690
     select AD7417
+    select AT24C
 
 config E500
     bool

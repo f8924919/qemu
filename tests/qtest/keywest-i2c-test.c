@@ -1382,15 +1382,22 @@ static void dumb_write_reg(QTestState *qts, uint8_t reg, uint8_t val)
  * byte with AAK clear -- the controller stops by itself on the ack after
  * the byte.  `ack` is the value written to the ISR to acknowledge DATA.
  */
-static uint8_t dumb_read_reg_at(QTestState *qts, uint8_t addr8, uint8_t reg,
+static uint8_t dumb_read_ptr_at(QTestState *qts, uint8_t addr8,
+                                const uint8_t *ptr, unsigned nptr,
                                 uint8_t ack)
 {
     uint8_t val;
+    unsigned i;
 
     g_assert_true(dumb_open(qts, 0, addr8 & ~1));
     qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_DATA);
-    qtest_writeb(qts, KW_DATA, reg);
-    i2c_wait_isr(qts, KW_I2C_IRQ_DATA);
+    for (i = 0; i < nptr; i++) {
+        if (i) {
+            qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_DATA);
+        }
+        qtest_writeb(qts, KW_DATA, ptr[i]);
+        i2c_wait_isr(qts, KW_I2C_IRQ_DATA);
+    }
 
     /* Repeated START: ends the write without a STOP interrupt */
     qtest_writeb(qts, KW_ISR, 0x0f);
@@ -1407,6 +1414,12 @@ static uint8_t dumb_read_reg_at(QTestState *qts, uint8_t addr8, uint8_t reg,
     qtest_writeb(qts, KW_ISR, 0x0f);
 
     return val;
+}
+
+static uint8_t dumb_read_reg_at(QTestState *qts, uint8_t addr8, uint8_t reg,
+                                uint8_t ack)
+{
+    return dumb_read_ptr_at(qts, addr8, &reg, 1, ack);
 }
 
 /* ... of the clock chip */
@@ -2187,6 +2200,312 @@ static void test_thermal_lane3(void)
     qtest_quit(qts);
 }
 
+/*
+ * x-u3-i2c-cpuid: the CPU card's EEPROM (a 24256, 32 KiB, 2-byte addresses)
+ * that a real boot ROM reads at 8-bit 0xa0 on channel 0.  The ROM writes the
+ * two address bytes in a standard mode transfer and reads the contents in
+ * another one; only the slot number (+0x24, 0) and the MLB serial number
+ * (+0x80, 16 bytes, copied from the ROM's 0x3fc0) are not 0xff.  The
+ * expected bytes below are written out by hand, not computed.
+ */
+#define KW_MACHINE_CPUID "-machine powermac7_3,x-u3-i2c-cpuid=on"
+#define KW_MACHINE_CPUID_LANE3 \
+    "-machine powermac7_3,x-u3-i2c-cpuid=on,x-u3-i2c-lane3=on"
+#define KW_MACHINE_CPUID_DUMB \
+    "-machine powermac7_3,x-u3-i2c-cpuid=on,x-u3-i2c-dumb=on"
+
+#define CPUID_ADDR8       0xa0
+#define CPUID_SLOT        0x24
+#define CPUID_MLB         0x80
+#define CPUID_MLB_LEN     16
+/* What a qtest "ROM" holds at 0x3fc0, where Boot ROM 5.1.5f2 has its MLB */
+#define ROM_MLB_OFFSET    0x3fc0
+#define ROM_MLB           "QTEST-MLB-SN-123"
+
+/* Standard mode write of `n` bytes to the 8-bit address `addr8` */
+static void std_write(QTestState *qts, uint8_t addr8, const uint8_t *b,
+                      unsigned n)
+{
+    unsigned i;
+
+    qtest_writeb(qts, KW_STATUS, 0);
+    qtest_writeb(qts, KW_MODE, KW_I2C_MODE_STANDARD | KW_I2C_MODE_100KHZ);
+    qtest_writeb(qts, KW_ADDR, addr8 & ~1);
+    qtest_writeb(qts, KW_CONTROL, KW_I2C_CTL_XADDR);
+    i2c_wait_isr(qts, KW_I2C_IRQ_ADDR);
+    g_assert_cmphex(qtest_readb(qts, KW_STATUS) & KW_I2C_STAT_LAST_AAK,
+                    ==, KW_I2C_STAT_LAST_AAK);
+    qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_ADDR);
+
+    for (i = 0; i < n; i++) {
+        qtest_writeb(qts, KW_DATA, b[i]);
+        i2c_wait_isr(qts, KW_I2C_IRQ_DATA);
+        g_assert_cmphex(qtest_readb(qts, KW_STATUS) & KW_I2C_STAT_LAST_AAK,
+                        ==, KW_I2C_STAT_LAST_AAK);
+        qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_DATA);
+    }
+
+    qtest_writeb(qts, KW_CONTROL, KW_I2C_CTL_STOP);
+    i2c_wait_isr(qts, KW_I2C_IRQ_STOP);
+    qtest_writeb(qts, KW_ISR, 0x0f);
+}
+
+/*
+ * Standard mode read of `n` bytes from `addr8`, from wherever the chip
+ * was last pointed.  AAK stays armed until the last byte is under way, and
+ * every DATA is acked twice with the AAK change in between, as
+ * test_multi_byte_read() does.
+ */
+static void std_read(QTestState *qts, uint8_t addr8, uint8_t *out,
+                     unsigned n)
+{
+    unsigned i;
+
+    qtest_writeb(qts, KW_STATUS, 0);
+    qtest_writeb(qts, KW_MODE, KW_I2C_MODE_STANDARD | KW_I2C_MODE_100KHZ);
+    qtest_writeb(qts, KW_ADDR, addr8 | 1);
+    qtest_writeb(qts, KW_CONTROL, KW_I2C_CTL_XADDR);
+    i2c_wait_isr(qts, KW_I2C_IRQ_ADDR);
+    g_assert_cmphex(qtest_readb(qts, KW_STATUS) & KW_I2C_STAT_LAST_AAK,
+                    ==, KW_I2C_STAT_LAST_AAK);
+
+    qtest_writeb(qts, KW_CONTROL, n > 1 ? KW_I2C_CTL_AAK : 0);
+    qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_ADDR);
+    for (i = 0; i < n; i++) {
+        i2c_wait_isr(qts, KW_I2C_IRQ_DATA);
+        out[i] = qtest_readb(qts, KW_DATA);
+        qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_DATA);
+        if (i + 2 == n) {
+            qtest_writeb(qts, KW_CONTROL, 0);
+        }
+        qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_DATA);
+    }
+    i2c_wait_isr(qts, KW_I2C_IRQ_STOP);
+    qtest_writeb(qts, KW_ISR, 0x0f);
+}
+
+/* What the ROM does: the 2-byte address in one transfer, a read in another */
+static void cpuid_read_at(QTestState *qts, uint16_t off, uint8_t *out,
+                          unsigned n)
+{
+    uint8_t ptr[2] = { off >> 8, off & 0xff };
+
+    std_write(qts, CPUID_ADDR8, ptr, 2);
+    std_read(qts, CPUID_ADDR8, out, n);
+}
+
+static uint8_t cpuid_read1(QTestState *qts, uint16_t off)
+{
+    uint8_t b;
+
+    cpuid_read_at(qts, off, &b, 1);
+    return b;
+}
+
+/*
+ * A raw 1 MiB "ROM" for -bios: not an ELF, so it is read as a binary
+ * image, as Boot ROM 5.1.5f2 is.  The caller frees the name and unlinks.
+ */
+static char *cpuid_make_rom(void)
+{
+    char *name = NULL;
+    g_autofree uint8_t *rom = g_malloc(1024 * 1024);
+    int fd = g_file_open_tmp("keywest-cpuid-XXXXXX.rom", &name, NULL);
+
+    g_assert_cmpint(fd, >=, 0);
+    close(fd);
+    memset(rom, 0xff, 1024 * 1024);
+    memcpy(rom + ROM_MLB_OFFSET, ROM_MLB, CPUID_MLB_LEN);
+    g_assert_true(g_file_set_contents(name, (char *)rom, 1024 * 1024, NULL));
+    return name;
+}
+
+static QTestState *cpuid_init_rom(char **romname)
+{
+    QTestState *qts;
+
+    *romname = cpuid_make_rom();
+    qts = qtest_initf("%s -bios %s", KW_MACHINE_CPUID, *romname);
+    return qts;
+}
+
+static void cpuid_quit_rom(QTestState *qts, char *romname)
+{
+    qtest_quit(qts);
+    unlink(romname);
+    g_free(romname);
+}
+
+/* Without the switch 0xa0 is empty, as it always was */
+static void test_cpuid_off_naks(void)
+{
+    QTestState *qts = qtest_init(KW_MACHINE);
+
+    g_assert_false(i2c_addr_acked(qts, 0x00, CPUID_ADDR8));
+    /* The clock chip is still there */
+    g_assert_true(i2c_addr_acked(qts, 0x00, HWCLOCK_ADDR8));
+    qtest_quit(qts);
+}
+
+/* check-calibration wants the slot number at +0x24 to be 0 */
+static void test_cpuid_slot_number(void)
+{
+    QTestState *qts = qtest_init(KW_MACHINE_CPUID);
+
+    g_assert_true(i2c_addr_acked(qts, 0x00, CPUID_ADDR8));
+    g_assert_cmphex(cpuid_read1(qts, CPUID_SLOT), ==, 0x00);
+    qtest_quit(qts);
+}
+
+/* ... and the MLB serial number at +0x80 to be the ROM's */
+static void test_cpuid_mlb_from_rom(void)
+{
+    char *romname;
+    QTestState *qts = cpuid_init_rom(&romname);
+    uint8_t mlb[CPUID_MLB_LEN];
+
+    cpuid_read_at(qts, CPUID_MLB, mlb, CPUID_MLB_LEN);
+    g_assert_cmpmem(mlb, CPUID_MLB_LEN, ROM_MLB, CPUID_MLB_LEN);
+    cpuid_quit_rom(qts, romname);
+}
+
+/* OpenBIOS (an ELF) has no such block: the 16 bytes stay 0xff */
+static void test_cpuid_mlb_openbios(void)
+{
+    QTestState *qts = qtest_init(KW_MACHINE_CPUID);
+    uint8_t mlb[CPUID_MLB_LEN];
+    unsigned i;
+
+    cpuid_read_at(qts, CPUID_MLB, mlb, CPUID_MLB_LEN);
+    for (i = 0; i < CPUID_MLB_LEN; i++) {
+        g_assert_cmphex(mlb[i], ==, 0xff);
+    }
+    qtest_quit(qts);
+}
+
+/*
+ * Everything else is 0xff, next to the slot number included: a slot number
+ * put one byte off would show up here.
+ */
+static void test_cpuid_rest_is_ff(void)
+{
+    static const uint16_t offs[] = {
+        0x0000, 0x0023, 0x0025, 0x0028, 0x007f, 0x0090, 0x7fff,
+    };
+    QTestState *qts = qtest_init(KW_MACHINE_CPUID);
+    unsigned i;
+
+    for (i = 0; i < ARRAY_SIZE(offs); i++) {
+        g_assert_cmphex(cpuid_read1(qts, offs[i]), ==, 0xff);
+    }
+    qtest_quit(qts);
+}
+
+/*
+ * The ROM's own read: pointer 0x0000 in one standard mode transfer, then
+ * 160 bytes in another.
+ */
+static void test_cpuid_rom_procedure(void)
+{
+    char *romname;
+    QTestState *qts = cpuid_init_rom(&romname);
+    uint8_t img[0xa0];
+    unsigned i;
+
+    cpuid_read_at(qts, 0, img, sizeof(img));
+    for (i = 0; i < sizeof(img); i++) {
+        if (i == CPUID_SLOT) {
+            g_assert_cmphex(img[i], ==, 0x00);
+        } else if (i >= CPUID_MLB && i < CPUID_MLB + CPUID_MLB_LEN) {
+            g_assert_cmphex(img[i], ==, (uint8_t)ROM_MLB[i - CPUID_MLB]);
+        } else {
+            g_assert_cmphex(img[i], ==, 0xff);
+        }
+    }
+    cpuid_quit_rom(qts, romname);
+}
+
+/* DUMB mode, the way the ROM first reads it: 0xa0, 0x00 0x00, 0xa1 */
+static void test_cpuid_dumb(void)
+{
+    QTestState *qts = qtest_init(KW_MACHINE_CPUID_DUMB);
+    static const uint8_t p0[2] = { 0x00, 0x00 };
+    static const uint8_t pslot[2] = { 0x00, CPUID_SLOT };
+
+    g_assert_cmphex(dumb_read_ptr_at(qts, CPUID_ADDR8, p0, 2,
+                                     KW_I2C_IRQ_DATA), ==, 0xff);
+    g_assert_cmphex(dumb_read_ptr_at(qts, CPUID_ADDR8, pslot, 2,
+                                     KW_I2C_IRQ_DATA), ==, 0x00);
+    qtest_quit(qts);
+}
+
+/* Byte 3 of the register slots is the same controller */
+static void test_cpuid_lane3(void)
+{
+    QTestState *qts = qtest_init(KW_MACHINE_CPUID_LANE3);
+
+    kw_base = KW_I2C_BASE + KW_LANE3;
+    g_assert_cmphex(cpuid_read1(qts, CPUID_SLOT), ==, 0x00);
+    g_assert_cmphex(cpuid_read1(qts, 0x0000), ==, 0xff);
+    kw_base = KW_I2C_BASE;
+    g_assert_cmphex(cpuid_read1(qts, CPUID_SLOT), ==, 0x00);
+    qtest_quit(qts);
+}
+
+/*
+ * STANDARDSUB and COMBINED carry one byte of sub-address, which is half of
+ * this chip's address: the read that follows is the "address not complete"
+ * one and gives 0xff, and the chip is still usable afterwards.
+ */
+static void test_cpuid_one_byte_subaddress(void)
+{
+    QTestState *qts = qtest_init(KW_MACHINE_CPUID);
+    uint8_t b;
+
+    g_assert_cmphex(cpuid_read1(qts, CPUID_SLOT), ==, 0x00);
+    therm_read(qts, KW_I2C_MODE_COMBINED, CPUID_ADDR8, CPUID_SLOT, &b, 1);
+    g_assert_cmphex(b, ==, 0xff);
+    g_assert_cmphex(cpuid_read1(qts, CPUID_SLOT), ==, 0x00);
+    therm_read(qts, KW_I2C_MODE_STANDARDSUB, CPUID_ADDR8, CPUID_SLOT, &b, 1);
+    g_assert_cmphex(b, ==, 0xff);
+    g_assert_cmphex(cpuid_read1(qts, CPUID_SLOT), ==, 0x00);
+    qtest_quit(qts);
+}
+
+/* Only 0xa0 on channel 0: not channel 1 (no SPD here), not 0xa2 */
+static void test_cpuid_neighbours_nak(void)
+{
+    QTestState *qts = qtest_init(KW_MACHINE_CPUID);
+
+    g_assert_true(i2c_addr_acked(qts, 0x00, CPUID_ADDR8));
+    g_assert_false(i2c_addr_acked(qts, KW_CHAN1, CPUID_ADDR8));
+    g_assert_false(i2c_addr_acked(qts, 0x00, 0xa2));
+    g_assert_true(i2c_addr_acked(qts, 0x00, HWCLOCK_ADDR8));
+    qtest_quit(qts);
+}
+
+/*
+ * A lone first byte of the 2-byte address, then STOP, leaves the address
+ * counter above the size of the chip; the next read must still be inside
+ * it.  Pointer 0x0080, then the single byte 0x80 (the counter would be
+ * 0x8080 of a 0x8000-byte chip), then a read from where the chip points:
+ * +0x80, the first byte of the MLB.  Needs the at24c fix.
+ */
+static void test_cpuid_partial_address_stays_in_range(void)
+{
+    char *romname;
+    QTestState *qts = cpuid_init_rom(&romname);
+    static const uint8_t ptr[2] = { 0x00, 0x80 };
+    static const uint8_t lone[1] = { 0x80 };
+    uint8_t b;
+
+    std_write(qts, CPUID_ADDR8, ptr, 2);
+    std_write(qts, CPUID_ADDR8, lone, 1);
+    std_read(qts, CPUID_ADDR8, &b, 1);
+    g_assert_cmphex(b, ==, (uint8_t)ROM_MLB[0]);
+    cpuid_quit_rom(qts, romname);
+}
+
 int main(int argc, char **argv)
 {
     unsigned i;
@@ -2296,6 +2615,22 @@ int main(int argc, char **argv)
                    test_thermal_dumb);
     qtest_add_func("/keywest-i2c/thermal-lane3",
                    test_thermal_lane3);
+    qtest_add_func("/keywest-i2c/cpuid-off-naks", test_cpuid_off_naks);
+    qtest_add_func("/keywest-i2c/cpuid-slot-number", test_cpuid_slot_number);
+    qtest_add_func("/keywest-i2c/cpuid-mlb-from-rom", test_cpuid_mlb_from_rom);
+    qtest_add_func("/keywest-i2c/cpuid-mlb-openbios",
+                   test_cpuid_mlb_openbios);
+    qtest_add_func("/keywest-i2c/cpuid-rest-is-ff", test_cpuid_rest_is_ff);
+    qtest_add_func("/keywest-i2c/cpuid-rom-procedure",
+                   test_cpuid_rom_procedure);
+    qtest_add_func("/keywest-i2c/cpuid-dumb", test_cpuid_dumb);
+    qtest_add_func("/keywest-i2c/cpuid-lane3", test_cpuid_lane3);
+    qtest_add_func("/keywest-i2c/cpuid-one-byte-subaddress",
+                   test_cpuid_one_byte_subaddress);
+    qtest_add_func("/keywest-i2c/cpuid-neighbours-nak",
+                   test_cpuid_neighbours_nak);
+    qtest_add_func("/keywest-i2c/cpuid-partial-address-stays-in-range",
+                   test_cpuid_partial_address_stays_in_range);
 
     return g_test_run();
 }

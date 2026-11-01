@@ -60,6 +60,7 @@
 #include "hw/pci-host/u3_dart.h"
 #include "hw/i2c/i2c.h"
 #include "hw/i2c/smbus_eeprom.h"
+#include "hw/nvram/eeprom_at24c.h"
 #include "hw/sensor/tmp105.h"
 #include "hw/input/adb.h"
 #include "hw/ppc/mac_dbdma.h"
@@ -158,6 +159,8 @@ struct Core99MachineState {
     bool u3_i2c_dumb;
     /* PowerMac7,3: temperature sensors on U3 i2c chan 0 (x-u3-i2c-thermal) */
     bool u3_i2c_thermal;
+    /* PowerMac7,3: CPU card EEPROM on U3 i2c chan 0 (x-u3-i2c-cpuid) */
+    bool u3_i2c_cpuid;
     /* PowerMac7,3: DBDMA control writes set s0-s7 (x-dbdma-devstat) */
     bool dbdma_devstat;
     /* PowerMac7,3: the fans' TACH counts move (x-k2-fan-tach) */
@@ -443,6 +446,7 @@ static void ppc_core99_init(MachineState *machine)
     char *filename;
     IrqLines *openpic_irqs;
     int i, j, k, ppc_boot_device, machine_arch, bios_size = -1;
+    bool bios_is_raw = false;
     const char *bios_name = machine->firmware ?: PROM_FILENAME;
     MemoryRegion *bios = g_new(MemoryRegion, 1);
     hwaddr kernel_base = 0, initrd_base = 0, cmdline_base = 0;
@@ -578,6 +582,7 @@ static void ppc_core99_init(MachineState *machine)
             /* or load binary ROM image */
             bios_size = load_image_targphys(filename, PROM_BASE, PROM_SIZE,
                                             &error_fatal);
+            bios_is_raw = true;
         }
         g_free(filename);
     }
@@ -790,6 +795,39 @@ static void ppc_core99_init(MachineState *machine)
                                             40000, &error_fatal);
                 }
             }
+        }
+
+        /*
+         * The CPU card's EEPROM (a 24256, 32 KiB, 2-byte addresses) that
+         * a real boot ROM's device tree lists as cpuid at 8-bit 0xa0 on
+         * channel 0.  Without it the ROM reads 0xff for the card's slot
+         * number and sets thermal-max-cooling to "normal", which makes
+         * the platform plugin report an uncalibrated system.  Only two things
+         * are put in; they are not a real board's contents and the rest
+         * stays 0xff, as the ROM's own rom-image does after a NAK:
+         * the slot number (+0x24, 0 for the first card, which the ROM's
+         * finish-cpus expects at 0xa0), and the MLB serial number
+         * (+0x80, 16 bytes), copied from the ROM it was given so that
+         * the ROM finds the value it compares it with
+         * (config-block >manf.mlb1-serial-number, at 0x3f00 + 0xc0 of
+         * Boot ROM 5.1.5f2; other versions have not been looked at).
+         * OpenBIOS, which is an ELF and has no such block, leaves 0xff.
+         *
+         * The buffer is not freed: at24c_eeprom_init_rom() keeps the
+         * pointer, as smbus_eeprom_init_one() does for the SPD below.
+         */
+        if (core99_machine->u3_i2c_cpuid) {
+            I2CBus *bus0 = I2C_BUS(qdev_get_child_bus(i2c_dev, "i2c0"));
+            uint8_t *cpuid = g_malloc(32 * KiB);
+            const void *mlb = bios_is_raw ?
+                rom_ptr(PROM_BASE + 0x3f00 + 0xc0, 16) : NULL;
+
+            memset(cpuid, 0xff, 32 * KiB);
+            cpuid[0x24] = 0;
+            if (mlb) {
+                memcpy(cpuid + 0x80, mlb, 16);
+            }
+            at24c_eeprom_init_rom(bus0, 0xa0 >> 1, 32 * KiB, cpuid, 32 * KiB);
         }
 
         /*
@@ -1638,6 +1676,17 @@ static void powermac7_3_set_u3_i2c_thermal(Object *obj, bool value,
     CORE99_MACHINE(obj)->u3_i2c_thermal = value;
 }
 
+static bool powermac7_3_get_u3_i2c_cpuid(Object *obj, Error **errp)
+{
+    return CORE99_MACHINE(obj)->u3_i2c_cpuid;
+}
+
+static void powermac7_3_set_u3_i2c_cpuid(Object *obj, bool value,
+                                         Error **errp)
+{
+    CORE99_MACHINE(obj)->u3_i2c_cpuid = value;
+}
+
 static bool powermac7_3_get_nvram_flash_id(Object *obj, Error **errp)
 {
     return CORE99_MACHINE(obj)->nvram_flash_id;
@@ -1889,6 +1938,19 @@ static void powermac7_3_machine_class_init(ObjectClass *oc, const void *data)
                                           "ROM's guest read on U3 i2c "
                                           "channel 0, at 40 C (off by "
                                           "default)");
+    object_class_property_add_bool(oc, "x-u3-i2c-cpuid",
+                                   powermac7_3_get_u3_i2c_cpuid,
+                                   powermac7_3_set_u3_i2c_cpuid);
+    object_class_property_set_description(oc, "x-u3-i2c-cpuid",
+                                          "Put the CPU card's EEPROM that "
+                                          "a real boot ROM reads on U3 i2c "
+                                          "channel 0, at 8-bit 0xa0 only: "
+                                          "it holds slot 0 and the MLB "
+                                          "serial number copied from the "
+                                          "ROM, the rest is 0xff, not a "
+                                          "real board's values; not "
+                                          "expected to help with x-rom-smp's "
+                                          "two CPUs (off by default)");
     object_class_property_add_bool(oc, "x-nvram-flash-id",
                                    powermac7_3_get_nvram_flash_id,
                                    powermac7_3_set_nvram_flash_id);

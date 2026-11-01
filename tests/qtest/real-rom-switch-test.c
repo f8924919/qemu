@@ -278,6 +278,7 @@ static void check_children(QTestState *qts, const ChildWant *w)
     g_autofree char *cpu1 = find_type(qts, "-powerpc64-cpu", 1);
     g_autofree char *dbdma = NULL;
     g_autofree char *i2s = NULL;
+    g_autofree char *eeprom = NULL;
     QDict *resp;
 
     g_assert(i2c && macio && nvram && unin && cpu1);
@@ -300,6 +301,26 @@ static void check_children(QTestState *qts, const ChildWant *w)
                           " 'property': 'type' } }");
     g_assert(qdict_haskey(resp, "error"));
     qobject_unref(resp);
+    /* Nor the CPU card's EEPROM */
+    g_assert_false(get_bool(qts, "/machine", "x-u3-i2c-cpuid"));
+    eeprom = find_type(qts, "at24c-eeprom", 0);
+    g_assert_null(eeprom);
+}
+
+/*
+ * The positive control for the "no at24c-eeprom" check above: with the
+ * switch on, find_type() does find one, so it looks where the machine
+ * puts it.
+ */
+static void test_cpuid_found_when_on(void)
+{
+    QTestState *qts = qtest_initf("-machine powermac7_3,x-u3-i2c-cpuid=on "
+                                  RAM);
+    g_autofree char *eeprom = find_type(qts, "at24c-eeprom", 0);
+
+    g_assert_nonnull(eeprom);
+    g_assert_true(get_bool(qts, "/machine", "x-u3-i2c-cpuid"));
+    qtest_quit(qts);
 }
 
 static void run_children(const char *opts, const ChildWant *w)
@@ -429,6 +450,8 @@ int main(int argc, char **argv)
     qtest_add_func("/real-rom-switch/children-default",
                    test_children_default);
     qtest_add_func("/real-rom-switch/children-on", test_children_on);
+    qtest_add_func("/real-rom-switch/cpuid-found-when-on",
+                   test_cpuid_found_when_on);
     qtest_add_func("/real-rom-switch/children-override",
                    test_children_override);
     qtest_add_func("/real-rom-switch/preconfig-switch-first",
