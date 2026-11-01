@@ -151,6 +151,9 @@ config MAC_NEWWORLD
     select MAC_HWCLOCK
     select MAC_K2_SOUND
     select SMBUS_EEPROM
+    select TMP105
+    select MAX6690
+    select AD7417
 
 config E500
     bool

@@ -278,6 +278,7 @@ static void check_children(QTestState *qts, const ChildWant *w)
     g_autofree char *cpu1 = find_type(qts, "-powerpc64-cpu", 1);
     g_autofree char *dbdma = NULL;
     g_autofree char *i2s = NULL;
+    QDict *resp;
 
     g_assert(i2c && macio && nvram && unin && cpu1);
     dbdma = g_strdup_printf("%s/dbdma", macio);
@@ -292,6 +293,13 @@ static void check_children(QTestState *qts, const ChildWant *w)
                     w->cpu1_off);
     /* Not one of them: the fan count is its own switch */
     g_assert_false(get_bool(qts, i2s, "x-fan-tach"));
+    /* Nor the temperature sensors */
+    g_assert_false(get_bool(qts, "/machine", "x-u3-i2c-thermal"));
+    resp = qtest_qmp(qts, "{ 'execute': 'qom-get', 'arguments':"
+                          " { 'path': '/machine/u3-ds1775',"
+                          " 'property': 'type' } }");
+    g_assert(qdict_haskey(resp, "error"));
+    qobject_unref(resp);
 }
 
 static void run_children(const char *opts, const ChildWant *w)

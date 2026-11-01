@@ -1377,23 +1377,24 @@ static void dumb_write_reg(QTestState *qts, uint8_t reg, uint8_t val)
 }
 
 /*
- * Point the clock chip at `reg` with a manual write, then read it back
- * with a manual read after a repeated START, one byte with AAK clear --
- * the controller stops by itself on the ack after the byte.  `ack` is
- * the value written to the ISR to acknowledge DATA.
+ * Point the chip at 8-bit `addr8` (write address) at `reg` with a manual
+ * write, then read it back with a manual read after a repeated START, one
+ * byte with AAK clear -- the controller stops by itself on the ack after
+ * the byte.  `ack` is the value written to the ISR to acknowledge DATA.
  */
-static uint8_t dumb_read_reg(QTestState *qts, uint8_t reg, uint8_t ack)
+static uint8_t dumb_read_reg_at(QTestState *qts, uint8_t addr8, uint8_t reg,
+                                uint8_t ack)
 {
     uint8_t val;
 
-    g_assert_true(dumb_open(qts, 0, HWCLOCK_ADDR8 & ~1));
+    g_assert_true(dumb_open(qts, 0, addr8 & ~1));
     qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_DATA);
     qtest_writeb(qts, KW_DATA, reg);
     i2c_wait_isr(qts, KW_I2C_IRQ_DATA);
 
     /* Repeated START: ends the write without a STOP interrupt */
     qtest_writeb(qts, KW_ISR, 0x0f);
-    g_assert_true(dumb_open(qts, 0, HWCLOCK_ADDR8 | 1));
+    g_assert_true(dumb_open(qts, 0, addr8 | 1));
     g_assert_cmphex(qtest_readb(qts, KW_ISR) & KW_I2C_IRQ_STOP, ==, 0);
 
     qtest_writeb(qts, KW_CONTROL, 0);
@@ -1406,6 +1407,12 @@ static uint8_t dumb_read_reg(QTestState *qts, uint8_t reg, uint8_t ack)
     qtest_writeb(qts, KW_ISR, 0x0f);
 
     return val;
+}
+
+/* ... of the clock chip */
+static uint8_t dumb_read_reg(QTestState *qts, uint8_t reg, uint8_t ack)
+{
+    return dumb_read_reg_at(qts, HWCLOCK_ADDR8 & ~1, reg, ack);
 }
 
 /* START in DUMB mode raises the START interrupt, write-1-to-clear */
@@ -1718,6 +1725,462 @@ static void test_transfer_keeps_its_channel(void)
     qtest_quit(qts);
 }
 
+/*
+ * x-u3-i2c-thermal: the temperature sensors a real boot ROM's guest finds
+ * on channel 0 (8-bit addresses, as the device tree and the kexts have
+ * them).  Tiger's thermal kexts only need their accesses to be acked:
+ * AppleLM7x::initHW reads register 1 and writes it back with 0x60 set,
+ * AppleAD741x::softReset writes registers 1 and 5 with 0 and reads
+ * register 1, AppleMaxim6690::start reads register 0xfe.  The values are
+ * properties that qom-set can change; the expected bytes below are written
+ * out by hand from the register layouts, not computed.
+ */
+#define KW_MACHINE_THERMAL "-machine powermac7_3,x-u3-i2c-thermal=on"
+#define KW_MACHINE_THERMAL_LANE3 \
+    "-machine powermac7_3,x-u3-i2c-thermal=on,x-u3-i2c-lane3=on"
+#define KW_MACHINE_THERMAL_DUMB \
+    "-machine powermac7_3,x-u3-i2c-thermal=on,x-u3-i2c-dumb=on"
+
+#define DS1775_ADDR8      0x94
+#define MAX6690_0_ADDR8   0x98
+#define MAX6690_1_ADDR8   0x9c
+#define AD7417_ADDR8      0x58
+
+#define DS1775_PATH       "/machine/u3-ds1775"
+#define MAX6690_0_PATH    "/machine/u3-max6690-0"
+#define MAX6690_1_PATH    "/machine/u3-max6690-1"
+#define AD7417_PATH       "/machine/u3-ad7417"
+
+/*
+ * Read `n` (1 or 2) bytes from register `sub`.  In COMBINED mode the
+ * register is written first and the bus restarted for the read, in
+ * STANDARD mode there is no register byte and the chip keeps the register
+ * it was last pointed at.  The handshake is that of i2c_read_sub() for one
+ * byte and of test_multi_byte_read() for two.
+ */
+static void therm_read(QTestState *qts, uint8_t mode, uint8_t addr8,
+                       uint8_t sub, uint8_t *out, unsigned n)
+{
+    qtest_writeb(qts, KW_STATUS, 0);
+    qtest_writeb(qts, KW_MODE, mode | KW_I2C_MODE_100KHZ | kw_chan);
+    qtest_writeb(qts, KW_ADDR, addr8 | 1);
+    qtest_writeb(qts, KW_SUBADDR, sub);
+    qtest_writeb(qts, KW_CONTROL, KW_I2C_CTL_XADDR);
+    i2c_wait_isr(qts, KW_I2C_IRQ_ADDR);
+    g_assert_cmphex(qtest_readb(qts, KW_STATUS) & KW_I2C_STAT_LAST_AAK,
+                    ==, KW_I2C_STAT_LAST_AAK);
+
+    if (n == 1) {
+        qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_ADDR);
+        i2c_wait_isr(qts, KW_I2C_IRQ_DATA);
+        out[0] = qtest_readb(qts, KW_DATA);
+        qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_DATA);
+        qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_DATA);
+    } else {
+        g_assert_cmpuint(n, ==, 2);
+        qtest_writeb(qts, KW_CONTROL, KW_I2C_CTL_AAK);
+        qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_ADDR);
+        i2c_wait_isr(qts, KW_I2C_IRQ_DATA);
+        out[0] = qtest_readb(qts, KW_DATA);
+        qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_DATA);
+        qtest_writeb(qts, KW_CONTROL, 0);
+        qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_DATA);
+        i2c_wait_isr(qts, KW_I2C_IRQ_DATA);
+        out[1] = qtest_readb(qts, KW_DATA);
+        qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_DATA);
+        qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_DATA);
+    }
+    i2c_wait_isr(qts, KW_I2C_IRQ_STOP);
+    qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_STOP);
+}
+
+static uint8_t therm_read1(QTestState *qts, uint8_t addr8, uint8_t sub)
+{
+    uint8_t b;
+
+    therm_read(qts, KW_I2C_MODE_COMBINED, addr8, sub, &b, 1);
+    return b;
+}
+
+static uint16_t therm_read2(QTestState *qts, uint8_t addr8, uint8_t sub)
+{
+    uint8_t b[2];
+
+    therm_read(qts, KW_I2C_MODE_COMBINED, addr8, sub, b, 2);
+    return (b[0] << 8) | b[1];
+}
+
+/* A write of two bytes after the register, as test_multi_byte_write() */
+static void therm_write2(QTestState *qts, uint8_t addr8, uint8_t sub,
+                         uint8_t b0, uint8_t b1)
+{
+    qtest_writeb(qts, KW_STATUS, 0);
+    qtest_writeb(qts, KW_MODE, KW_I2C_MODE_STANDARDSUB);
+    qtest_writeb(qts, KW_ADDR, addr8 & ~1);
+    qtest_writeb(qts, KW_SUBADDR, sub);
+    qtest_writeb(qts, KW_CONTROL, KW_I2C_CTL_XADDR);
+    i2c_wait_isr(qts, KW_I2C_IRQ_ADDR);
+    qtest_writeb(qts, KW_DATA, b0);
+    qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_ADDR);
+    i2c_wait_isr(qts, KW_I2C_IRQ_DATA);
+    qtest_writeb(qts, KW_DATA, b1);
+    qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_DATA);
+    i2c_wait_isr(qts, KW_I2C_IRQ_DATA);
+    qtest_writeb(qts, KW_CONTROL, KW_I2C_CTL_STOP);
+    i2c_wait_isr(qts, KW_I2C_IRQ_STOP);
+    qtest_writeb(qts, KW_ISR, KW_I2C_IRQ_STOP);
+}
+
+static void therm_set(QTestState *qts, const char *path, const char *prop,
+                      int64_t value)
+{
+    qtest_qmp_assert_success(qts,
+        "{ 'execute': 'qom-set', 'arguments': { 'path': %s, "
+        "'property': %s, 'value': %" PRId64 " } }", path, prop, value);
+}
+
+static int64_t therm_get(QTestState *qts, const char *path, const char *prop)
+{
+    QDict *resp = qtest_qmp(qts,
+        "{ 'execute': 'qom-get', 'arguments': { 'path': %s, "
+        "'property': %s } }", path, prop);
+    int64_t value;
+
+    g_assert(qdict_haskey(resp, "return"));
+    value = qdict_get_int(resp, "return");
+    qobject_unref(resp);
+    return value;
+}
+
+static void therm_set_fails(QTestState *qts, const char *path,
+                            const char *prop, int64_t value)
+{
+    QDict *resp = qtest_qmp_assert_failure_ref(qts,
+        "{ 'execute': 'qom-set', 'arguments': { 'path': %s, "
+        "'property': %s, 'value': %" PRId64 " } }", path, prop, value);
+
+    qobject_unref(resp);
+}
+
+/* Without the switch the four addresses are empty, as they always were */
+static void test_thermal_off_naks(void)
+{
+    QTestState *qts = qtest_init(KW_MACHINE);
+
+    g_assert_false(i2c_addr_acked(qts, 0x00, DS1775_ADDR8));
+    g_assert_false(i2c_addr_acked(qts, 0x00, MAX6690_0_ADDR8));
+    g_assert_false(i2c_addr_acked(qts, 0x00, MAX6690_1_ADDR8));
+    g_assert_false(i2c_addr_acked(qts, 0x00, AD7417_ADDR8));
+    /* The clock chip is still there */
+    g_assert_true(i2c_addr_acked(qts, 0x00, HWCLOCK_ADDR8));
+    qtest_quit(qts);
+}
+
+/* What the three kexts do at start-up, each step acked and answered */
+static void test_thermal_kext_accesses(void)
+{
+    QTestState *qts = qtest_init(KW_MACHINE_THERMAL);
+    uint8_t cfg;
+
+    /* AppleLM7x::initHW: read register 1, set 0x60, write it back */
+    cfg = i2c_read_sub(qts, DS1775_ADDR8, 1);
+    g_assert_cmphex(cfg & 0x60, ==, 0x00);
+    i2c_write_sub(qts, DS1775_ADDR8, 1, cfg | 0x60);
+    g_assert_cmphex(i2c_read_sub(qts, DS1775_ADDR8, 1) & 0x60, ==, 0x60);
+
+    /* AppleAD741x::softReset: registers 1 and 5 get 0, then read 1 */
+    i2c_write_sub(qts, AD7417_ADDR8, 1, 0x00);
+    i2c_write_sub(qts, AD7417_ADDR8, 5, 0x00);
+    g_assert_cmphex(i2c_read_sub(qts, AD7417_ADDR8, 1), ==, 0x00);
+    /* ... and they keep what they are given */
+    i2c_write_sub(qts, AD7417_ADDR8, 1, 0x40);
+    i2c_write_sub(qts, AD7417_ADDR8, 5, 0x81);
+    g_assert_cmphex(i2c_read_sub(qts, AD7417_ADDR8, 1), ==, 0x40);
+    g_assert_cmphex(i2c_read_sub(qts, AD7417_ADDR8, 5), ==, 0x81);
+
+    /* AppleMaxim6690::start: register 0xfe is the manufacturer */
+    g_assert_cmphex(i2c_read_sub(qts, MAX6690_0_ADDR8, 0xfe), ==, 0x4d);
+    g_assert_cmphex(i2c_read_sub(qts, MAX6690_1_ADDR8, 0xfe), ==, 0x4d);
+    g_assert_cmphex(i2c_read_sub(qts, MAX6690_0_ADDR8, 0xff), ==, 0x09);
+    g_assert_cmphex(i2c_read_sub(qts, MAX6690_1_ADDR8, 0xff), ==, 0x09);
+    qtest_quit(qts);
+}
+
+/* Nothing set: 40 C everywhere, the ADC inputs at 0 */
+static void test_thermal_defaults(void)
+{
+    QTestState *qts = qtest_init(KW_MACHINE_THERMAL);
+
+    g_assert_cmphex(therm_read2(qts, DS1775_ADDR8, 0), ==, 0x2800);
+    g_assert_cmphex(therm_read2(qts, AD7417_ADDR8, 0), ==, 0x2800);
+    g_assert_cmphex(i2c_read_sub(qts, MAX6690_0_ADDR8, 0x00), ==, 0x28);
+    g_assert_cmphex(i2c_read_sub(qts, MAX6690_0_ADDR8, 0x01), ==, 0x28);
+    g_assert_cmphex(i2c_read_sub(qts, MAX6690_0_ADDR8, 0x10), ==, 0x00);
+    g_assert_cmphex(i2c_read_sub(qts, MAX6690_0_ADDR8, 0x11), ==, 0x00);
+    g_assert_cmphex(i2c_read_sub(qts, MAX6690_1_ADDR8, 0x00), ==, 0x28);
+    g_assert_cmphex(i2c_read_sub(qts, MAX6690_1_ADDR8, 0x01), ==, 0x28);
+    g_assert_cmphex(i2c_read_sub(qts, MAX6690_1_ADDR8, 0x10), ==, 0x00);
+    g_assert_cmphex(i2c_read_sub(qts, MAX6690_1_ADDR8, 0x11), ==, 0x00);
+    /* The AD7417's ADC: every channel reads 0 */
+    i2c_write_sub(qts, AD7417_ADDR8, 1, 1 << 5);
+    g_assert_cmphex(therm_read2(qts, AD7417_ADDR8, 4), ==, 0x0000);
+
+    g_assert_cmpint(therm_get(qts, DS1775_PATH, "temperature"), ==, 40000);
+    g_assert_cmpint(therm_get(qts, MAX6690_1_PATH, "temperature1"), ==, 40000);
+    g_assert_cmpint(therm_get(qts, AD7417_PATH, "temperature"), ==, 40000);
+    qtest_quit(qts);
+}
+
+/* Values with a fraction, through qom-set */
+static void test_thermal_qom_values(void)
+{
+    QTestState *qts = qtest_init(KW_MACHINE_THERMAL);
+
+    /* DS1775: 9 bits until the config asks for 12 (tmp105's masking) */
+    therm_set(qts, DS1775_PATH, "temperature", 40625);
+    g_assert_cmphex(therm_read2(qts, DS1775_ADDR8, 0), ==, 0x2880);
+    i2c_write_sub(qts, DS1775_ADDR8, 1, 0x60);
+    g_assert_cmphex(therm_read2(qts, DS1775_ADDR8, 0), ==, 0x28a0);
+    g_assert_cmpint(therm_get(qts, DS1775_PATH, "temperature"), ==, 40625);
+
+    /* MAX6690: eighths of a degree in the top three bits of 0x11 / 0x10 */
+    therm_set(qts, MAX6690_0_PATH, "temperature0", 40625);
+    g_assert_cmphex(i2c_read_sub(qts, MAX6690_0_ADDR8, 0x00), ==, 0x28);
+    g_assert_cmphex(i2c_read_sub(qts, MAX6690_0_ADDR8, 0x11), ==, 0xa0);
+    therm_set(qts, MAX6690_0_PATH, "temperature1", 55250);
+    g_assert_cmphex(i2c_read_sub(qts, MAX6690_0_ADDR8, 0x01), ==, 0x37);
+    g_assert_cmphex(i2c_read_sub(qts, MAX6690_0_ADDR8, 0x10), ==, 0x40);
+    g_assert_cmpint(therm_get(qts, MAX6690_0_PATH, "temperature0"), ==, 40625);
+    g_assert_cmpint(therm_get(qts, MAX6690_0_PATH, "temperature1"), ==, 55250);
+
+    /* AD7417: 10 bits, 0.25 C a step, left-justified: 163 << 6 */
+    therm_set(qts, AD7417_PATH, "temperature", 40750);
+    g_assert_cmphex(therm_read2(qts, AD7417_ADDR8, 0), ==, 0x28c0);
+    g_assert_cmpint(therm_get(qts, AD7417_PATH, "temperature"), ==, 40750);
+
+    /* The first byte of a two-byte read is the high one on its own too */
+    therm_set(qts, AD7417_PATH, "temperature", 100000);
+    g_assert_cmphex(therm_read1(qts, AD7417_ADDR8, 0), ==, 0x64);
+    qtest_quit(qts);
+}
+
+/* Below zero is two's complement, cut toward minus infinity */
+static void test_thermal_negative_values(void)
+{
+    QTestState *qts = qtest_init(KW_MACHINE_THERMAL);
+
+    therm_set(qts, DS1775_PATH, "temperature", -500);
+    g_assert_cmphex(therm_read2(qts, DS1775_ADDR8, 0), ==, 0xff80);
+    therm_set(qts, MAX6690_0_PATH, "temperature0", -500);
+    g_assert_cmphex(i2c_read_sub(qts, MAX6690_0_ADDR8, 0x00), ==, 0xff);
+    g_assert_cmphex(i2c_read_sub(qts, MAX6690_0_ADDR8, 0x11), ==, 0x80);
+    therm_set(qts, MAX6690_0_PATH, "temperature1", -10000);
+    g_assert_cmphex(i2c_read_sub(qts, MAX6690_0_ADDR8, 0x01), ==, 0xf6);
+    g_assert_cmphex(i2c_read_sub(qts, MAX6690_0_ADDR8, 0x10), ==, 0x00);
+    therm_set(qts, AD7417_PATH, "temperature", -250);
+    g_assert_cmphex(therm_read2(qts, AD7417_ADDR8, 0), ==, 0xffc0);
+    qtest_quit(qts);
+}
+
+/* The two MAX6690 are two chips, and each has an internal and an external */
+static void test_thermal_max6690_independent(void)
+{
+    QTestState *qts = qtest_init(KW_MACHINE_THERMAL);
+
+    therm_set(qts, MAX6690_0_PATH, "temperature0", 30125);
+    therm_set(qts, MAX6690_0_PATH, "temperature1", 50500);
+    therm_set(qts, MAX6690_1_PATH, "temperature0", 60750);
+    therm_set(qts, MAX6690_1_PATH, "temperature1", 20375);
+
+    g_assert_cmphex(i2c_read_sub(qts, MAX6690_0_ADDR8, 0x00), ==, 30);
+    g_assert_cmphex(i2c_read_sub(qts, MAX6690_0_ADDR8, 0x11), ==, 0x20);
+    g_assert_cmphex(i2c_read_sub(qts, MAX6690_0_ADDR8, 0x01), ==, 50);
+    g_assert_cmphex(i2c_read_sub(qts, MAX6690_0_ADDR8, 0x10), ==, 0x80);
+
+    g_assert_cmphex(i2c_read_sub(qts, MAX6690_1_ADDR8, 0x00), ==, 60);
+    g_assert_cmphex(i2c_read_sub(qts, MAX6690_1_ADDR8, 0x11), ==, 0xc0);
+    g_assert_cmphex(i2c_read_sub(qts, MAX6690_1_ADDR8, 0x01), ==, 20);
+    g_assert_cmphex(i2c_read_sub(qts, MAX6690_1_ADDR8, 0x10), ==, 0x60);
+    qtest_quit(qts);
+}
+
+/* The ADC value comes from the channel in bits 7-5 of the configuration */
+static void test_thermal_ad7417_adc(void)
+{
+    QTestState *qts = qtest_init(KW_MACHINE_THERMAL);
+    static const struct {
+        const char *prop;
+        int64_t raw;
+        uint16_t reg;
+    } adc[] = {
+        { "adc0", 0x0c3, 0x30c0 },
+        { "adc1", 0x155, 0x5540 },
+        { "adc2", 0x2aa, 0xaa80 },
+        { "adc3", 0x3ff, 0xffc0 },
+        { "adc4", 0x001, 0x0040 },
+    };
+    unsigned ch;
+
+    for (ch = 0; ch < ARRAY_SIZE(adc); ch++) {
+        therm_set(qts, AD7417_PATH, adc[ch].prop, adc[ch].raw);
+    }
+    for (ch = 0; ch < ARRAY_SIZE(adc); ch++) {
+        /* Low bits of the configuration are not part of the channel */
+        i2c_write_sub(qts, AD7417_ADDR8, 1, (ch << 5) | 0x1f);
+        g_assert_cmphex(therm_read2(qts, AD7417_ADDR8, 4), ==, adc[ch].reg);
+        g_assert_cmpint(therm_get(qts, AD7417_PATH, adc[ch].prop), ==,
+                        adc[ch].raw);
+    }
+    /* Channels 5-7 do not exist */
+    for (ch = 5; ch < 8; ch++) {
+        i2c_write_sub(qts, AD7417_ADDR8, 1, ch << 5);
+        g_assert_cmphex(therm_read2(qts, AD7417_ADDR8, 4), ==, 0x0000);
+    }
+    /* A raw value is 10 bits */
+    therm_set_fails(qts, AD7417_PATH, "adc1", 0x400);
+    therm_set_fails(qts, AD7417_PATH, "adc1", -1);
+    g_assert_cmpint(therm_get(qts, AD7417_PATH, "adc1"), ==, 0x155);
+    qtest_quit(qts);
+}
+
+/* The thresholds are two bytes, kept as written, high byte first */
+static void test_thermal_ad7417_thresholds(void)
+{
+    QTestState *qts = qtest_init(KW_MACHINE_THERMAL);
+
+    g_assert_cmphex(therm_read2(qts, AD7417_ADDR8, 2), ==, 0x0000);
+    therm_write2(qts, AD7417_ADDR8, 2, 0x12, 0x34);
+    therm_write2(qts, AD7417_ADDR8, 3, 0xab, 0xcd);
+    g_assert_cmphex(therm_read2(qts, AD7417_ADDR8, 2), ==, 0x1234);
+    g_assert_cmphex(therm_read2(qts, AD7417_ADDR8, 3), ==, 0xabcd);
+    /* A write to the temperature register changes nothing */
+    therm_write2(qts, AD7417_ADDR8, 0, 0xff, 0xff);
+    g_assert_cmphex(therm_read2(qts, AD7417_ADDR8, 0), ==, 0x2800);
+    qtest_quit(qts);
+}
+
+/* Only the four addresses, only on channel 0 */
+static void test_thermal_neighbours_nak(void)
+{
+    QTestState *qts = qtest_init(KW_MACHINE_THERMAL);
+
+    g_assert_true(i2c_addr_acked(qts, 0x00, DS1775_ADDR8));
+    g_assert_true(i2c_addr_acked(qts, 0x00, MAX6690_0_ADDR8));
+    g_assert_true(i2c_addr_acked(qts, 0x00, MAX6690_1_ADDR8));
+    g_assert_true(i2c_addr_acked(qts, 0x00, AD7417_ADDR8));
+    g_assert_true(i2c_addr_acked(qts, 0x00, HWCLOCK_ADDR8));
+
+    /* ad7417@0x5a, the PCA9556s, the CY2213 and 0xa0 stay empty */
+    g_assert_false(i2c_addr_acked(qts, 0x00, 0x5a));
+    g_assert_false(i2c_addr_acked(qts, 0x00, 0x30));
+    g_assert_false(i2c_addr_acked(qts, 0x00, 0x32));
+    g_assert_false(i2c_addr_acked(qts, 0x00, 0xca));
+    g_assert_false(i2c_addr_acked(qts, 0x00, 0xa0));
+
+    /* Channel 1 has none of them */
+    g_assert_false(i2c_addr_acked(qts, KW_CHAN1, DS1775_ADDR8));
+    g_assert_false(i2c_addr_acked(qts, KW_CHAN1, MAX6690_0_ADDR8));
+    g_assert_false(i2c_addr_acked(qts, KW_CHAN1, MAX6690_1_ADDR8));
+    g_assert_false(i2c_addr_acked(qts, KW_CHAN1, AD7417_ADDR8));
+    qtest_quit(qts);
+}
+
+/* The thermal chips and the SPD EEPROMs on the other channel coexist */
+static void test_thermal_with_spd(void)
+{
+    QTestState *qts = qtest_init(KW_MACHINE_THERMAL ",x-u3-i2c-spd=on");
+
+    g_assert_true(i2c_addr_acked(qts, 0x00, MAX6690_0_ADDR8));
+    g_assert_false(i2c_addr_acked(qts, 0x00, 0xa0));
+    g_assert_true(i2c_addr_acked(qts, KW_CHAN1, 0xa0));
+    g_assert_false(i2c_addr_acked(qts, KW_CHAN1, AD7417_ADDR8));
+    qtest_quit(qts);
+}
+
+/*
+ * Standard mode writes no register byte: the chip keeps the register it
+ * was pointed at by an earlier transfer, across the STOP in between.
+ */
+static void test_thermal_standard_mode_keeps_pointer(void)
+{
+    QTestState *qts = qtest_init(KW_MACHINE_THERMAL);
+    uint8_t b[2];
+
+    therm_set(qts, MAX6690_0_PATH, "temperature0", 41000);
+    i2c_read_sub(qts, MAX6690_0_ADDR8, 0xfe);
+    therm_read(qts, KW_I2C_MODE_STANDARD, MAX6690_0_ADDR8, 0, b, 1);
+    g_assert_cmphex(b[0], ==, 0x4d);
+    /* The other MAX6690 has its own pointer, still at register 0 */
+    therm_read(qts, KW_I2C_MODE_STANDARD, MAX6690_1_ADDR8, 0, b, 1);
+    g_assert_cmphex(b[0], ==, 0x28);
+
+    /* Two bytes: the DS1775 pointed at its temperature */
+    therm_set(qts, DS1775_PATH, "temperature", 40625);
+    i2c_write_sub(qts, DS1775_ADDR8, 1, 0x60);
+    therm_read2(qts, DS1775_ADDR8, 0);
+    therm_read(qts, KW_I2C_MODE_STANDARD, DS1775_ADDR8, 0, b, 2);
+    g_assert_cmphex((b[0] << 8) | b[1], ==, 0x28a0);
+
+    /* ... and the AD7417 at its ADC */
+    therm_set(qts, AD7417_PATH, "adc2", 0x2aa);
+    i2c_write_sub(qts, AD7417_ADDR8, 1, 2 << 5);
+    therm_read2(qts, AD7417_ADDR8, 4);
+    therm_read(qts, KW_I2C_MODE_STANDARD, AD7417_ADDR8, 0, b, 2);
+    g_assert_cmphex((b[0] << 8) | b[1], ==, 0xaa80);
+    qtest_quit(qts);
+}
+
+/* A register that is not there reads 0 and takes writes without effect */
+static void test_thermal_unknown_register(void)
+{
+    QTestState *qts = qtest_init(KW_MACHINE_THERMAL);
+
+    g_assert_cmphex(i2c_read_sub(qts, MAX6690_0_ADDR8, 0x09), ==, 0x00);
+    i2c_write_sub(qts, MAX6690_0_ADDR8, 0x09, 0x55);
+    g_assert_cmphex(i2c_read_sub(qts, MAX6690_0_ADDR8, 0x00), ==, 0x28);
+    g_assert_cmphex(i2c_read_sub(qts, MAX6690_0_ADDR8, 0x09), ==, 0x00);
+    /* Not the temperature or the ID either */
+    i2c_write_sub(qts, MAX6690_0_ADDR8, 0x00, 0x55);
+    i2c_write_sub(qts, MAX6690_0_ADDR8, 0xfe, 0x55);
+    g_assert_cmphex(i2c_read_sub(qts, MAX6690_0_ADDR8, 0x00), ==, 0x28);
+    g_assert_cmphex(i2c_read_sub(qts, MAX6690_0_ADDR8, 0xfe), ==, 0x4d);
+
+    g_assert_cmphex(i2c_read_sub(qts, AD7417_ADDR8, 0x07), ==, 0x00);
+    i2c_write_sub(qts, AD7417_ADDR8, 0x07, 0x55);
+    g_assert_cmphex(i2c_read_sub(qts, AD7417_ADDR8, 0x07), ==, 0x00);
+    g_assert_cmphex(therm_read2(qts, AD7417_ADDR8, 0), ==, 0x2800);
+    qtest_quit(qts);
+}
+
+/* DUMB mode transfers reach the same chips */
+static void test_thermal_dumb(void)
+{
+    QTestState *qts = qtest_init(KW_MACHINE_THERMAL_DUMB);
+
+    g_assert_cmphex(dumb_read_reg_at(qts, MAX6690_0_ADDR8, 0xfe,
+                                     KW_I2C_IRQ_DATA), ==, 0x4d);
+    g_assert_cmphex(dumb_read_reg_at(qts, MAX6690_1_ADDR8, 0xff,
+                                     KW_I2C_IRQ_DATA), ==, 0x09);
+    g_assert_cmphex(dumb_read_reg_at(qts, DS1775_ADDR8, 0,
+                                     KW_I2C_IRQ_DATA), ==, 0x28);
+    /* ... and the ordinary reads are unchanged */
+    g_assert_cmphex(i2c_read_sub(qts, MAX6690_0_ADDR8, 0xfe), ==, 0x4d);
+    qtest_quit(qts);
+}
+
+/* Byte 3 of the register slots is the same controller */
+static void test_thermal_lane3(void)
+{
+    QTestState *qts = qtest_init(KW_MACHINE_THERMAL_LANE3);
+
+    kw_base = KW_I2C_BASE + KW_LANE3;
+    g_assert_cmphex(i2c_read_sub(qts, MAX6690_0_ADDR8, 0xfe), ==, 0x4d);
+    g_assert_cmphex(therm_read2(qts, DS1775_ADDR8, 0), ==, 0x2800);
+    kw_base = KW_I2C_BASE;
+    g_assert_cmphex(i2c_read_sub(qts, MAX6690_1_ADDR8, 0xfe), ==, 0x4d);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     unsigned i;
@@ -1799,6 +2262,34 @@ int main(int argc, char **argv)
     qtest_add_func("/keywest-i2c/rom-smp-off-cypress-naks",
                    test_rom_smp_off_cypress_naks);
     qtest_add_func("/keywest-i2c/rom-smp-with-spd", test_rom_smp_with_spd);
+    qtest_add_func("/keywest-i2c/thermal-off-naks",
+                   test_thermal_off_naks);
+    qtest_add_func("/keywest-i2c/thermal-kext-accesses",
+                   test_thermal_kext_accesses);
+    qtest_add_func("/keywest-i2c/thermal-defaults",
+                   test_thermal_defaults);
+    qtest_add_func("/keywest-i2c/thermal-qom-values",
+                   test_thermal_qom_values);
+    qtest_add_func("/keywest-i2c/thermal-negative-values",
+                   test_thermal_negative_values);
+    qtest_add_func("/keywest-i2c/thermal-max6690-independent",
+                   test_thermal_max6690_independent);
+    qtest_add_func("/keywest-i2c/thermal-ad7417-adc",
+                   test_thermal_ad7417_adc);
+    qtest_add_func("/keywest-i2c/thermal-ad7417-thresholds",
+                   test_thermal_ad7417_thresholds);
+    qtest_add_func("/keywest-i2c/thermal-neighbours-nak",
+                   test_thermal_neighbours_nak);
+    qtest_add_func("/keywest-i2c/thermal-with-spd",
+                   test_thermal_with_spd);
+    qtest_add_func("/keywest-i2c/thermal-standard-mode-keeps-pointer",
+                   test_thermal_standard_mode_keeps_pointer);
+    qtest_add_func("/keywest-i2c/thermal-unknown-register",
+                   test_thermal_unknown_register);
+    qtest_add_func("/keywest-i2c/thermal-dumb",
+                   test_thermal_dumb);
+    qtest_add_func("/keywest-i2c/thermal-lane3",
+                   test_thermal_lane3);
 
     return g_test_run();
 }

@@ -60,6 +60,7 @@
 #include "hw/pci-host/u3_dart.h"
 #include "hw/i2c/i2c.h"
 #include "hw/i2c/smbus_eeprom.h"
+#include "hw/sensor/tmp105.h"
 #include "hw/input/adb.h"
 #include "hw/ppc/mac_dbdma.h"
 #include "hw/pci/pci.h"
@@ -155,6 +156,8 @@ struct Core99MachineState {
     bool u3_i2c_spd;
     /* PowerMac7,3: U3 i2c drives DUMB mode transfers (x-u3-i2c-dumb) */
     bool u3_i2c_dumb;
+    /* PowerMac7,3: temperature sensors on U3 i2c chan 0 (x-u3-i2c-thermal) */
+    bool u3_i2c_thermal;
     /* PowerMac7,3: DBDMA control writes set s0-s7 (x-dbdma-devstat) */
     bool dbdma_devstat;
     /* PowerMac7,3: the fans' TACH counts move (x-k2-fan-tach) */
@@ -739,6 +742,54 @@ static void ppc_core99_init(MachineState *machine)
             i2c_slave_create_simple(
                 I2C_BUS(qdev_get_child_bus(i2c_dev, "i2c0")),
                 "mac-hwclock", 0xd0 >> 1);
+        }
+
+        /*
+         * The temperature sensors a PowerMac7,2 boot ROM's device tree lists
+         * on channel 0, which the thermal kexts of a real boot ROM's guest
+         * read and write: a DS1775 (a tmp105 does for it) at 8-bit 0x94, two
+         * MAX6690 at 0x98 and 0x9c, and an AD7417 at 0x58.  All of them
+         * start at 40 C and the ADC inputs at 0; those are guesses, not
+         * what a board reads.  The properties are not reset, so they can
+         * be changed with qom-set on /machine/u3-ds1775 and friends.
+         *
+         * The two MAX6690 share a vmstate section and are told apart by
+         * instance number in creation order, so 0x4c is created before
+         * 0x4e, as the hwclocks above are.  Each one is made a child of the
+         * machine before it is realized, to get a name that stays put.
+         */
+        if (core99_machine->u3_i2c_thermal) {
+            I2CBus *bus0 = I2C_BUS(qdev_get_child_bus(i2c_dev, "i2c0"));
+            static const struct {
+                const char *name;
+                const char *type;
+                uint8_t addr;
+            } sensors[] = {
+                { "u3-ds1775", TYPE_TMP105, 0x4a },
+                { "u3-max6690-0", "max6690", 0x4c },
+                { "u3-max6690-1", "max6690", 0x4e },
+                { "u3-ad7417", "ad7417", 0x2c },
+            };
+            int n;
+
+            for (n = 0; n < ARRAY_SIZE(sensors); n++) {
+                I2CSlave *sensor = i2c_slave_new(sensors[n].type,
+                                                 sensors[n].addr);
+
+                object_property_add_child(OBJECT(machine), sensors[n].name,
+                                          OBJECT(sensor));
+                i2c_slave_realize_and_unref(sensor, bus0, &error_fatal);
+                /* tmp105 zeroes its temperature when it is realized */
+                if (object_property_find(OBJECT(sensor), "temperature0")) {
+                    object_property_set_int(OBJECT(sensor), "temperature0",
+                                            40000, &error_fatal);
+                    object_property_set_int(OBJECT(sensor), "temperature1",
+                                            40000, &error_fatal);
+                } else {
+                    object_property_set_int(OBJECT(sensor), "temperature",
+                                            40000, &error_fatal);
+                }
+            }
         }
 
         /*
@@ -1576,6 +1627,17 @@ static void powermac7_3_set_k2_fan_tach(Object *obj, bool value,
     CORE99_MACHINE(obj)->k2_fan_tach = value;
 }
 
+static bool powermac7_3_get_u3_i2c_thermal(Object *obj, Error **errp)
+{
+    return CORE99_MACHINE(obj)->u3_i2c_thermal;
+}
+
+static void powermac7_3_set_u3_i2c_thermal(Object *obj, bool value,
+                                           Error **errp)
+{
+    CORE99_MACHINE(obj)->u3_i2c_thermal = value;
+}
+
 static bool powermac7_3_get_nvram_flash_id(Object *obj, Error **errp)
 {
     return CORE99_MACHINE(obj)->nvram_flash_id;
@@ -1817,6 +1879,16 @@ static void powermac7_3_machine_class_init(ObjectClass *oc, const void *data)
                                           "the virtual clock, so that "
                                           "AppleK2Fan sees them turning "
                                           "(off by default)");
+    object_class_property_add_bool(oc, "x-u3-i2c-thermal",
+                                   powermac7_3_get_u3_i2c_thermal,
+                                   powermac7_3_set_u3_i2c_thermal);
+    object_class_property_set_description(oc, "x-u3-i2c-thermal",
+                                          "Put the DS1775, two MAX6690 and "
+                                          "AD7417 temperature sensors that "
+                                          "the thermal kexts of a real boot "
+                                          "ROM's guest read on U3 i2c "
+                                          "channel 0, at 40 C (off by "
+                                          "default)");
     object_class_property_add_bool(oc, "x-nvram-flash-id",
                                    powermac7_3_get_nvram_flash_id,
                                    powermac7_3_set_nvram_flash_id);
