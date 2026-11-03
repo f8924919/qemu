@@ -99,6 +99,26 @@ struct MACIOIDEState {
 void macio_ide_init_drives(MACIOIDEState *ide, DriveInfo **hd_table);
 void macio_ide_register_dma(MACIOIDEState *ide);
 
+#define TYPE_K2_UATA "k2-uata"
+OBJECT_DECLARE_SIMPLE_TYPE(K2UATAState, K2_UATA)
+
+/* The "irq" outputs: the machine takes them to the MPIC directly */
+#define K2_UATA_IRQ_ATA 0
+#define K2_UATA_IRQ_DMA 1
+#define K2_UATA_NIRQS 2
+
+struct K2UATAState {
+    /*< private >*/
+    PCIDevice parent_obj;
+    /*< public >*/
+    MemoryRegion bar;
+    MemoryRegion fcr_mem;
+    MACIOIDEState ide;
+    DBDMAState dbdma;
+    qemu_irq irq[K2_UATA_NIRQS];
+    uint32_t fcr;
+};
+
 #define TYPE_MACIO "macio"
 OBJECT_DECLARE_SIMPLE_TYPE(MacIOState, MACIO)
 

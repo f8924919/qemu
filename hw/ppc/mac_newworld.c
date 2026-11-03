@@ -157,6 +157,8 @@ struct Core99MachineState {
     bool u3_i2c_cpuid;
     /* PowerMac7,3: DBDMA control writes set s0-s7 (x-dbdma-devstat) */
     bool dbdma_devstat;
+    /* PowerMac7,3: K2 UATA behind the HT bridge at dev 3 (x-k2-uata) */
+    bool k2_uata;
     /* PowerMac7,3: the fans' TACH counts move (x-k2-fan-tach) */
     bool k2_fan_tach;
     /* PowerMac7,3: NVRAM flash answers Read Identifier (x-nvram-flash-id) */
@@ -447,7 +449,7 @@ static void ppc_core99_init(MachineState *machine)
     long kernel_size = 0, initrd_size = 0;
     PCIBus *pci_bus;
     DeviceState *u3_ht_dev = NULL;
-    PCIBus *ht_bus = NULL, *k2_bus = NULL;
+    PCIBus *ht_bus = NULL, *k2_bus = NULL, *uata_bus = NULL;
     DeviceState *dart_dev = NULL;
     ram_addr_t low_ram_size = machine->ram_size;
     bool has_pmu, has_adb;
@@ -466,6 +468,12 @@ static void ppc_core99_init(MachineState *machine)
 
     /* Before anything reads the switches x-real-rom covers */
     core99_resolve_real_rom(core99_machine);
+
+    if (core99_machine->k2_uata &&
+        core99_machine->ht_k2_layout != HT_K2_LAYOUT_DEV1_5) {
+        error_report("x-k2-uata needs x-ht-k2-layout=dev1-5");
+        exit(1);
+    }
 
     /* init CPUs */
     for (i = 0; i < machine->smp.cpus; i++) {
@@ -1045,6 +1053,10 @@ static void ppc_core99_init(MachineState *machine)
                                      U3_HT_PCI_BRIDGE_DEVICE_ID + 1 + i);
                 pci_bridge_map_irq(PCI_BRIDGE(br), names[i], NULL);
                 pci_realize_and_unref(br, ht_bus, &error_fatal);
+                /* A real boot ROM looks for ata-6 behind dev 3 */
+                if (i == 1) {
+                    uata_bus = pci_bridge_get_sec_bus(PCI_BRIDGE(br));
+                }
             }
         }
     }
@@ -1222,6 +1234,20 @@ static void ppc_core99_init(MachineState *machine)
         }
     }
     g_free(openpic_irqs);
+
+    /*
+     * After mac-io, whose IDE buses keep ide.0 and ide.1; this one is ide.2.
+     * The inputs are the ones the ROM's finish-pci-interrupts names.
+     */
+    if (core99_machine->k2_uata) {
+        PCIDevice *uata = pci_new(PCI_DEVFN(0xd, 0), TYPE_K2_UATA);
+
+        pci_realize_and_unref(uata, uata_bus, &error_fatal);
+        qdev_connect_gpio_out_named(DEVICE(uata), "irq", K2_UATA_IRQ_ATA,
+                                    qdev_get_gpio_in(pic_dev, 0x27));
+        qdev_connect_gpio_out_named(DEVICE(uata), "irq", K2_UATA_IRQ_DMA,
+                                    qdev_get_gpio_in(pic_dev, 0x26));
+    }
 
     /* We only emulate 2 out of 3 IDE controllers for now */
     ide_drive_get(hd, ARRAY_SIZE(hd));
@@ -1648,6 +1674,16 @@ static bool powermac7_3_get_dbdma_devstat(Object *obj, Error **errp)
     return CORE99_MACHINE(obj)->dbdma_devstat;
 }
 
+static bool powermac7_3_get_k2_uata(Object *obj, Error **errp)
+{
+    return CORE99_MACHINE(obj)->k2_uata;
+}
+
+static void powermac7_3_set_k2_uata(Object *obj, bool value, Error **errp)
+{
+    CORE99_MACHINE(obj)->k2_uata = value;
+}
+
 static bool powermac7_3_get_k2_fan_tach(Object *obj, Error **errp)
 {
     return CORE99_MACHINE(obj)->k2_fan_tach;
@@ -1918,6 +1954,15 @@ static void powermac7_3_machine_class_init(ObjectClass *oc, const void *data)
                                           "Let DBDMA control writes set "
                                           "the s0-s7 status bits, which a "
                                           "real boot ROM uses (off by "
+                                          "default)");
+    object_class_property_add_bool(oc, "x-k2-uata",
+                                   powermac7_3_get_k2_uata,
+                                   powermac7_3_set_k2_uata);
+    object_class_property_set_description(oc, "x-k2-uata",
+                                          "Put the K2 UATA that a real boot "
+                                          "ROM opens at dev 0xd behind the "
+                                          "HT bridge at dev 3; needs "
+                                          "x-ht-k2-layout=dev1-5 (off by "
                                           "default)");
     object_class_property_add_bool(oc, "x-k2-fan-tach",
                                    powermac7_3_get_k2_fan_tach,

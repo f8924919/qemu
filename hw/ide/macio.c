@@ -25,6 +25,7 @@
 
 #include "qemu/osdep.h"
 #include "hw/core/irq.h"
+#include "hw/pci/pci_device.h"
 #include "hw/ppc/mac_dbdma.h"
 #include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
@@ -482,9 +483,135 @@ static const TypeInfo macio_ide_type_info = {
     .class_init = macio_ide_class_init,
 };
 
+/*
+ * K2 UATA (106b:0043), which a real boot ROM's uata driver opens: the mac-io
+ * IDE cell and a DBDMA channel of its own behind one BAR, FCR at +0, DBDMA at
+ * +0x1000 and the ATA registers at +0x2000.  The ROM gives the node its
+ * interrupts itself (finish-pci-interrupts), to mac-io's controller, so no
+ * pin is used: INTx here would reach the HT root's inputs instead.
+ */
+static uint64_t k2_uata_fcr_read(void *opaque, hwaddr addr, unsigned size)
+{
+    K2UATAState *s = opaque;
+
+    return addr ? 0 : s->fcr;
+}
+
+static void k2_uata_fcr_write(void *opaque, hwaddr addr, uint64_t val,
+                              unsigned size)
+{
+    K2UATAState *s = opaque;
+
+    if (!addr) {
+        s->fcr = val;
+    }
+}
+
+static const MemoryRegionOps k2_uata_fcr_ops = {
+    .read = k2_uata_fcr_read,
+    .write = k2_uata_fcr_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+};
+
+/* The ATA line is also the channel's s7: AppleKauaiATA's programs wait on it */
+static void k2_uata_ata_irq(void *opaque, int n, int level)
+{
+    K2UATAState *s = opaque;
+
+    DBDMA_set_devstat(&s->dbdma, 0, level ? 0x80 : 0);
+    qemu_set_irq(s->irq[K2_UATA_IRQ_ATA], level);
+}
+
+static void k2_uata_dma_irq(void *opaque, int n, int level)
+{
+    K2UATAState *s = opaque;
+
+    qemu_set_irq(s->irq[K2_UATA_IRQ_DMA], level);
+}
+
+static void k2_uata_realize(PCIDevice *d, Error **errp)
+{
+    K2UATAState *s = K2_UATA(d);
+    SysBusDevice *sbd = SYS_BUS_DEVICE(&s->ide);
+
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->dbdma), errp)) {
+        return;
+    }
+    DBDMA_set_address_space(&s->dbdma, pci_device_iommu_address_space(d));
+    DBDMA_set_devstat(&s->dbdma, 0, 0);
+
+    object_property_set_link(OBJECT(&s->ide), "dbdma", OBJECT(&s->dbdma),
+                             &error_abort);
+    macio_ide_register_dma(&s->ide);
+    if (!sysbus_realize(sbd, errp)) {
+        return;
+    }
+    sysbus_connect_irq(sbd, 0, qemu_allocate_irq(k2_uata_ata_irq, s, 0));
+    sysbus_connect_irq(sbd, 1, qemu_allocate_irq(k2_uata_dma_irq, s, 0));
+
+    memory_region_init(&s->bar, OBJECT(s), "k2-uata", 0x4000);
+    memory_region_init_io(&s->fcr_mem, OBJECT(s), &k2_uata_fcr_ops, s,
+                          "k2-uata-fcr", 0x1000);
+    memory_region_add_subregion(&s->bar, 0x0000, &s->fcr_mem);
+    memory_region_add_subregion(&s->bar, 0x1000,
+                                sysbus_mmio_get_region(
+                                    SYS_BUS_DEVICE(&s->dbdma), 0));
+    memory_region_add_subregion(&s->bar, 0x2000, &s->ide.mem);
+    pci_register_bar(d, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->bar);
+}
+
+static void k2_uata_init(Object *obj)
+{
+    K2UATAState *s = K2_UATA(obj);
+
+    object_initialize_child(obj, "dbdma", &s->dbdma, TYPE_MAC_DBDMA);
+    object_initialize_child(obj, "ide", &s->ide, TYPE_MACIO_IDE);
+    qdev_init_gpio_out_named(DEVICE(obj), s->irq, "irq", K2_UATA_NIRQS);
+}
+
+static const VMStateDescription vmstate_k2_uata = {
+    .name = "k2-uata",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_PCI_DEVICE(parent_obj, K2UATAState),
+        VMSTATE_UINT32(fcr, K2UATAState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static void k2_uata_class_init(ObjectClass *oc, const void *data)
+{
+    PCIDeviceClass *k = PCI_DEVICE_CLASS(oc);
+    DeviceClass *dc = DEVICE_CLASS(oc);
+
+    k->realize = k2_uata_realize;
+    k->vendor_id = PCI_VENDOR_ID_APPLE;
+    k->device_id = PCI_DEVICE_ID_APPLE_K2_ATA100;
+    k->class_id = PCI_CLASS_STORAGE_IDE;
+    dc->vmsd = &vmstate_k2_uata;
+    /* The machine wires its "irq" outputs to the MPIC: x-k2-uata */
+    dc->user_creatable = false;
+    set_bit(DEVICE_CATEGORY_STORAGE, dc->categories);
+}
+
+static const TypeInfo k2_uata_type_info = {
+    .name = TYPE_K2_UATA,
+    .parent = TYPE_PCI_DEVICE,
+    .instance_size = sizeof(K2UATAState),
+    .instance_init = k2_uata_init,
+    .class_init = k2_uata_class_init,
+    .interfaces = (const InterfaceInfo[]) {
+        { INTERFACE_CONVENTIONAL_PCI_DEVICE },
+        { },
+    },
+};
+
 static void macio_ide_register_types(void)
 {
     type_register_static(&macio_ide_type_info);
+    type_register_static(&k2_uata_type_info);
 }
 
 /* hd_table must contain 2 block drivers */
