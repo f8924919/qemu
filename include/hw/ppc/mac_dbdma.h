@@ -157,6 +157,8 @@ typedef struct DBDMA_channel {
     DBDMA_rw rw;
     DBDMA_flush flush;
     dbdma_cmd current;
+    /* The device drives s0-s7, so conditions compare them all */
+    bool devstat_driven;
 } DBDMA_channel;
 
 struct DBDMAState {
@@ -180,5 +182,6 @@ void DBDMA_register_channel(void *dbdma, int nchan, qemu_irq irq,
 void DBDMA_kick(DBDMAState *dbdma);
 /* Bus addresses of every channel resolve in @as (default: system memory) */
 void DBDMA_set_address_space(DBDMAState *dbdma, AddressSpace *as);
+void DBDMA_set_devstat(DBDMAState *dbdma, int nchan, uint8_t devstat);
 
 #endif

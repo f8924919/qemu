@@ -118,6 +118,16 @@ static void kill_channel(DBDMA_channel *ch)
     qemu_irq_raise(ch->irq);
 }
 
+/*
+ * s4-s7 are the attached device's lines.  Conditions see them only on a
+ * channel whose device publishes them through DBDMA_set_devstat(); elsewhere
+ * nothing drives them, so keep comparing s0-s3.
+ */
+static uint16_t devstat_sel_mask(DBDMA_channel *ch)
+{
+    return ch->devstat_driven ? DEVSTAT : 0x0f;
+}
+
 static void conditional_interrupt(DBDMA_channel *ch)
 {
     dbdma_cmd *current = &ch->current;
@@ -141,8 +151,8 @@ static void conditional_interrupt(DBDMA_channel *ch)
 
     status = ch->regs[DBDMA_STATUS] & DEVSTAT;
 
-    sel_mask = (ch->regs[DBDMA_INTR_SEL] >> 16) & 0x0f;
-    sel_value = ch->regs[DBDMA_INTR_SEL] & 0x0f;
+    sel_mask = (ch->regs[DBDMA_INTR_SEL] >> 16) & devstat_sel_mask(ch);
+    sel_value = ch->regs[DBDMA_INTR_SEL] & devstat_sel_mask(ch);
 
     cond = (status & sel_mask) == (sel_value & sel_mask);
 
@@ -182,8 +192,8 @@ static int conditional_wait(DBDMA_channel *ch)
 
     status = ch->regs[DBDMA_STATUS] & DEVSTAT;
 
-    sel_mask = (ch->regs[DBDMA_WAIT_SEL] >> 16) & 0x0f;
-    sel_value = ch->regs[DBDMA_WAIT_SEL] & 0x0f;
+    sel_mask = (ch->regs[DBDMA_WAIT_SEL] >> 16) & devstat_sel_mask(ch);
+    sel_value = ch->regs[DBDMA_WAIT_SEL] & devstat_sel_mask(ch);
 
     cond = (status & sel_mask) == (sel_value & sel_mask);
 
@@ -248,8 +258,8 @@ static void conditional_branch(DBDMA_channel *ch)
 
     status = ch->regs[DBDMA_STATUS] & DEVSTAT;
 
-    sel_mask = (ch->regs[DBDMA_BRANCH_SEL] >> 16) & 0x0f;
-    sel_value = ch->regs[DBDMA_BRANCH_SEL] & 0x0f;
+    sel_mask = (ch->regs[DBDMA_BRANCH_SEL] >> 16) & devstat_sel_mask(ch);
+    sel_value = ch->regs[DBDMA_BRANCH_SEL] & devstat_sel_mask(ch);
 
     cond = (status & sel_mask) == (sel_value & sel_mask);
 
@@ -909,6 +919,24 @@ void DBDMA_set_address_space(DBDMAState *dbdma, AddressSpace *as)
 
     for (i = 0; i < DBDMA_CHANNELS; i++) {
         dbdma->channels[i].io.as = as;
+    }
+}
+
+/*
+ * Publish a device's lines s0-s7.  The first call must come before a program
+ * can wait on them: until then the channel's conditions ignore them.
+ */
+void DBDMA_set_devstat(DBDMAState *dbdma, int nchan, uint8_t devstat)
+{
+    DBDMA_channel *ch = &dbdma->channels[nchan];
+    uint32_t old = ch->regs[DBDMA_STATUS];
+
+    ch->devstat_driven = true;
+    ch->regs[DBDMA_STATUS] = (old & ~(uint32_t)DEVSTAT) | devstat;
+
+    /* A channel parked on a wait goes on now */
+    if (ch->regs[DBDMA_STATUS] != old && (old & RUN) && (old & ACTIVE)) {
+        DBDMA_kick(dbdma);
     }
 }
 
