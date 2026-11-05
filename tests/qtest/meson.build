@@ -210,6 +210,7 @@ qtests_ppc64 = \
   (config_all_devices.has_key('CONFIG_MAC_NEWWORLD') ? ['macio-rom-smp-test'] : []) + \
   (config_all_devices.has_key('CONFIG_MAC_NEWWORLD') ? ['k2-uata-test'] : []) + \
   (config_all_devices.has_key('CONFIG_MAC_NEWWORLD') ? ['real-rom-switch-test'] : []) + \
+  (config_all_devices.has_key('CONFIG_MAC_NEWWORLD') ? ['u3-agp-reset-test'] : []) + \
   qtests_pci + ['migration-test', 'cpu-plug-test', 'drive_del-test']
 
 qtests_sh4 = (config_all_devices.has_key('CONFIG_ISA_TESTDEV') ? ['endianness-test'] : [])

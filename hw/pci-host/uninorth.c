@@ -637,21 +637,26 @@ static void unin_agp_pci_host_realize(PCIDevice *d, Error **errp)
     /* d->config[PCI_CAPABILITY_LIST] = 0x80; */
 }
 
+/*
+ * Set kMacRISCPCIAddressSelect (0x48) register to indicate PCI
+ * memory space with base 0x80000000, size 0x10000000 for Apple's
+ * AppleMacRiscPCI driver, the same way the UniNorth main bridge
+ * does.  Without it the driver has no memory range to work with.
+ */
+static void u3_agp_set_address_select(PCIDevice *d)
+{
+    d->config[0x48] = 0x0;
+    d->config[0x49] = 0x0;
+    d->config[0x4a] = 0x0;
+    d->config[0x4b] = 0x1;
+}
+
 static void u3_agp_pci_host_realize(PCIDevice *d, Error **errp)
 {
     d->config[PCI_CACHE_LINE_SIZE] = 0x08;
     d->config[PCI_LATENCY_TIMER] = 0x10;
 
-    /*
-     * Set kMacRISCPCIAddressSelect (0x48) register to indicate PCI
-     * memory space with base 0x80000000, size 0x10000000 for Apple's
-     * AppleMacRiscPCI driver, the same way the UniNorth main bridge
-     * does.  Without it the driver has no memory range to work with.
-     */
-    d->config[0x48] = 0x0;
-    d->config[0x49] = 0x0;
-    d->config[0x4a] = 0x0;
-    d->config[0x4b] = 0x1;
+    u3_agp_set_address_select(d);
 
     /*
      * Advertise an AGP capability.  Mac OS X's AppleMacRiscAGP::configure()
@@ -715,6 +720,14 @@ static void u3_agp_pci_host_config_write(PCIDevice *d, uint32_t addr,
 static void u3_agp_pci_host_reset(DeviceState *dev)
 {
     PCIDevice *d = PCI_DEVICE(dev);
+
+    /*
+     * A real boot ROM sets more bits of the address select register as it
+     * opens the windows.  Left set across a reset, Mac OS X panicked starting
+     * the driver of the AGP card on the next boot.  How the two connect has
+     * not been worked out.
+     */
+    u3_agp_set_address_select(d);
 
     if (!u3_agp_host(d)->agp_master) {
         return;
