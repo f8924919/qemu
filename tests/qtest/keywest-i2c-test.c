@@ -1316,6 +1316,43 @@ static void test_spd_smallest_ram(void)
 }
 
 /*
+ * The geometry of the pair's SPD.  The real Boot ROM sizes a bank from the
+ * row bits (byte 3) and the number of ranks (byte 5), not from the rank
+ * density (byte 31), so up to 1 GiB per DIMM the row bits must make
+ * 2^rows * 2^cols * device banks * 8 bytes equal one rank.  Above that
+ * (highmem) the SPD stays as spd_data_generate() writes it.
+ */
+typedef struct SpdGeometry {
+    const char *args;
+    uint8_t rows, cols, ranks, dev_banks, density;
+} SpdGeometry;
+
+static const SpdGeometry spd_geometries[] = {
+    { " -m 64",                      10, 10, 1, 4, 0x08 },
+    { " -m 1024",                    13, 10, 2, 4, 0x40 },
+    { " -m 2048",                    14, 10, 2, 4, 0x80 },
+    { ",highmem=on -m 4096",         13, 10, 2, 4, 0x01 },
+};
+
+static void test_spd_geometry(const void *opaque)
+{
+    const SpdGeometry *g = opaque;
+    QTestState *qts = qtest_initf("%s%s", KW_MACHINE_SPD, g->args);
+    uint8_t lo[SPD_LEN], hi[SPD_LEN];
+
+    spd_read(qts, SPD_ADDR8(0x50), lo);
+    spd_read(qts, SPD_ADDR8(0x51), hi);
+    spd_assert_ddr(lo);
+    g_assert_cmpmem(lo, sizeof(lo), hi, sizeof(hi));
+    g_assert_cmpuint(lo[3], ==, g->rows);
+    g_assert_cmpuint(lo[4], ==, g->cols);
+    g_assert_cmpuint(lo[5], ==, g->ranks);
+    g_assert_cmpuint(lo[17], ==, g->dev_banks);
+    g_assert_cmphex(lo[31], ==, g->density);
+    qtest_quit(qts);
+}
+
+/*
  * The real Boot ROM also drives the controller in DUMB (manual) mode: it
  * writes START to the control register with the mode's transfer type at
  * 0, waits for the START interrupt, and then hands the address byte over
@@ -2556,6 +2593,12 @@ int main(int argc, char **argv)
     qtest_add_func("/keywest-i2c/spd-other-addresses-nak",
                    test_spd_other_addresses_nak);
     qtest_add_func("/keywest-i2c/spd-smallest-ram", test_spd_smallest_ram);
+    for (i = 0; i < ARRAY_SIZE(spd_geometries); i++) {
+        g_autofree char *path =
+            g_strdup_printf("/keywest-i2c/spd-geometry/%u", i);
+
+        qtest_add_data_func(path, &spd_geometries[i], test_spd_geometry);
+    }
     qtest_add_func("/keywest-i2c/dumb-start-raises-isr",
                    test_dumb_start_raises_isr);
     qtest_add_func("/keywest-i2c/dumb-off-start-ignored",

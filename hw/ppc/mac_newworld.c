@@ -433,6 +433,33 @@ static void ht_k2_rom_irq_set(void *opaque, int irq_num, int level)
     qemu_set_irq(cms->ht_k2_rom_irqs[irq_num], level);
 }
 
+/*
+ * The SPD of one DIMM of the pair x-u3-i2c-spd places on U3's i2c.  The
+ * real Boot ROM sizes each bank (one rank across the pair) from the row
+ * address bits (byte 3) and the number of ranks (byte 5); it does not use
+ * the rank density (byte 31).  spd_data_generate() always writes 13 rows
+ * and 10 columns, so up to 1 GiB per DIMM set the rows to match one rank:
+ * 2^rows * 2^cols * banks per device * 8 bytes (64-bit).  Larger DIMMs
+ * (highmem) keep the SPD as generated.
+ */
+static uint8_t *u3_spd_generate(ram_addr_t dimm_size)
+{
+    uint8_t *spd = spd_data_generate(DDR, dimm_size);
+    uint8_t sum = 0;
+    int i;
+
+    if (dimm_size <= 1 * GiB) {
+        uint64_t rank = dimm_size / spd[5];
+
+        spd[3] = ctz64(rank) - spd[4] - ctz32(spd[17]) - 3;
+        for (i = 0; i < 63; i++) {
+            sum += spd[i];
+        }
+        spd[63] = sum;
+    }
+    return spd;
+}
+
 static void ppc_core99_init(MachineState *machine)
 {
     Core99MachineState *core99_machine = CORE99_MACHINE(machine);
@@ -835,10 +862,10 @@ static void ppc_core99_init(MachineState *machine)
         /*
          * A real boot ROM addresses channel 1 at 7-bit 0x50, 0x52, 0x54
          * and 0x56, where memory SPD EEPROMs usually sit, and with this
-         * pair in place reads bytes from 0x50 and 0x51; what it does with
-         * them has not been traced.  Give it one pair of DDR DIMMs, as the
-         * board takes them in pairs: 0x50 and 0x51, each with half of the
-         * RAM.
+         * pair in place reads bytes from 0x50 and 0x51, from which it sizes
+         * the memory banks (see u3_spd_generate()).  Give it one pair of DDR
+         * DIMMs, as the board takes them in pairs: 0x50 and 0x51, each with
+         * half of the RAM.
          */
         if (core99_machine->u3_i2c_spd) {
             I2CBus *spd_bus = I2C_BUS(qdev_get_child_bus(i2c_dev, "i2c1"));
@@ -851,10 +878,8 @@ static void ppc_core99_init(MachineState *machine)
                              "least 32 MiB");
                 exit(1);
             }
-            smbus_eeprom_init_one(spd_bus, 0x50,
-                                  spd_data_generate(DDR, dimm_size));
-            smbus_eeprom_init_one(spd_bus, 0x51,
-                                  spd_data_generate(DDR, dimm_size));
+            smbus_eeprom_init_one(spd_bus, 0x50, u3_spd_generate(dimm_size));
+            smbus_eeprom_init_one(spd_bus, 0x51, u3_spd_generate(dimm_size));
         }
 
         /* Plain map, for the same reason as the i2c above */
